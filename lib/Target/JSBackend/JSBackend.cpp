@@ -2428,6 +2428,22 @@ void JSWriter::printFunction(const Function *F) {
   Allocas.clear();
 }
 
+static std::string escapeJSONString(llvm::StringRef str)
+{
+  std::string out;
+  for(llvm::StringRef::const_iterator itr = str.begin(); itr < str.end(); ++itr) {
+    char ch = *itr;
+    if(ch < 0x1f) {
+      char escaped[6];
+      sprintf(escaped, "\\u%04d", ch);
+      out.append(escaped);
+    } else {
+      out.append(1, ch);
+    }
+  }
+  return out;
+}
+
 void JSWriter::printModuleBody() {
   processConstants();
 
@@ -2492,7 +2508,7 @@ void JSWriter::printModuleBody() {
       } else {
         Out << ", ";
       }
-      Out << "\"" << I->getName() << "\"";
+      Out << "\"" << escapeJSONString(I->getName()) << "\"";
     }
   }
   for (NameSet::const_iterator I = Declares.begin(), E = Declares.end();
@@ -2502,7 +2518,7 @@ void JSWriter::printModuleBody() {
     } else {
       Out << ", ";
     }
-    Out << "\"" << *I << "\"";
+    Out << "\"" << escapeJSONString(*I) << "\"";
   }
   Out << "],";
 
@@ -2515,7 +2531,7 @@ void JSWriter::printModuleBody() {
     } else {
       Out << ", ";
     }
-    Out << "\"_" << I->first << "\": \"" << I->second << "\"";
+    Out << "\"_" << escapeJSONString(I->first) << "\": \"" << escapeJSONString(I->second) << "\"";
   }
   Out << "},";
 
@@ -2528,7 +2544,7 @@ void JSWriter::printModuleBody() {
     } else {
       Out << ", ";
     }
-    Out << "\"" << *I << "\"";
+    Out << "\"" << escapeJSONString(*I) << "\"";
   }
   Out << "],";
 
@@ -2542,7 +2558,7 @@ void JSWriter::printModuleBody() {
       } else {
         Out << ", ";
       }
-      Out << "\"_" << I->getName() << '"';
+      Out << "\"_" << escapeJSONString(I->getName()) << '"';
     }
   }
   Out << "],";
@@ -2574,7 +2590,7 @@ void JSWriter::printModuleBody() {
     } else {
       Out << ", ";
     }
-    Out << "\"" << GlobalInitializers[i] << "\"";
+    Out << "\"" << escapeJSONString(GlobalInitializers[i]) << "\"";
   }
   Out << "],";
 
@@ -2586,7 +2602,7 @@ void JSWriter::printModuleBody() {
     } else {
       Out << ", ";
     }
-    Out << "\"" << Exports[i] << "\"";
+    Out << "\"" << escapeJSONString(Exports[i]) << "\"";
   }
   Out << "],";
 
@@ -2604,7 +2620,7 @@ void JSWriter::printModuleBody() {
     } else {
       Out << ", ";
     }
-    Out << "\"_" << I->first << "\": \"" << utostr(I->second) << "\"";
+    Out << "\"_" << escapeJSONString(I->first) << "\": \"" << escapeJSONString(utostr(I->second)) << "\"";
   }
   Out << "}";
 
