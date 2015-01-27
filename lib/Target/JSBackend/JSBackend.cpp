@@ -129,6 +129,7 @@ namespace {
   typedef std::map<const BasicBlock*, unsigned> BlockIndexMap;
   typedef std::map<const Function*, BlockIndexMap> BlockAddressMap;
   typedef std::map<const BasicBlock*, Block*> LLVMToRelooperMap;
+  typedef std::vector<unsigned> AddressList;
 
   /// JSWriter - This class is the main chunk of code that converts an LLVM
   /// module to JavaScript.
@@ -154,6 +155,16 @@ namespace {
     std::vector<std::string> GlobalInitializers;
     std::vector<std::string> Exports; // additional exports
     BlockAddressMap BlockAddresses;
+	AddressList objcSelectorRefs;
+	AddressList objcMessageRefs;
+	AddressList objcClassRefs;
+	AddressList objcSuperRefs;
+	AddressList objcClassList;
+	AddressList objcNonlazyClassList;
+	AddressList objcCategoryList;
+	AddressList objcNonlazyCategoryList;
+	AddressList objcProtocolList;
+	AddressList objcProtocolRefs;
 
     std::string CantValidate;
     bool UsesSIMD;
@@ -182,6 +193,7 @@ namespace {
     void printProgram(const std::string& fname, const std::string& modName );
     void printModule(const std::string& fname, const std::string& modName );
     void printFunction(const Function *F);
+	void printAddressList(AddressList &addressList);
 
     void error(const std::string& msg);
 
@@ -2370,19 +2382,87 @@ void JSWriter::printFunctionBody(const Function *F) {
   }
 }
 
+static std::string tmp[] = {
+"__objc_selrefs",
+"__objc_msgrefs",
+"__objc_classrefs",
+"__objc_superrefs",
+"__objc_classlist",
+"__objc_nlclslist",
+"__objc_catlist",
+"__objc_nlcatlist",
+"__objc_protolist",
+"__objc_protorefs",
+};
+static std::vector<std::string> objcSections(tmp, end(tmp));
+
+static bool isObjCMetaVar(const std::string &section) {
+	if(section.empty()) {
+		return false;
+	}
+	for(int i = 0; i < objcSections.size(); i++) {
+		size_t pos = section.find(objcSections[i], 0);
+		if(pos != std::string::npos) return true;
+	}
+	return false;
+}
+
 void JSWriter::processConstants() {
   // First, calculate the address of each constant
   for (Module::const_global_iterator I = TheModule->global_begin(),
          E = TheModule->global_end(); I != E; ++I) {
-    if (I->hasInitializer()) {
+    if (I->hasInitializer() && !isObjCMetaVar(I->getSection())) {
       parseConstant(I->getName().str(), I->getInitializer(), true);
+    }
+  }
+  for (std::vector<std::string>::iterator i = objcSections.begin(), e = objcSections.end(); i != e; ++i) {
+    for (Module::const_global_iterator I = TheModule->global_begin(),
+           E = TheModule->global_end(); I != E; ++I) {
+      if (I->hasInitializer() && I->getSection().find(*i, 0) != std::string::npos) {
+        parseConstant(I->getName().str(), I->getInitializer(), true);
+      }
     }
   }
   // Second, allocate their contents
   for (Module::const_global_iterator I = TheModule->global_begin(),
          E = TheModule->global_end(); I != E; ++I) {
-    if (I->hasInitializer()) {
+    if (I->hasInitializer() && !isObjCMetaVar(I->getSection())) {
       parseConstant(I->getName().str(), I->getInitializer(), false);
+    }
+  }
+  for (std::vector<std::string>::iterator i = objcSections.begin(), e = objcSections.end(); i != e; ++i) {
+    for (Module::const_global_iterator I = TheModule->global_begin(),
+           E = TheModule->global_end(); I != E; ++I) {
+      if (I->hasInitializer() && I->getSection().find(*i, 0) != std::string::npos) {
+        parseConstant(I->getName().str(), I->getInitializer(), false);
+      }
+    }
+  }
+
+  for (Module::const_global_iterator I = TheModule->global_begin(),
+         E = TheModule->global_end(); I != E; ++I) {
+    std::string name = I->getName().str();
+    std::string section = I->getSection();
+    if(section.find("__objc_selrefs") != std::string::npos) {
+      objcSelectorRefs.push_back(getGlobalAddress(name)); 
+	} else if(section.find("__objc_msgrefs") != std::string::npos) {
+      objcMessageRefs.push_back(getGlobalAddress(name)); 
+	} else if(section.find("__objc_classrefs") != std::string::npos) {
+      objcClassRefs.push_back(getGlobalAddress(name)); 
+	} else if(section.find("__objc_superrefs") != std::string::npos) {
+      objcSuperRefs.push_back(getGlobalAddress(name)); 
+	} else if(section.find("__objc_classlist") != std::string::npos) {
+      objcClassList.push_back(getGlobalAddress(name)); 
+	} else if(section.find("__objc_nlclslist") != std::string::npos) {
+      objcNonlazyClassList.push_back(getGlobalAddress(name)); 
+	} else if(section.find("__objc_catlist") != std::string::npos) {
+      objcCategoryList.push_back(getGlobalAddress(name)); 
+	} else if(section.find("__objc_nlcatlist") != std::string::npos) {
+      objcNonlazyCategoryList.push_back(getGlobalAddress(name)); 
+	} else if(section.find("__objc_protolist") != std::string::npos) {
+      objcProtocolList.push_back(getGlobalAddress(name)); 
+	} else if(section.find("__objc_protorefs") != std::string::npos) {
+      objcProtocolRefs.push_back(getGlobalAddress(name)); 
     }
   }
 }
@@ -2442,6 +2522,18 @@ static std::string escapeJSONString(llvm::StringRef str)
     }
   }
   return out;
+}
+
+void JSWriter::printAddressList(AddressList &addressList) {
+  bool first = true;
+  for (AddressList::const_iterator I = addressList.begin(), E = addressList.end(); I != E; ++I) {
+    if (first) {
+      first = false;
+    } else {
+      Out << ", ";
+    }
+	Out << *I;
+  }
 }
 
 void JSWriter::printModuleBody() {
@@ -2622,6 +2714,31 @@ void JSWriter::printModuleBody() {
     }
     Out << "\"_" << escapeJSONString(I->first) << "\": \"" << escapeJSONString(utostr(I->second)) << "\"";
   }
+  Out << "},";
+
+  Out << "\"objc\": {";
+  first = true;
+  Out << "\"__objc_selrefs\":[";
+	printAddressList(objcSelectorRefs);
+  Out << "], \"__objc_msgrefs\":[";
+	printAddressList(objcMessageRefs);
+  Out << "], \"__objc_classrefs\":[";
+	printAddressList(objcClassRefs);
+  Out << "], \"__objc_superrefs\":[";
+	printAddressList(objcSuperRefs);
+  Out << "], \"__objc_classlist\":[";
+	printAddressList(objcClassList);
+  Out << "], \"__objc_nlclslist\":[";
+	printAddressList(objcNonlazyClassList);
+  Out << "], \"__objc_catlist\":[";
+	printAddressList(objcCategoryList);
+  Out << "], \"__objc_nlcatlist\":[";
+	printAddressList(objcNonlazyCategoryList);
+  Out << "], \"__objc_protolist\":[";
+	printAddressList(objcProtocolList);
+  Out << "], \"__objc_protorefs\":[";
+	printAddressList(objcProtocolRefs);
+  Out << "]";
   Out << "}";
 
   Out << "\n}\n";
@@ -2710,6 +2827,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
       }
     }
   } else if (const ConstantStruct *CS = dyn_cast<ConstantStruct>(CV)) {
+	//errs() << "struct\n";
     if (name == "__init_array_start") {
       // this is the global static initializer
       if (calculate) {
@@ -2725,10 +2843,12 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
     } else if (calculate) {
       HeapData *GlobalData = allocateAddress(name);
       unsigned Bytes = DL->getTypeStoreSize(CV->getType());
+      //errs() << "assigned: " << Bytes << "bytes\n";
       for (unsigned i = 0; i < Bytes; ++i) {
         GlobalData->push_back(0);
       }
     } else {
+      //if(name.find("OBJC_", 0) != std::string::npos) CS->dump();
       // Per the PNaCl abi, this must be a packed struct of a very specific type
       // https://chromium.googlesource.com/native_client/pnacl-llvm/+/7287c45c13dc887cebe3db6abfa2f1080186bb97/lib/Transforms/NaCl/FlattenGlobals.cpp
       assert(CS->getType()->isPacked());
@@ -2737,8 +2857,11 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
       unsigned Offset = getRelativeGlobalAddress(name);
       unsigned OffsetStart = Offset;
       unsigned Absolute = getGlobalAddress(name);
+      //errs() << "Offset: " << Offset << ",Num: " << Num << ", Absolute: " << Absolute << "\n";
       for (unsigned i = 0; i < Num; i++) {
         const Constant* C = CS->getOperand(i);
+		//if(name.find("OBJC_", 0) != std::string::npos) C->dump();
+
         if (isa<ConstantAggregateZero>(C)) {
           unsigned Bytes = DL->getTypeStoreSize(C->getType());
           Offset += Bytes; // zeros, so just skip
@@ -2746,6 +2869,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
           const Value *V = CE->getOperand(0);
           unsigned Data = 0;
           if (CE->getOpcode() == Instruction::PtrToInt) {
+	        //if(name.find("OBJC_", 0) != std::string::npos) V->dump();
             Data = getConstAsOffset(V, Absolute + Offset - OffsetStart);
           } else if (CE->getOpcode() == Instruction::Add) {
             V = cast<ConstantExpr>(V)->getOperand(0);
