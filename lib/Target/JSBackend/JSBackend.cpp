@@ -287,6 +287,9 @@ namespace {
         return 'i';
       }
     }
+	bool isObjCFunction(const std::string *Name) {
+		return Name && Name->compare(0, 8, "_objc___") == 0;
+	}
     std::string getFunctionSignature(const FunctionType *F, const std::string *Name=NULL) {
       std::string Ret;
       Ret += getFunctionSignatureLetter(F->getReturnType());
@@ -296,17 +299,23 @@ namespace {
       }
       return Ret;
     }
-    FunctionTable& ensureFunctionTable(const FunctionType *FT) {
-      FunctionTable &Table = FunctionTables[getFunctionSignature(FT)];
+    FunctionTable& ensureFunctionTable(const FunctionType *FT, const std::string *Name=NULL) {
+      FunctionTable &Table = FunctionTables[getFunctionSignature(FT, Name)];
       unsigned MinSize = ReservedFunctionPointers ? 2*(ReservedFunctionPointers+1) : 1; // each reserved slot must be 2-aligned
       while (Table.size() < MinSize) Table.push_back("0");
+
+      if(isObjCFunction(Name)) {
+		FunctionTable &ObjCTable = FunctionTables["o"];
+		while (ObjCTable.size() < MinSize) ObjCTable.push_back("0");
+	  }
+
       return Table;
     }
     unsigned getFunctionIndex(const Function *F) {
       const std::string &Name = getJSName(F);
       if (IndexedFunctions.find(Name) != IndexedFunctions.end()) return IndexedFunctions[Name];
       std::string Sig = getFunctionSignature(F->getFunctionType(), &Name);
-      FunctionTable& Table = ensureFunctionTable(F->getFunctionType());
+      FunctionTable& Table = ensureFunctionTable(F->getFunctionType(), &Name);
       if (NoAliasingFunctionPointers) {
         while (Table.size() < NextFunctionIndex) Table.push_back("0");
       }
@@ -315,6 +324,16 @@ namespace {
       while (Table.size() % Alignment) Table.push_back("0");
       unsigned Index = Table.size();
       Table.push_back(Name);
+
+      if(isObjCFunction(&Name)) {
+		FunctionTable &ObjCTable = FunctionTables["o"];
+        if (NoAliasingFunctionPointers) {
+          while (ObjCTable.size() < NextFunctionIndex) ObjCTable.push_back("0");
+        }
+        while (ObjCTable.size() % Alignment) ObjCTable.push_back("0");
+        ObjCTable.push_back(Name);
+	  }
+
       IndexedFunctions[Name] = Index;
       if (NoAliasingFunctionPointers) {
         NextFunctionIndex = Index+1;
@@ -509,6 +528,8 @@ static inline char halfCharToHex(unsigned char half) {
 }
 
 static inline void sanitizeGlobal(std::string& str) {
+  if(str.compare(0, 3, "\1-[") == 0 || str.compare(0, 3, "\1+[") == 0) str = "objc" + str;
+
   // Global names are prefixed with "_" to prevent them from colliding with
   // names of things in normal JS.
   str = "_" + str;
@@ -2400,8 +2421,8 @@ static bool isObjCMetaVar(const std::string &section) {
 	if(section.empty()) {
 		return false;
 	}
-	for(int i = 0; i < objcSections.size(); i++) {
-		size_t pos = section.find(objcSections[i], 0);
+    for (std::vector<std::string>::iterator i = objcSections.begin(), e = objcSections.end(); i != e; ++i) {
+		size_t pos = section.find(*i, 0);
 		if(pos != std::string::npos) return true;
 	}
 	return false;
@@ -2598,7 +2619,7 @@ void JSWriter::printModuleBody() {
       if (first) {
         first = false;
       } else {
-        Out << ", ";
+        Out << ", \n";
       }
       Out << "\"" << escapeJSONString(I->getName()) << "\"";
     }
@@ -2608,7 +2629,7 @@ void JSWriter::printModuleBody() {
     if (first) {
       first = false;
     } else {
-      Out << ", ";
+      Out << ", \n";
     }
     Out << "\"" << escapeJSONString(*I) << "\"";
   }
@@ -2621,7 +2642,7 @@ void JSWriter::printModuleBody() {
     if (first) {
       first = false;
     } else {
-      Out << ", ";
+      Out << ", \n";
     }
     Out << "\"_" << escapeJSONString(I->first) << "\": \"" << escapeJSONString(I->second) << "\"";
   }
@@ -2634,7 +2655,7 @@ void JSWriter::printModuleBody() {
     if (first) {
       first = false;
     } else {
-      Out << ", ";
+      Out << ", \n";
     }
     Out << "\"" << escapeJSONString(*I) << "\"";
   }
@@ -2648,7 +2669,7 @@ void JSWriter::printModuleBody() {
       if (first) {
         first = false;
       } else {
-        Out << ", ";
+        Out << ", \n";
       }
       Out << "\"_" << escapeJSONString(I->getName()) << '"';
     }
@@ -2692,7 +2713,7 @@ void JSWriter::printModuleBody() {
     if (first) {
       first = false;
     } else {
-      Out << ", ";
+      Out << ", \n";
     }
     Out << "\"" << escapeJSONString(Exports[i]) << "\"";
   }
@@ -2710,7 +2731,7 @@ void JSWriter::printModuleBody() {
     if (first) {
       first = false;
     } else {
-      Out << ", ";
+      Out << ", \n";
     }
     Out << "\"_" << escapeJSONString(I->first) << "\": \"" << escapeJSONString(utostr(I->second)) << "\"";
   }
@@ -2848,6 +2869,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
         GlobalData->push_back(0);
       }
     } else {
+      // errs() << name << "\n";
       //if(name.find("OBJC_", 0) != std::string::npos) CS->dump();
       // Per the PNaCl abi, this must be a packed struct of a very specific type
       // https://chromium.googlesource.com/native_client/pnacl-llvm/+/7287c45c13dc887cebe3db6abfa2f1080186bb97/lib/Transforms/NaCl/FlattenGlobals.cpp
@@ -2857,7 +2879,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
       unsigned Offset = getRelativeGlobalAddress(name);
       unsigned OffsetStart = Offset;
       unsigned Absolute = getGlobalAddress(name);
-      //errs() << "Offset: " << Offset << ",Num: " << Num << ", Absolute: " << Absolute << "\n";
+      // errs() << "Offset: " << Offset << ",Num: " << Num << ", Absolute: " << Absolute << "\n";
       for (unsigned i = 0; i < Num; i++) {
         const Constant* C = CS->getOperand(i);
 		//if(name.find("OBJC_", 0) != std::string::npos) C->dump();
