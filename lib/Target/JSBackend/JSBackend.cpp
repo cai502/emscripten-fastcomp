@@ -205,8 +205,8 @@ namespace {
     // parsing of constants has two phases: calculate, and then emit
     void parseConstant(const std::string& name, const Constant* CV, bool calculate);
 
-    #define MEM_ALIGN 8
-    #define MEM_ALIGN_BITS 64
+    #define MEM_ALIGN 4
+    #define MEM_ALIGN_BITS 32
     #define STACK_ALIGN 16
     #define STACK_ALIGN_BITS 128
 
@@ -218,7 +218,7 @@ namespace {
     }
 
     HeapData *allocateAddress(const std::string& Name, unsigned Bits = MEM_ALIGN_BITS) {
-      assert(Bits == 64); // FIXME when we use optimal alignments
+      assert(Bits == 32); // FIXME when we use optimal alignments
       HeapData *GlobalData = NULL;
       switch (Bits) {
         case 8:  GlobalData = &GlobalData8;  break;
@@ -238,7 +238,7 @@ namespace {
         report_fatal_error("cannot find global address " + Twine(s));
       }
       Address a = I->second;
-      assert(a.second == 64); // FIXME when we use optimal alignments
+      assert(a.second == 32); // FIXME when we use optimal alignments
       unsigned Ret;
       switch (a.second) {
         case 64:
@@ -2572,7 +2572,7 @@ void JSWriter::printModuleBody() {
   PostSets = "";
   Out << "// EMSCRIPTEN_END_FUNCTIONS\n\n";
 
-  assert(GlobalData32.size() == 0 && GlobalData8.size() == 0); // FIXME when we use optimal constant alignments
+  assert(GlobalData64.size() == 0 && GlobalData8.size() == 0); // FIXME when we use optimal constant alignments
 
   // TODO fix commas
   Out << "/* memory initializer */ allocate([";
@@ -2904,16 +2904,16 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
           }
           union { unsigned i; unsigned char b[sizeof(unsigned)]; } integer;
           integer.i = Data;
-          assert(Offset+4 <= GlobalData64.size());
+          assert(Offset+4 <= GlobalData32.size());
           for (unsigned i = 0; i < 4; ++i) {
-            GlobalData64[Offset++] = integer.b[i];
+            GlobalData32[Offset++] = integer.b[i];
           }
         } else if (const ConstantDataSequential *CDS = dyn_cast<ConstantDataSequential>(C)) {
           assert(CDS->isString());
           StringRef Str = CDS->getAsString();
-          assert(Offset+Str.size() <= GlobalData64.size());
+          assert(Offset+Str.size() <= GlobalData32.size());
           for (unsigned int i = 0; i < Str.size(); i++) {
-            GlobalData64[Offset++] = Str.data()[i];
+            GlobalData32[Offset++] = Str.data()[i];
           }
         } else {
           C->dump();
@@ -2964,9 +2964,9 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
         union { unsigned i; unsigned char b[sizeof(unsigned)]; } integer;
         integer.i = Data;
         unsigned Offset = getRelativeGlobalAddress(name);
-        assert(Offset+4 <= GlobalData64.size());
+        assert(Offset+4 <= GlobalData32.size());
         for (unsigned i = 0; i < 4; ++i) {
-          GlobalData64[Offset++] = integer.b[i];
+          GlobalData32[Offset++] = integer.b[i];
         }
       }
     }
