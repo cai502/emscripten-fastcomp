@@ -2466,27 +2466,35 @@ void JSWriter::processConstants() {
          E = TheModule->global_end(); I != E; ++I) {
     std::string name = I->getName().str();
     std::string section = I->getSection();
-    if(section.find("__objc_selrefs") != std::string::npos) {
-      objcSelectorRefs.push_back(getGlobalAddress(name)); 
-	} else if(section.find("__objc_msgrefs") != std::string::npos) {
-      objcMessageRefs.push_back(getGlobalAddress(name)); 
-	} else if(section.find("__objc_classrefs") != std::string::npos) {
-      objcClassRefs.push_back(getGlobalAddress(name)); 
-	} else if(section.find("__objc_superrefs") != std::string::npos) {
-      objcSuperRefs.push_back(getGlobalAddress(name)); 
-	} else if(section.find("__objc_classlist") != std::string::npos) {
-      objcClassList.push_back(getGlobalAddress(name)); 
-	} else if(section.find("__objc_nlclslist") != std::string::npos) {
-      objcNonlazyClassList.push_back(getGlobalAddress(name)); 
-	} else if(section.find("__objc_catlist") != std::string::npos) {
-      objcCategoryList.push_back(getGlobalAddress(name)); 
-	} else if(section.find("__objc_nlcatlist") != std::string::npos) {
-      objcNonlazyCategoryList.push_back(getGlobalAddress(name)); 
-	} else if(section.find("__objc_protolist") != std::string::npos) {
-      objcProtocolList.push_back(getGlobalAddress(name)); 
-	} else if(section.find("__objc_protorefs") != std::string::npos) {
-      objcProtocolRefs.push_back(getGlobalAddress(name)); 
-    }
+
+    if(section.find("__objc_") == std::string::npos) continue;
+
+    const ConstantStruct *CS = dyn_cast<ConstantStruct>(I->getInitializer());
+    unsigned Num = CS->getNumOperands();
+    unsigned addr = getGlobalAddress(name);
+    for(unsigned i = 0; i < Num; i++, addr += 8) {
+      if(section.find("__objc_selrefs") != std::string::npos) {
+        objcSelectorRefs.push_back(addr);
+      } else if(section.find("__objc_msgrefs") != std::string::npos) {
+        objcMessageRefs.push_back(addr);
+      } else if(section.find("__objc_classrefs") != std::string::npos) {
+        objcClassRefs.push_back(addr);
+      } else if(section.find("__objc_superrefs") != std::string::npos) {
+        objcSuperRefs.push_back(addr);
+      } else if(section.find("__objc_classlist") != std::string::npos) {
+        objcClassList.push_back(addr);
+      } else if(section.find("__objc_nlclslist") != std::string::npos) {
+        objcNonlazyClassList.push_back(addr);
+      } else if(section.find("__objc_catlist") != std::string::npos) {
+        objcCategoryList.push_back(addr);
+      } else if(section.find("__objc_nlcatlist") != std::string::npos) {
+        objcNonlazyCategoryList.push_back(addr);
+      } else if(section.find("__objc_protolist") != std::string::npos) {
+        objcProtocolList.push_back(addr);
+      } else if(section.find("__objc_protorefs") != std::string::npos) {
+        objcProtocolRefs.push_back(addr);
+      }
+	}
   }
 }
 
