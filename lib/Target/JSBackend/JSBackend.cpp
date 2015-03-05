@@ -288,7 +288,7 @@ namespace {
       }
     }
 	bool isObjCFunction(const std::string *Name) {
-		return Name && Name->compare(0, 8, "_objc___") == 0;
+		return Name && Name->compare(0, 6, "_OBJC_") == 0;
 	}
     std::string getFunctionSignature(const FunctionType *F, const std::string *Name=NULL) {
       std::string Ret;
@@ -528,7 +528,7 @@ static inline char halfCharToHex(unsigned char half) {
 }
 
 static inline void sanitizeGlobal(std::string& str) {
-  if(str.compare(0, 3, "\1-[") == 0 || str.compare(0, 3, "\1+[") == 0) str = "objc" + str;
+  if(str.compare(0, 3, "\1-[") == 0 || str.compare(0, 3, "\1+[") == 0) str = "OBJC" + str;
 
   // Global names are prefixed with "_" to prevent them from colliding with
   // names of things in normal JS.
@@ -542,7 +542,9 @@ static inline void sanitizeGlobal(std::string& str) {
   size_t OriginalSize = str.size();
   for (size_t i = 1; i < OriginalSize; ++i) {
     unsigned char c = str[i];
-    if (!isalnum(c) && c != '_') str[i] = '_';
+    if (c == '+') str[i] = 'C';
+    else if (c == '-') str[i] = 'I';
+    else if (!isalnum(c) && c != '_') str[i] = '_';
   }
 }
 
