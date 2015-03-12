@@ -288,7 +288,7 @@ namespace {
       }
     }
 	bool isObjCFunction(const std::string *Name) {
-		return Name && Name->compare(0, 6, "_OBJC_") == 0;
+		return Name && (Name->compare(0, 6, "_OBJC_") == 0 || Name->compare(0, 9, "_objc_msg") == 0);
 	}
     std::string getFunctionSignature(const FunctionType *F, const std::string *Name=NULL) {
       std::string Ret;

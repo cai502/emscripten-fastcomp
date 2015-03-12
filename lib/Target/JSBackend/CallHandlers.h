@@ -89,7 +89,11 @@ DEF_CALL_HANDLER(__default__, {
   }
 
   if (Invoke) {
-    Sig = getFunctionSignature(FT, &Name);
+	if(isObjCFunction(&Name)) {
+      Sig = "o";
+    } else {
+      Sig = getFunctionSignature(FT, &Name);
+    }
     Name = "invoke_" + Sig;
     NeedCasts = true;
   }
