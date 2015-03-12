@@ -62,9 +62,11 @@ DEF_CALL_HANDLER(__default__, {
   bool ForcedNumArgs = NumArgs != -1;
   if (!ForcedNumArgs) NumArgs = getNumArgOperands(CI);
 
+  bool ObjcMsgSendFuncs = Name.find("_objc_msg") != std::string::npos;
+
   if (!FT->isVarArg() && !ForcedNumArgs) {
     int TypeNumArgs = FT->getNumParams();
-    if (TypeNumArgs != NumArgs) {
+    if (TypeNumArgs != NumArgs && !ObjcMsgSendFuncs) {
       if (EmscriptenAssertions) prettyWarning() << "unexpected number of arguments " << utostr(NumArgs) << " in call to '" << F->getName() << "', should be " << utostr(TypeNumArgs) << "\n";
       if (NumArgs > TypeNumArgs) NumArgs = TypeNumArgs; // lop off the extra params that will not be used and just break validation
     }
