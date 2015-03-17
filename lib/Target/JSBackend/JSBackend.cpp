@@ -147,6 +147,7 @@ namespace {
     GlobalAddressMap GlobalAddresses;
     NameSet Externals; // vars
     NameSet Declares; // funcs
+    NameSet ObjCMessageFuncs; // funcs
     StringMap Redirects; // library function redirects actually used, needed for wrapper funcs in tables
     std::string PostSets;
     NameIntMap NamedGlobals; // globals that we export as metadata to JS, so it can access them by name
@@ -155,16 +156,16 @@ namespace {
     std::vector<std::string> GlobalInitializers;
     std::vector<std::string> Exports; // additional exports
     BlockAddressMap BlockAddresses;
-	AddressList objcSelectorRefs;
-	AddressList objcMessageRefs;
-	AddressList objcClassRefs;
-	AddressList objcSuperRefs;
-	AddressList objcClassList;
-	AddressList objcNonlazyClassList;
-	AddressList objcCategoryList;
-	AddressList objcNonlazyCategoryList;
-	AddressList objcProtocolList;
-	AddressList objcProtocolRefs;
+    AddressList objcSelectorRefs;
+    AddressList objcMessageRefs;
+    AddressList objcClassRefs;
+    AddressList objcSuperRefs;
+    AddressList objcClassList;
+    AddressList objcNonlazyClassList;
+    AddressList objcCategoryList;
+    AddressList objcNonlazyCategoryList;
+    AddressList objcProtocolList;
+    AddressList objcProtocolRefs;
 
     std::string CantValidate;
     bool UsesSIMD;
@@ -287,9 +288,9 @@ namespace {
         return 'i';
       }
     }
-	bool isObjCFunction(const std::string *Name) {
-		return Name && (Name->compare(0, 6, "_OBJC_") == 0 || Name->compare(0, 9, "_objc_msg") == 0);
-	}
+    bool isObjCFunction(const std::string *Name) {
+      return Name && (Name->compare(0, 6, "_OBJC_") == 0 || Name->compare(0, 9, "_objc_msg") == 0);
+    }
     std::string getFunctionSignature(const FunctionType *F, const std::string *Name=NULL) {
       std::string Ret;
       Ret += getFunctionSignatureLetter(F->getReturnType());
@@ -303,11 +304,6 @@ namespace {
       FunctionTable &Table = FunctionTables[getFunctionSignature(FT, Name)];
       unsigned MinSize = ReservedFunctionPointers ? 2*(ReservedFunctionPointers+1) : 1; // each reserved slot must be 2-aligned
       while (Table.size() < MinSize) Table.push_back("0");
-
-      if(isObjCFunction(Name)) {
-		FunctionTable &ObjCTable = FunctionTables["o"];
-		while (ObjCTable.size() < MinSize) ObjCTable.push_back("0");
-	  }
 
       return Table;
     }
@@ -324,15 +320,6 @@ namespace {
       while (Table.size() % Alignment) Table.push_back("0");
       unsigned Index = Table.size();
       Table.push_back(Name);
-
-      if(isObjCFunction(&Name)) {
-		FunctionTable &ObjCTable = FunctionTables["o"];
-        if (NoAliasingFunctionPointers) {
-          while (ObjCTable.size() < NextFunctionIndex) ObjCTable.push_back("0");
-        }
-        while (ObjCTable.size() % Alignment) ObjCTable.push_back("0");
-        ObjCTable.push_back(Name);
-	  }
 
       IndexedFunctions[Name] = Index;
       if (NoAliasingFunctionPointers) {
@@ -2661,6 +2648,19 @@ void JSWriter::printModuleBody() {
   Out << "\"externs\": [";
   first = true;
   for (NameSet::const_iterator I = Externals.begin(), E = Externals.end();
+       I != E; ++I) {
+    if (first) {
+      first = false;
+    } else {
+      Out << ", \n";
+    }
+    Out << "\"" << escapeJSONString(*I) << "\"";
+  }
+  Out << "],";
+
+  Out << "\"objCMessageFuncs\": [";
+  first = true;
+  for (NameSet::const_iterator I = ObjCMessageFuncs.begin(), E = ObjCMessageFuncs.end();
        I != E; ++I) {
     if (first) {
       first = false;
