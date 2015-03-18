@@ -64,17 +64,6 @@ DEF_CALL_HANDLER(__default__, {
 
   bool ObjcMsgSendFuncs = Name.find("_objc_msg") != std::string::npos;
   if(ObjcMsgSendFuncs) {
-//    CI->dump();
-//    const Value *cv = ImmutableCallSite(CI).getCalledValue();
-//    cv->dump();
-
-//    errs() << "\n";
-    /*
-    Function *f = dynamic_cast<Function>(CI->getCalledValue());
-    if(f) {
-      errs << f->getNumParams();
-    }
-    */
     Sig = getFunctionSignatureLetter(CI->getType());
     for (int i = 0; i < NumArgs; i++) {
       Type *ActualType = CI->getOperand(i)->getType();

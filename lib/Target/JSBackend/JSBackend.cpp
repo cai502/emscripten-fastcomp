@@ -2459,7 +2459,7 @@ void JSWriter::processConstants() {
     const ConstantStruct *CS = dyn_cast<ConstantStruct>(I->getInitializer());
     unsigned Num = CS->getNumOperands();
     unsigned addr = getGlobalAddress(name);
-    for(unsigned i = 0; i < Num; i++, addr += 8) {
+    for(unsigned i = 0; i < Num; i++, addr += 4) {
       if(section.find("__objc_selrefs") != std::string::npos) {
         objcSelectorRefs.push_back(addr);
       } else if(section.find("__objc_msgrefs") != std::string::npos) {
