@@ -17,18 +17,24 @@
 #define LLVM_BITCODE_NACL_NACLREADERWRITER_H
 
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorOr.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include <string>
 
 namespace llvm {
-  class MemoryBuffer;
   class LLVMContext;
   class Module;
-  class raw_ostream;
   class NaClBitcodeHeader;
   class NaClBitstreamWriter;
-  class StreamableMemoryObject;
+  class StreamingMemoryObject;
+  class raw_ostream;
 
+  /// Defines the data layout used for PNaCl bitcode files. We set the
+  /// data layout of the module in the bitcode readers rather than in
+  /// pnacl-llc so that 'opt' will also use the correct data layout if
+  /// it is run on a pexe.
+  extern const char *PNaClDataLayout;
 
   /// Allows (function) local symbol tables (unsupported) in PNaCl bitcode
   /// files.
@@ -37,11 +43,13 @@ namespace llvm {
   /// \brief Defines the integer bit size used to model pointers in PNaCl.
   static const unsigned PNaClIntPtrTypeBitSize = 32;
 
-  /// getNaClLazyBitcodeModule - Read the header of the specified bitcode buffer
-  /// and prepare for lazy deserialization of function bodies.  If successful,
-  /// this takes ownership of 'buffer' and returns a non-null pointer.  On
-  /// error, this returns null, *does not* take ownership of Buffer, and fills
-  /// in *ErrMsg with an error description if ErrMsg is non-null.
+  /// Read the header of the specified bitcode buffer and prepare for lazy
+  /// deserialization of function bodies.  If successful, this takes ownership
+  /// of 'Buffer' (extending its lifetime).  On error, this returns an error code
+  /// and deletes Buffer.
+  ///
+  /// When Verbose is non-null, more descriptive error messages are also
+  /// written to Verbose.
   ///
   /// The AcceptSupportedOnly argument is used to decide which PNaCl versions
   /// of the PNaCl bitcode to accept. There are three forms:
@@ -51,39 +59,38 @@ namespace llvm {
   ///    3) Unreadable.
   /// When AcceptSupportedOnly is true, only form 1 is allowed. When
   /// AcceptSupportedOnly is false, forms 1 and 2 are allowed.
-  Module *getNaClLazyBitcodeModule(MemoryBuffer *Buffer,
-                                   LLVMContext &Context,
-                                   std::string *ErrMsg = 0,
-                                   bool AcceptSupportedOnly = true);
+  ErrorOr<Module *> getNaClLazyBitcodeModule(
+      std::unique_ptr<MemoryBuffer> &&Buffer, LLVMContext &Context,
+      raw_ostream *Verbose = nullptr, bool AcceptSupportedOnly = true);
 
-  /// getNaClStreamedBitcodeModule - Read the header of the specified stream
-  /// and prepare for lazy deserialization and streaming of function bodies.
-  /// On error, this returns null, and fills in *ErrMsg with an error
-  /// description if ErrMsg is non-null.
+  /// Read the header of the specified stream and prepare for lazy
+  /// deserialization and streaming of function bodies. On error,
+  /// this returns null, and fills in *ErrMsg with an error description
+  /// if ErrMsg is non-null.
   ///
-  /// See getNaClLazyBitcodeModule for an explanation of argument
-  /// AcceptSupportedOnly.
+  /// See getNaClLazyBitcodeModule for an explanation of arguments
+  /// Verbose, AcceptSupportedOnly.
+  /// TODO(kschimpf): Refactor this and getStreamedBitcodeModule to use
+  /// ErrorOr<Module *> API so that all methods have the same interface.
   Module *getNaClStreamedBitcodeModule(const std::string &name,
-                                       StreamableMemoryObject *streamer,
+                                       StreamingMemoryObject *streamer,
                                        LLVMContext &Context,
-                                       std::string *ErrMsg = 0,
+                                       raw_ostream *Verbose = nullptr,
+                                       std::string *ErrMsg = nullptr,
                                        bool AcceptSupportedOnly = true);
 
-  /// NaClParseBitcodeFile - Read the specified bitcode file,
-  /// returning the module.  If an error occurs, this returns null and
-  /// fills in *ErrMsg if it is non-null.  This method *never* takes
-  /// ownership of Buffer.
+  /// Read the bitcode file from a buffer, returning the module.
   ///
-  /// See getNaClLazyBitcodeModule for an explanation of argument
-  /// AcceptSupportedOnly.
-  Module *NaClParseBitcodeFile(MemoryBuffer *Buffer, LLVMContext &Context,
-                               std::string *ErrMsg = 0,
-                               bool AcceptSupportedOnly = true);
+  /// See getNaClLazyBitcodeModule for an explanation of arguments
+  /// Verbose, AcceptSupportedOnly.
+  ErrorOr<Module *> NaClParseBitcodeFile(MemoryBufferRef Buffer,
+                                         LLVMContext &Context,
+                                         raw_ostream *Verbose = nullptr,
+                                         bool AcceptSupportedOnly = true);
 
-  /// NaClWriteBitcodeToFile - Write the specified module to the
-  /// specified raw output stream, using PNaCl wire format.  For
-  /// streams where it matters, the given stream should be in "binary"
-  /// mode.
+  /// Write the specified module to the specified raw output stream, using
+  /// PNaCl wire format.  For streams where it matters, the given stream
+  /// should be in "binary" mode.
   ///
   /// The AcceptSupportedOnly argument is used to decide which PNaCl versions
   /// of the PNaCl bitcode to generate. There are two forms:
@@ -107,10 +114,21 @@ namespace llvm {
         BufPtr[3] == 'E';
   }
 
+  /// NaClWriteHeader - Generate a default header (using the version
+  /// number defined by kPNaClVersion) and write to the corresponding
+  /// bitcode stream.
+  void NaClWriteHeader(NaClBitstreamWriter &Stream, bool AcceptSupportedOnly);
+
   // NaClWriteHeader - Write the contents of the bitcode header to the
   // corresponding bitcode stream.
   void NaClWriteHeader(const NaClBitcodeHeader &Header,
                        NaClBitstreamWriter &Stream);
+
+  /// NaClObjDump - Read PNaCl bitcode file from input, and print a
+  /// textual representation of its contents. NoRecords and NoAssembly
+  /// define what should not be included in the dump.
+  bool NaClObjDump(MemoryBufferRef Input, raw_ostream &output,
+                   bool NoRecords, bool NoAssembly);
 
 } // end llvm namespace
 #endif

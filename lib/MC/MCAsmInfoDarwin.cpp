@@ -23,8 +23,6 @@ void MCAsmInfoDarwin::anchor() { }
 MCAsmInfoDarwin::MCAsmInfoDarwin() {
   // Common settings for all Darwin targets.
   // Syntax:
-  GlobalPrefix = "_";
-  PrivateGlobalPrefix = "L";
   LinkerPrivateGlobalPrefix = "l";
   HasSingleParameterDotFile = false;
   HasSubsectionsViaSymbols = true;
@@ -36,15 +34,13 @@ MCAsmInfoDarwin::MCAsmInfoDarwin() {
   InlineAsmEnd = " InlineAsm End";
 
   // Directives:
-  WeakDefDirective = "\t.weak_definition ";
+  HasWeakDefDirective = true;
+  HasWeakDefCanBeHiddenDirective = true;
   WeakRefDirective = "\t.weak_reference ";
   ZeroDirective = "\t.space\t";  // ".space N" emits N zeros.
   HasMachoZeroFillDirective = true;  // Uses .zerofill
   HasMachoTBSSDirective = true; // Uses .tbss
   HasStaticCtorDtorReferenceInStaticMode = true;
-
-  // FIXME: Darwin 10 and newer don't need this.
-  LinkerRequiresNonEmptyDwarfLines = true;
 
   // FIXME: Change this once MC is the system assembler.
   HasAggressiveSymbolFolding = false;
@@ -59,4 +55,7 @@ MCAsmInfoDarwin::MCAsmInfoDarwin() {
   HasNoDeadStrip = true;
 
   DwarfUsesRelocationsAcrossSections = false;
+
+  UseIntegratedAssembler = true;
+  SetDirectiveSuppressesReloc = true;
 }

@@ -30,7 +30,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/NaCl.h"
-#include "llvm/Analysis/Dominators.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include <vector>
 #include <set>
@@ -49,9 +49,10 @@ using namespace llvm;
 
 bool valueEscapes(const Instruction *Inst) {
   const BasicBlock *BB = Inst->getParent();
-  for (Value::const_use_iterator UI = Inst->use_begin(),E = Inst->use_end();
+  for (Value::const_user_iterator UI = Inst->user_begin(),E = Inst->user_end();
        UI != E; ++UI) {
-    const Instruction *I = cast<Instruction>(*UI);
+    const User *U = *UI;
+    const Instruction *I = cast<Instruction>(U);
     if (I->getParent() != BB || isa<PHINode>(I))
       return true;
   }
@@ -114,8 +115,9 @@ void doMemToReg(Function &F) {
 
   BasicBlock &BB = F.getEntryBlock();  // Get the entry node for the function
 
-  DominatorTree DT;
-  DT.runOnFunction(F);
+  DominatorTreeWrapperPass DTW;
+  DTW.runOnFunction(F);
+  DominatorTree& DT = DTW.getDomTree();
 
   while (1) {
     Allocas.clear();
@@ -188,6 +190,8 @@ bool LowerEmSetjmp::runOnModule(Module &M) {
   FunctionType *VoidFunc = FunctionType::get(Void, false);
   Function *PrepSetjmp = Function::Create(VoidFunc, GlobalValue::ExternalLinkage, "emscripten_prep_setjmp", TheModule);
 
+  Function *CleanupSetjmp = Function::Create(VoidFunc, GlobalValue::ExternalLinkage, "emscripten_cleanup_setjmp", TheModule);
+
   Function *PreInvoke = TheModule->getFunction("emscripten_preinvoke");
   if (!PreInvoke) PreInvoke = Function::Create(VoidFunc, GlobalValue::ExternalLinkage, "emscripten_preinvoke", TheModule);
 
@@ -203,8 +207,9 @@ bool LowerEmSetjmp::runOnModule(Module &M) {
   std::vector<Instruction*> ToErase;
 
   if (Setjmp) {
-    for (Instruction::use_iterator UI = Setjmp->use_begin(), UE = Setjmp->use_end(); UI != UE; ++UI) {
-      if (CallInst *CI = dyn_cast<CallInst>(*UI)) {
+    for (Instruction::user_iterator UI = Setjmp->user_begin(), UE = Setjmp->user_end(); UI != UE; ++UI) {
+      User *U = *UI;
+      if (CallInst *CI = dyn_cast<CallInst>(U)) {
         BasicBlock *SJBB = CI->getParent();
         // The tail is everything right after the call, and will be reached once when setjmp is
         // called, and later when longjmp returns to the setjmp
@@ -241,7 +246,7 @@ bool LowerEmSetjmp::runOnModule(Module &M) {
     Function *F = I->first;
     Phis& P = I->second;
 
-    CallInst::Create(PrepSetjmp, "", F->begin()->begin()); // FIXME: adding after other allocas might be better
+    CallInst::Create(PrepSetjmp, "", F->begin()->begin());
 
     // Update each call that can longjmp so it can return to a setjmp where relevant
 
@@ -302,8 +307,18 @@ bool LowerEmSetjmp::runOnModule(Module &M) {
           Iter = BB->begin();
           E = BB->end();
         } else if (InvokeInst *CI = dyn_cast<InvokeInst>(I)) { // XXX check if target is setjmp
-          assert("TODO: invoke inside setjmping functions");
+          (void)CI;
+          report_fatal_error("TODO: invoke inside setjmping functions");
         }
+      }
+    }
+
+    // add a cleanup before each return
+    for (Function::iterator BBI = F->begin(), E = F->end(); BBI != E; ) {
+      BasicBlock *BB = BBI++;
+      TerminatorInst *TI = BB->getTerminator();
+      if (isa<ReturnInst>(TI)) {
+        CallInst::Create(CleanupSetjmp, "", TI);
       }
     }
   }

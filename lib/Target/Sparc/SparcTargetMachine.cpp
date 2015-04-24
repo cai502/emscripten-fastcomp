@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "SparcTargetMachine.h"
+#include "SparcTargetObjectFile.h"
 #include "Sparc.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/PassManager.h"
@@ -32,13 +33,12 @@ SparcTargetMachine::SparcTargetMachine(const Target &T, StringRef TT,
                                        CodeGenOpt::Level OL,
                                        bool is64bit)
   : LLVMTargetMachine(T, TT, CPU, FS, Options, RM, CM, OL),
-    Subtarget(TT, CPU, FS, is64bit),
-    DL(Subtarget.getDataLayout()),
-    InstrInfo(Subtarget),
-    TLInfo(*this), TSInfo(*this),
-    FrameLowering(Subtarget) {
+    TLOF(make_unique<SparcELFTargetObjectFile>()),
+    Subtarget(TT, CPU, FS, *this, is64bit) {
   initAsmInfo();
 }
+
+SparcTargetMachine::~SparcTargetMachine() {}
 
 namespace {
 /// Sparc Code Generator Pass Configuration Options.
@@ -51,8 +51,9 @@ public:
     return getTM<SparcTargetMachine>();
   }
 
-  virtual bool addInstSelector();
-  virtual bool addPreEmitPass();
+  void addIRPasses() override;
+  bool addInstSelector() override;
+  bool addPreEmitPass() override;
 };
 } // namespace
 
@@ -60,15 +61,14 @@ TargetPassConfig *SparcTargetMachine::createPassConfig(PassManagerBase &PM) {
   return new SparcPassConfig(this, PM);
 }
 
-bool SparcPassConfig::addInstSelector() {
-  addPass(createSparcISelDag(getSparcTargetMachine()));
-  return false;
+void SparcPassConfig::addIRPasses() {
+  addPass(createAtomicExpandPass(&getSparcTargetMachine()));
+
+  TargetPassConfig::addIRPasses();
 }
 
-bool SparcTargetMachine::addCodeEmitter(PassManagerBase &PM,
-                                        JITCodeEmitter &JCE) {
-  // Machine code emitter pass for Sparc.
-  PM.add(createSparcJITCodeEmitterPass(*this, JCE));
+bool SparcPassConfig::addInstSelector() {
+  addPass(createSparcISelDag(getSparcTargetMachine()));
   return false;
 }
 

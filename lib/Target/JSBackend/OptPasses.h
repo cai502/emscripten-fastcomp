@@ -14,10 +14,7 @@
 
 namespace llvm {
 
-  extern FunctionPass *createSimplifyAllocasPass();
-
-  extern Pass *createExpandI64Pass();
-  extern Pass *createExpandInsertExtractElementPass();
+  extern FunctionPass *createEmscriptenSimplifyAllocasPass();
 
 } // End llvm namespace
 

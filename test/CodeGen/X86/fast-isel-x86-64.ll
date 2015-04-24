@@ -56,7 +56,7 @@ define i32 @test3_nacl64() nounwind {
 ; NACL64_PIC: test3_nacl64:
 ; NACL64_PIC: movl G@GOTPCREL(%rip), %eax
 ; NACL64_PIC-NEXT: popq    %r11
-; NACL64_PIC-NEXT: nacljmp %r11, %r15
+; NACL64_PIC-NEXT: nacljmp %r11d, %r15
 }
 
 
@@ -156,7 +156,7 @@ if.end:                                           ; preds = %if.then, %entry
 ; CHECK-LABEL: test12:
 ; CHECK: testb	$1,
 ; CHECK-NEXT: je L
-; CHECK-NEXT: movl $0, %edi
+; CHECK-NEXT: xorl %edi, %edi
 ; CHECK-NEXT: callq
 }
 
@@ -166,7 +166,7 @@ define void @test13() nounwind {
   call void @test13f(i1 0)
   ret void
 ; CHECK-LABEL: test13:
-; CHECK: movl $0, %edi
+; CHECK: xorl %edi, %edi
 ; CHECK-NEXT: callq
 }
 
@@ -206,12 +206,10 @@ define void @test16() nounwind {
   br label %block2
 
 block2:
-; CHECK: movabsq $1
-; CHECK: cvtsi2sdq {{.*}} %xmm0
+; CHECK: movsd LCP{{.*}}_{{.*}}(%rip), %xmm0
 ; CHECK: movb $1, %al
 ; CHECK: callq _test16callee
 
-; AVX: movabsq $1
 ; AVX: vmovsd LCP{{.*}}_{{.*}}(%rip), %xmm0
 ; AVX: movb $1, %al
 ; AVX: callq _test16callee
@@ -292,7 +290,7 @@ entry:
   call void @foo22(i32 3)
   ret void
 ; CHECK-LABEL: test22:
-; CHECK: movl	$0, %edi
+; CHECK: xorl	%edi, %edi
 ; CHECK: callq	_foo22
 ; CHECK: movl	$1, %edi
 ; CHECK: callq	_foo22
@@ -317,7 +315,17 @@ define void @test23(i8* noalias sret %result) {
 ; NACL64: call
 ; NACL64: movl  %edi, %eax
 ; NACL64: popq %r11
-; NACL64: nacljmp %r11, %r15
+; NACL64: nacljmp %r11d, %r15
 }
 
 declare i8* @foo23()
+
+declare void @takesi32ptr(i32* %arg)
+
+; CHECK-LABEL: allocamaterialize
+define void @allocamaterialize() {
+  %a = alloca i32
+; CHECK: leaq {{.*}}, %rdi
+  call void @takesi32ptr(i32* %a)
+  ret void
+}

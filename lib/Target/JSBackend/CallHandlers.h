@@ -26,6 +26,19 @@ const Value *getActuallyCalledValue(const Instruction *I) {
   return CV;
 }
 
+// We can't and shouldn't try to invoke an LLVM intrinsic which we overload with a call hander -
+// it would end up in a function table, which makes no sense.
+bool canInvoke(const Value *V) {
+  const Function *F = dyn_cast<const Function>(V);
+  if (F && F->isDeclaration() && F->isIntrinsic()) {
+    auto Intrin = F->getIntrinsicID();
+    if (Intrin == Intrinsic::memcpy || Intrin == Intrinsic::memset) {
+      return false;
+    }
+  }
+  return true;
+}
+
 #define DEF_CALL_HANDLER(Ident, Code) \
   std::string CH_##Ident(const Instruction *CI, std::string Name, int NumArgs=-1) { Code }
 
@@ -37,7 +50,7 @@ DEF_CALL_HANDLER(__default__, {
   bool Invoke = false;
   if (InvokeState == 1) {
     InvokeState = 2;
-    Invoke = true;
+    Invoke = canInvoke(CV);
   }
   std::string Sig;
   const Function *F = dyn_cast<const Function>(CV);
@@ -154,12 +167,12 @@ DEF_CALL_HANDLER(__default__, {
 
 // exceptions support
 DEF_CALL_HANDLER(emscripten_preinvoke, {
-  assert(InvokeState == 0);
+  // InvokeState is normally 0 here, but might be otherwise if a block was split apart TODO: add a function attribute for this
   InvokeState = 1;
   return "__THREW__ = 0";
 })
 DEF_CALL_HANDLER(emscripten_postinvoke, {
-  assert(InvokeState == 1 || InvokeState == 2); // normally 2, but can be 1 if the call in between was optimized out
+  // InvokeState is normally 2 here, but can be 1 if the call in between was optimized out, or 0 if a block was split apart
   InvokeState = 0;
   return getAssign(CI) + "__THREW__; __THREW__ = 0";
 })
@@ -180,13 +193,17 @@ DEF_CALL_HANDLER(emscripten_resume, {
 // setjmp support
 
 DEF_CALL_HANDLER(emscripten_prep_setjmp, {
-  return getAdHocAssign("_setjmpTable", Type::getInt32Ty(CI->getContext())) + "STACKTOP; " + getStackBump(4 * 2 * (MaxSetjmps+1)) +
+  return getAdHocAssign("_setjmpTableSize", Type::getInt32Ty(CI->getContext())) + "4;" +
+         getAdHocAssign("_setjmpTable", Type::getInt32Ty(CI->getContext())) + "_malloc(40) | 0;" +
          "HEAP32[_setjmpTable>>2]=0";
+})
+DEF_CALL_HANDLER(emscripten_cleanup_setjmp, {
+  return "_free(_setjmpTable|0)";
 })
 DEF_CALL_HANDLER(emscripten_setjmp, {
   // env, label, table
   Declares.insert("saveSetjmp");
-  return "_saveSetjmp(" + getValueAsStr(CI->getOperand(0)) + "," + getValueAsStr(CI->getOperand(1)) + ",_setjmpTable|0)|0";
+  return "_setjmpTable = _saveSetjmp(" + getValueAsStr(CI->getOperand(0)) + "," + getValueAsStr(CI->getOperand(1)) + ",_setjmpTable|0,_setjmpTableSize|0)|0;_setjmpTableSize = tempRet0";
 })
 DEF_CALL_HANDLER(emscripten_longjmp, {
   Declares.insert("longjmp");
@@ -197,7 +214,7 @@ DEF_CALL_HANDLER(emscripten_check_longjmp, {
   std::string Target = getJSName(CI);
   std::string Assign = getAssign(CI);
   return "if (((" + Threw + "|0) != 0) & ((threwValue|0) != 0)) { " +
-           Assign + "_testSetjmp(HEAP32[" + Threw + ">>2]|0, _setjmpTable)|0; " +
+           Assign + "_testSetjmp(HEAP32[" + Threw + ">>2]|0, _setjmpTable|0, _setjmpTableSize|0)|0; " +
            "if ((" + Target + "|0) == 0) { _longjmp(" + Threw + "|0, threwValue|0); } " + // rethrow
            "tempRet0 = threwValue; " +
          "} else { " + Assign + "-1; }";
@@ -252,7 +269,7 @@ DEF_CALL_HANDLER(low, { \
 DEF_CALL_HANDLER(high, { \
   std::string Input = getValueAsStr(CI->getOperand(0)); \
   if (PreciseF32 && CI->getOperand(0)->getType()->isFloatTy()) Input = "+" + Input; \
-  return getAssign(CI) + "+Math_abs(" + Input + ") >= +1 ? " + Input + " > +0 ? (Math_min(+Math_floor(" + Input + " / +4294967296), +4294967295) | 0) >>> 0 : ~~+Math_ceil((" + Input + " - +(~~" + Input + " >>> 0)) / +4294967296) >>> 0 : 0"; \
+  return getAssign(CI) + "+Math_abs(" + Input + ") >= +1 ? " + Input + " > +0 ? (~~+Math_min(+Math_floor(" + Input + " / +4294967296), +4294967295)) >>> 0 : ~~+Math_ceil((" + Input + " - +(~~" + Input + " >>> 0)) / +4294967296) >>> 0 : 0"; \
 })
 TO_I(FtoILow, FtoIHigh);
 TO_I(DtoILow, DtoIHigh);
@@ -297,6 +314,17 @@ DEF_CALL_HANDLER(BItoD, {
 DEF_CALL_HANDLER(llvm_nacl_atomic_store_i32, {
   return "HEAP32[" + getValueAsStr(CI->getOperand(0)) + ">>2]=" + getValueAsStr(CI->getOperand(1));
 })
+
+#define CMPXCHG_HANDLER(name) \
+DEF_CALL_HANDLER(name, { \
+  const Value *P = CI->getOperand(0); \
+  return getLoad(CI, P, CI->getType(), 0) + ';' + \
+         "if ((" + getCast(getJSName(CI), CI->getType()) + ") == " + getValueAsCastParenStr(CI->getOperand(1)) + ") " + \
+            getStore(CI, P, CI->getType(), getValueAsStr(CI->getOperand(2)), 0); \
+})
+CMPXCHG_HANDLER(llvm_nacl_atomic_cmpxchg_i8);
+CMPXCHG_HANDLER(llvm_nacl_atomic_cmpxchg_i16);
+CMPXCHG_HANDLER(llvm_nacl_atomic_cmpxchg_i32);
 
 #define UNROLL_LOOP_MAX 8
 #define WRITE_LOOP_MAX 128
@@ -463,7 +491,7 @@ DEF_CALL_HANDLER(bitshift64Shl, {
 })
 
 DEF_CALL_HANDLER(llvm_ctlz_i32, {
-  return CH___default__(CI, "_llvm_ctlz_i32", 1);
+  return CH___default__(CI, "Math_clz32", 1);
 })
 
 DEF_CALL_HANDLER(llvm_cttz_i32, {
@@ -473,6 +501,46 @@ DEF_CALL_HANDLER(llvm_cttz_i32, {
 // vector ops
 DEF_CALL_HANDLER(emscripten_float32x4_signmask, {
   return getAssign(CI) + getValueAsStr(CI->getOperand(0)) + ".signMask";
+})
+
+DEF_CALL_HANDLER(emscripten_float32x4_loadx, {
+  return getAssign(CI) + "SIMD_float32x4_loadX(HEAPU8, " + getValueAsStr(CI->getOperand(0)) + ")";
+})
+
+DEF_CALL_HANDLER(emscripten_float32x4_loadxy, {
+  return getAssign(CI) + "SIMD_float32x4_loadXY(HEAPU8, " + getValueAsStr(CI->getOperand(0)) + ")";
+})
+
+DEF_CALL_HANDLER(emscripten_float32x4_storex, {
+  return "SIMD_float32x4_storeX(HEAPU8, " + getValueAsStr(CI->getOperand(0)) + ", " + getValueAsStr(CI->getOperand(1)) + ")";
+})
+
+DEF_CALL_HANDLER(emscripten_float32x4_storexy, {
+  return "SIMD_float32x4_storeXY(HEAPU8, " + getValueAsStr(CI->getOperand(0)) + ", " + getValueAsStr(CI->getOperand(1)) + ")";
+})
+
+// EM_ASM support
+
+std::string handleAsmConst(const Instruction *CI, std::string suffix="") {
+  std::string ret = "_emscripten_asm_const" + suffix + "(" + utostr(getAsmConstId(CI->getOperand(0)));
+  unsigned Num = getNumArgOperands(CI);
+  for (unsigned i = 1; i < Num; i++) {
+    ret += ", " + getValueAsCastParenStr(CI->getOperand(i), ASM_NONSPECIFIC);
+  }
+  return ret + ")";
+}
+
+DEF_CALL_HANDLER(emscripten_asm_const, {
+  Declares.insert("emscripten_asm_const");
+  return handleAsmConst(CI);
+})
+DEF_CALL_HANDLER(emscripten_asm_const_int, {
+  Declares.insert("emscripten_asm_const_int");
+  return getAssign(CI) + getCast(handleAsmConst(CI, "_int"), Type::getInt32Ty(CI->getContext()));
+})
+DEF_CALL_HANDLER(emscripten_asm_const_double, {
+  Declares.insert("emscripten_asm_const_double");
+  return getAssign(CI) + getCast(handleAsmConst(CI, "_double"), Type::getDoubleTy(CI->getContext()));
 })
 
 #define DEF_BUILTIN_HANDLER(name, to) \
@@ -516,6 +584,7 @@ DEF_BUILTIN_HANDLER(sqrtl, Math_sqrt);
 DEF_BUILTIN_HANDLER(fabs, Math_abs);
 DEF_BUILTIN_HANDLER(fabsf, Math_abs);
 DEF_BUILTIN_HANDLER(fabsl, Math_abs);
+DEF_BUILTIN_HANDLER(llvm_fabs_f64, Math_abs);
 DEF_BUILTIN_HANDLER(ceil, Math_ceil);
 DEF_BUILTIN_HANDLER(ceilf, Math_ceil);
 DEF_BUILTIN_HANDLER(ceill, Math_ceil);
@@ -544,6 +613,8 @@ DEF_BUILTIN_HANDLER(emscripten_float32x4_min, SIMD_float32x4_min);
 DEF_BUILTIN_HANDLER(emscripten_float32x4_max, SIMD.float32x4_max);
 DEF_BUILTIN_HANDLER(emscripten_float32x4_abs, SIMD_float32x4_abs);
 DEF_BUILTIN_HANDLER(emscripten_float32x4_sqrt, SIMD_float32x4_sqrt);
+DEF_BUILTIN_HANDLER(emscripten_float32x4_reciprocalApproximation, SIMD_float32x4_reciprocalApproximation);
+DEF_BUILTIN_HANDLER(emscripten_float32x4_reciprocalSqrtApproximation, SIMD_float32x4_reciprocalSqrtApproximation);
 DEF_BUILTIN_HANDLER(emscripten_float32x4_and, SIMD_float32x4_and);
 DEF_BUILTIN_HANDLER(emscripten_float32x4_or, SIMD_float32x4_or);
 DEF_BUILTIN_HANDLER(emscripten_float32x4_xor, SIMD_float32x4_xor);
@@ -573,6 +644,7 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(emscripten_landingpad);
   SETUP_CALL_HANDLER(emscripten_resume);
   SETUP_CALL_HANDLER(emscripten_prep_setjmp);
+  SETUP_CALL_HANDLER(emscripten_cleanup_setjmp);
   SETUP_CALL_HANDLER(emscripten_setjmp);
   SETUP_CALL_HANDLER(emscripten_longjmp);
   SETUP_CALL_HANDLER(emscripten_check_longjmp);
@@ -597,6 +669,9 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(UItoD);
   SETUP_CALL_HANDLER(BItoD);
   SETUP_CALL_HANDLER(llvm_nacl_atomic_store_i32);
+  SETUP_CALL_HANDLER(llvm_nacl_atomic_cmpxchg_i8);
+  SETUP_CALL_HANDLER(llvm_nacl_atomic_cmpxchg_i16);
+  SETUP_CALL_HANDLER(llvm_nacl_atomic_cmpxchg_i32);
   SETUP_CALL_HANDLER(llvm_memcpy_p0i8_p0i8_i32);
   SETUP_CALL_HANDLER(llvm_memset_p0i8_i32);
   SETUP_CALL_HANDLER(llvm_memmove_p0i8_p0i8_i32);
@@ -620,6 +695,8 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(emscripten_float32x4_max);
   SETUP_CALL_HANDLER(emscripten_float32x4_abs);
   SETUP_CALL_HANDLER(emscripten_float32x4_sqrt);
+  SETUP_CALL_HANDLER(emscripten_float32x4_reciprocalApproximation);
+  SETUP_CALL_HANDLER(emscripten_float32x4_reciprocalSqrtApproximation);
   SETUP_CALL_HANDLER(emscripten_float32x4_equal);
   SETUP_CALL_HANDLER(emscripten_float32x4_notEqual);
   SETUP_CALL_HANDLER(emscripten_float32x4_lessThan);
@@ -635,6 +712,13 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(emscripten_float32x4_fromInt32x4);
   SETUP_CALL_HANDLER(emscripten_int32x4_fromFloat32x4Bits);
   SETUP_CALL_HANDLER(emscripten_int32x4_fromFloat32x4);
+  SETUP_CALL_HANDLER(emscripten_float32x4_loadx);
+  SETUP_CALL_HANDLER(emscripten_float32x4_loadxy);
+  SETUP_CALL_HANDLER(emscripten_float32x4_storex);
+  SETUP_CALL_HANDLER(emscripten_float32x4_storexy);
+  SETUP_CALL_HANDLER(emscripten_asm_const);
+  SETUP_CALL_HANDLER(emscripten_asm_const_int);
+  SETUP_CALL_HANDLER(emscripten_asm_const_double);
 
   SETUP_CALL_HANDLER(abs);
   SETUP_CALL_HANDLER(labs);
@@ -671,6 +755,7 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(fabs);
   SETUP_CALL_HANDLER(fabsf);
   SETUP_CALL_HANDLER(fabsl);
+  SETUP_CALL_HANDLER(llvm_fabs_f64);
   SETUP_CALL_HANDLER(ceil);
   SETUP_CALL_HANDLER(ceilf);
   SETUP_CALL_HANDLER(ceill);

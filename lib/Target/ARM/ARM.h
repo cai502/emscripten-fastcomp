@@ -12,13 +12,10 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef TARGET_ARM_H
-#define TARGET_ARM_H
+#ifndef LLVM_LIB_TARGET_ARM_ARM_H
+#define LLVM_LIB_TARGET_ARM_ARM_H
 
-#include "MCTargetDesc/ARMBaseInfo.h"
-#include "MCTargetDesc/ARMMCTargetDesc.h"
-#include "llvm/Support/DataTypes.h"
-#include "llvm/Target/TargetMachine.h"
+#include "llvm/Support/CodeGen.h"
 
 // @LOCALMOD (for LowerARMMachineInstrToMCInstPCRel)
 #include "llvm/MC/MCSymbol.h"
@@ -28,16 +25,14 @@ namespace llvm {
 class ARMAsmPrinter;
 class ARMBaseTargetMachine;
 class FunctionPass;
-class JITCodeEmitter;
+class ImmutablePass;
 class MachineInstr;
 class MCInst;
+class TargetLowering;
+class TargetMachine;
 
 FunctionPass *createARMISelDag(ARMBaseTargetMachine &TM,
                                CodeGenOpt::Level OptLevel);
-
-FunctionPass *createARMJITCodeEmitterPass(ARMBaseTargetMachine &TM,
-                                          JITCodeEmitter &JCE);
-
 FunctionPass *createA15SDOptimizerPass();
 FunctionPass *createARMLoadStoreOptimizationPass(bool PreAlloc = false);
 FunctionPass *createARMExpandPseudoPass();
@@ -46,6 +41,7 @@ FunctionPass *createARMGlobalMergePass(const TargetLowering* tli);
 FunctionPass *createARMConstantIslandPass();
 FunctionPass *createMLxExpansionPass();
 FunctionPass *createThumb2ITBlockPass();
+FunctionPass *createARMOptimizeBarriersPass();
 FunctionPass *createThumb2SizeReductionPass();
 
 /* @LOCALMOD-START */
@@ -55,11 +51,9 @@ FunctionPass *createARMNaClRewritePass();
 /// \brief Creates an ARM-specific Target Transformation Info pass.
 ImmutablePass *createARMTargetTransformInfoPass(const ARMBaseTargetMachine *TM);
 
-
 void LowerARMMachineInstrToMCInst(const MachineInstr *MI, MCInst &OutMI,
                                   ARMAsmPrinter &AP);
 
-                                          
 /* @LOCALMOD-START */
 // Used to lower the pc-relative MOVi16PIC / MOVTi16PIC pseudo instructions
 // into the real MOVi16 / MOVTi16 instructions.

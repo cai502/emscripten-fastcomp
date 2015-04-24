@@ -13,15 +13,14 @@
 
 #include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/NaCl.h"
-#include "llvm/Analysis/Verifier.h"
-#include "llvm/Assembly/PrintModulePass.h"
 #include "llvm/Bitcode/NaCl/NaClReaderWriter.h"
+#include "llvm/Bitcode/ReaderWriter.h"
 #include "llvm/CodeGen/CommandFlags.h"
-#include "llvm/CodeGen/LinkAllAsmWriterComponents.h"
 #include "llvm/CodeGen/LinkAllCodegenComponents.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/MC/SubtargetFeature.h"
 #include "llvm/Pass.h"
@@ -30,31 +29,34 @@
 #include "llvm/Support/DataStream.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/Host.h"
 #include "llvm/Support/ManagedStatic.h"
-#include "llvm/Support/Mutex.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/SourceMgr.h"
-#include "llvm/Support/StreamableMemoryObject.h"
+#include "llvm/Support/StreamingMemoryObject.h"
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetSubtargetInfo.h"
 #include "llvm/Transforms/NaCl.h"
+
+#include "ThreadedFunctionQueue.h"
 #include "ThreadedStreamingCache.h"
+
 #include <pthread.h>
 #include <memory>
 
-
 using namespace llvm;
 
-// NOTE: When __native_client__ is defined it means pnacl-llc is built as a
-// sandboxed translator (from pnacl-llc.pexe to pnacl-llc.nexe). In this mode
-// it uses SRPC operations instead of direct OS intefaces.
-#if defined(__native_client__)
+// NOTE: When PNACL_BROWSER_TRANSLATOR is defined it means pnacl-llc is built
+// as a sandboxed translator (from pnacl-llc.pexe to pnacl-llc.nexe). In this
+// mode it uses SRPC operations instead of direct OS intefaces.
+#if defined(PNACL_BROWSER_TRANSLATOR)
 int srpc_main(int argc, char **argv);
 int getObjectFileFD(unsigned index);
 DataStreamer *getNaClBitcodeStreamer();
@@ -70,7 +72,12 @@ InputFileFormat(
         clEnumValN(LLVMFormat, "llvm", "LLVM file (default)"),
         clEnumValN(PNaClFormat, "pnacl", "PNaCl bitcode file"),
         clEnumValEnd),
-    cl::init(LLVMFormat));
+#if defined(PNACL_BROWSER_TRANSLATOR)
+    cl::init(PNaClFormat)
+#else
+    cl::init(LLVMFormat)
+#endif
+                );
 
 // General options for llc.  Other pass-specific options are specified
 // within the corresponding llc passes, and target-specific options
@@ -82,23 +89,16 @@ InputFilename(cl::Positional, cl::desc("<input bitcode>"), cl::init("-"));
 static cl::opt<std::string>
 OutputFilename("o", cl::desc("Output filename"), cl::value_desc("filename"));
 
-// Using bitcode streaming has a couple of ramifications. Primarily it means
-// that the module in the file will be compiled one function at a time rather
-// than the whole module. This allows earlier functions to be compiled before
-// later functions are read from the bitcode but of course means no whole-module
-// optimizations. For now, streaming is only supported for files and stdin.
+// Using bitcode streaming allows compilation of one function at a time. This
+// allows earlier functions to be compiled before later functions are read from
+// the bitcode but of course means no whole-module optimizations. This means
+// that Module passes that run should only touch globals/function declarations
+// and not function bodies, otherwise the streaming and non-streaming code
+// pathes wouldn't emit the same code for each function. For now, streaming is
+// only supported for files and stdin.
 static cl::opt<bool>
 LazyBitcode("streaming-bitcode",
   cl::desc("Use lazy bitcode streaming for file inputs"),
-  cl::init(false));
-
-// The option below overlaps very much with bitcode streaming.
-// We keep it separate because it is still experimental and we want
-// to use it without changing the outside behavior which is especially
-// relevant for the sandboxed case.
-static cl::opt<bool>
-ReduceMemoryFootprint("reduce-memory-footprint",
-  cl::desc("Aggressively reduce memory used by pnacl-llc"),
   cl::init(false));
 
 static cl::opt<bool>
@@ -109,6 +109,11 @@ static cl::opt<bool>
 PNaClABIVerifyFatalErrors("pnaclabi-verify-fatal-errors",
   cl::desc("PNaCl ABI verification errors are fatal"),
   cl::init(false));
+
+
+static cl::opt<bool>
+NoIntegratedAssembler("no-integrated-as", cl::Hidden,
+                      cl::desc("Disable integrated assembler"));
 
 // Determine optimization level.
 static cl::opt<char>
@@ -122,24 +127,40 @@ OptLevel("O",
 static cl::opt<std::string>
 UserDefinedTriple("mtriple", cl::desc("Set target triple"));
 
-cl::opt<bool> NoVerify("disable-verify", cl::Hidden,
-                       cl::desc("Do not verify input module"));
+static cl::opt<bool> NoVerify("disable-verify", cl::Hidden,
+                              cl::desc("Do not verify input module"));
 
-cl::opt<bool>
-DisableSimplifyLibCalls("disable-simplify-libcalls",
-                        cl::desc("Disable simplify-libcalls"),
-                        cl::init(false));
+static cl::opt<bool>
+    DisableSimplifyLibCalls("disable-simplify-libcalls",
+                            cl::desc("Disable simplify-libcalls"));
 
-cl::opt<unsigned>
+static cl::opt<unsigned>
 SplitModuleCount("split-module",
                  cl::desc("Split PNaCl module"), cl::init(1U));
+
+enum SplitModuleSchedulerKind {
+  SplitModuleDynamic,
+  SplitModuleStatic
+};
+
+static cl::opt<SplitModuleSchedulerKind>
+SplitModuleSched(
+    "split-module-sched",
+    cl::desc("Choose thread scheduler for split module compilation."),
+    cl::values(
+        clEnumValN(SplitModuleDynamic, "dynamic",
+                   "Dynamic thread scheduling (default)"),
+        clEnumValN(SplitModuleStatic, "static",
+                   "Static thread scheduling"),
+        clEnumValEnd),
+    cl::init(SplitModuleDynamic));
 
 /// Compile the module provided to pnacl-llc. The file name for reading the
 /// module and other options are taken from globals populated by command-line
 /// option parsing.
 static int compileModule(StringRef ProgramName);
 
-#if !defined(__native_client__)
+#if !defined(PNACL_BROWSER_TRANSLATOR)
 // GetFileNameRoot - Helper function to get the basename of a filename.
 static std::string
 GetFileNameRoot(StringRef InputFilename) {
@@ -204,20 +225,20 @@ static tool_output_file *GetOutputStream(const char *TargetName,
   }
 
   // Open the file.
-  std::string error;
+  std::error_code EC;
   sys::fs::OpenFlags OpenFlags = sys::fs::F_None;
-  if (Binary)
-    OpenFlags |= sys::fs::F_Binary;
-  OwningPtr<tool_output_file> FDOut(
-      new tool_output_file(Filename.c_str(), error, OpenFlags));
-  if (!error.empty()) {
-    errs() << error << '\n';
-    return 0;
+  if (!Binary)
+    OpenFlags |= sys::fs::F_Text;
+  tool_output_file *FDOut = new tool_output_file(Filename, EC, OpenFlags);
+  if (EC) {
+    errs() << EC.message() << '\n';
+    delete FDOut;
+    return nullptr;
   }
 
-  return FDOut.take();
+  return FDOut;
 }
-#endif // !defined(__native_client__)
+#endif // !defined(PNACL_BROWSER_TRANSLATOR)
 
 // main - Entry point for the llc compiler.
 //
@@ -230,15 +251,15 @@ int llc_main(int argc, char **argv) {
 
   llvm_shutdown_obj Y;  // Call llvm_shutdown() on exit.
 
-#if defined(__native_client__)
-  install_fatal_error_handler(getSRPCErrorHandler(), NULL);
+#if defined(PNACL_BROWSER_TRANSLATOR)
+  install_fatal_error_handler(getSRPCErrorHandler(), nullptr);
 #endif
 
   // Initialize targets first, so that --version shows registered targets.
   InitializeAllTargets();
   InitializeAllTargetMCs();
   InitializeAllAsmPrinters();
-#if !defined(__native_client__)
+#if !defined(PNACL_BROWSER_TRANSLATOR)
   // Prune asm parsing from sandboxed translator.
   // Do not prune "AsmPrinters" because that includes
   // the direct object emission.
@@ -258,12 +279,21 @@ int llc_main(int argc, char **argv) {
   cl::AddExtraVersionPrinter(TargetRegistry::printRegisteredTargetsForVersion);
 
   // Enable the PNaCl ABI verifier by default in sandboxed mode.
-#if defined(__native_client__)
+#if defined(PNACL_BROWSER_TRANSLATOR)
   PNaClABIVerify = true;
   PNaClABIVerifyFatalErrors = true;
 #endif
 
   cl::ParseCommandLineOptions(argc, argv, "pnacl-llc\n");
+
+#if defined(PNACL_BROWSER_TRANSLATOR)
+  // If the user explicitly requests LLVM format in sandboxed mode
+  // (where the default is PNaCl format), they probably want debug
+  // metadata enabled.
+  if (InputFileFormat == LLVMFormat) {
+    PNaClABIAllowDebugMetadata = true;
+  }
+#endif
 
   if (SplitModuleCount > 1)
     LLVMStartMultithreaded();
@@ -287,74 +317,81 @@ static void CheckABIVerifyErrors(PNaClABIErrorReporter &Reporter,
   Reporter.reset();
 }
 
-static Module* getModule(StringRef ProgramName, LLVMContext &Context,
-                         StreamingMemoryObject *StreamingObject) {
-  Module *M = 0;
+static std::unique_ptr<Module> getModule(
+    StringRef ProgramName, LLVMContext &Context,
+    StreamingMemoryObject *StreamingObject) {
+  std::unique_ptr<Module> M;
   SMDiagnostic Err;
-#if defined(__native_client__)
+  std::string VerboseBuffer;
+  raw_string_ostream VerboseStrm(VerboseBuffer);
   if (LazyBitcode) {
     std::string StrError;
-    std::string DisplayFilename("<PNaCl-translated pexe>");
-    M = getNaClStreamedBitcodeModule(
-        DisplayFilename,
-        new ThreadedStreamingCache(StreamingObject), Context, &StrError);
-    if (!StrError.empty())
-      Err = SMDiagnostic(DisplayFilename, SourceMgr::DK_Error, StrError);
-  } else {
-    llvm_unreachable("native client SRPC only supports streaming");
-  }
-#else
-  if (LazyBitcode) {
-    std::string StrError;
-    M = getNaClStreamedBitcodeModule(
-        InputFilename,
-        new ThreadedStreamingCache(StreamingObject), Context, &StrError);
+    switch (InputFileFormat) {
+    case PNaClFormat:
+      M.reset(getNaClStreamedBitcodeModule(
+          InputFilename,
+          new ThreadedStreamingCache(StreamingObject), Context, &VerboseStrm,
+          &StrError));
+      break;
+    case LLVMFormat:
+      M.reset(getStreamedBitcodeModule(
+          InputFilename,
+          new ThreadedStreamingCache(StreamingObject), Context, &StrError));
+      break;
+    case AutodetectFileFormat:
+      report_fatal_error("Command can't autodetect file format!");
+    }
     if (!StrError.empty())
       Err = SMDiagnostic(InputFilename, SourceMgr::DK_Error, StrError);
   } else {
-    M = NaClParseIRFile(InputFilename, InputFileFormat, Err, Context);
+#if defined(PNACL_BROWSER_TRANSLATOR)
+    llvm_unreachable("native client SRPC only supports streaming");
+#else
+    // Parses binary bitcode as well as textual assembly
+    // (so pulls in more code into pnacl-llc).
+    M = NaClParseIRFile(InputFilename, InputFileFormat, Err, &VerboseStrm,
+                        Context);
+#endif
   }
-#endif // __native_client__
-  if (M == 0) {
-#if defined(__native_client__)
-    report_fatal_error(Err.getMessage());
+  if (!M) {
+#if defined(PNACL_BROWSER_TRANSLATOR)
+    report_fatal_error(VerboseStrm.str() + Err.getMessage());
 #else
     // Err.print is prettier, so use it for the non-sandboxed translator.
     Err.print(ProgramName.data(), errs());
-    return NULL;
+    errs() << VerboseStrm.str();
+    return nullptr;
 #endif
   }
-  return M;
+  return std::move(M);
 }
 
-static int runCompilePasses(Module *mod,
+static cl::opt<bool>
+ExternalizeAll("externalize",
+               cl::desc("Externalize all symbols"),
+               cl::init(false));
+
+static int runCompilePasses(Module *ModuleRef,
                             unsigned ModuleIndex,
+                            ThreadedFunctionQueue *FuncQueue,
                             const Triple &TheTriple,
                             TargetMachine &Target,
                             StringRef ProgramName,
                             formatted_raw_ostream &FOS){
-  // Add declarations for external functions required by PNaCl. The
-  // ResolvePNaClIntrinsics function pass running during streaming
-  // depends on these declarations being in the module.
-  OwningPtr<ModulePass> AddPNaClExternalDeclsPass(
-    createAddPNaClExternalDeclsPass());
-  AddPNaClExternalDeclsPass->runOnModule(*mod);
-  AddPNaClExternalDeclsPass.reset();
-
   PNaClABIErrorReporter ABIErrorReporter;
 
-  if (SplitModuleCount > 1) {
+  if (SplitModuleCount > 1 || ExternalizeAll) {
     // Add function and global names, and give them external linkage.
     // This relies on LLVM's consistent auto-generation of names, we could
     // maybe do our own in case something changes there.
-    for (Module::iterator I = mod->begin(), E = mod->end(); I != E; ++I) {
-      if (!I->hasName())
-        I->setName("Function");
-      if (I->hasInternalLinkage())
-        I->setLinkage(GlobalValue::ExternalLinkage);
+    for (Function &F : *ModuleRef) {
+      if (!F.hasName())
+        F.setName("Function");
+      if (F.hasInternalLinkage())
+        F.setLinkage(GlobalValue::ExternalLinkage);
     }
-    for (Module::global_iterator GI = mod->global_begin(),
-         GE = mod->global_end();
+    for (Module::global_iterator GI = ModuleRef->global_begin(),
+         GE = ModuleRef->global_end();
          GI != GE; ++GI) {
       if (!GI->hasName())
         GI->setName("Global");
@@ -364,36 +401,53 @@ static int runCompilePasses(Module *mod,
     if (ModuleIndex > 0) {
       // Remove the initializers for all global variables, turning them into
       // declarations.
-      for (Module::global_iterator GI = mod->global_begin(),
-          GE = mod->global_end();
+      for (Module::global_iterator GI = ModuleRef->global_begin(),
+          GE = ModuleRef->global_end();
           GI != GE; ++GI) {
         assert(GI->hasInitializer() && "Global variable missing initializer");
         Constant *Init = GI->getInitializer();
-        GI->setInitializer(NULL);
+        GI->setInitializer(nullptr);
         if (Init->getNumUses() == 0)
           Init->destroyConstant();
       }
     }
   }
 
+  // Make all non-weak symbols hidden for better code. We cannot do
+  // this for weak symbols. The linker complains when some weak
+  // symbols are not resolved.
+  for (Function &F : *ModuleRef) {
+    if (!F.isWeakForLinker() && !F.hasLocalLinkage())
+      F.setVisibility(GlobalValue::HiddenVisibility);
+  }
+  for (Module::global_iterator GI = ModuleRef->global_begin(),
+           GE = ModuleRef->global_end();
+       GI != GE; ++GI) {
+    if (!GI->isWeakForLinker() && !GI->hasLocalLinkage())
+      GI->setVisibility(GlobalValue::HiddenVisibility);
+  }
+
   // Build up all of the passes that we want to do to the module.
-  OwningPtr<PassManagerBase> PM;
-  if (LazyBitcode || ReduceMemoryFootprint)
-    PM.reset(new FunctionPassManager(mod));
+  std::unique_ptr<PassManagerBase> PM;
+  if (LazyBitcode)
+    PM.reset(new FunctionPassManager(ModuleRef));
   else
     PM.reset(new PassManager());
+
+  // Add the target data from the target machine, if it exists, or the module.
+  if (const DataLayout *DL = Target.getSubtargetImpl()->getDataLayout())
+    ModuleRef->setDataLayout(DL);
+  PM->add(new DataLayoutPass());
 
   // For conformance with llc, we let the user disable LLVM IR verification with
   // -disable-verify. Unlike llc, when LLVM IR verification is enabled we only
   // run it once, before PNaCl ABI verification.
-  if (!NoVerify) {
+  if (!NoVerify)
     PM->add(createVerifierPass());
-  }
 
   // Add the ABI verifier pass before the analysis and code emission passes.
-  if (PNaClABIVerify) {
+  if (PNaClABIVerify)
     PM->add(createPNaClABIVerifyFunctionsPass(&ABIErrorReporter));
-  }
 
   // Add the intrinsic resolution pass. It assumes ABI-conformant code.
   PM->add(createResolvePNaClIntrinsicsPass());
@@ -404,14 +458,13 @@ static int runCompilePasses(Module *mod,
     TLI->disableAllFunctions();
   PM->add(TLI);
 
-  // Add intenal analysis passes from the target machine.
-  Target.addAnalysisPasses(*PM.get());
+  // Allow subsequent passes and the backend to better optimize instructions
+  // that were simplified for PNaCl's ABI. This pass uses the TargetLibraryInfo
+  // above.
+  PM->add(createBackendCanonicalizePass());
 
-  // Add the target data from the target machine, if it exists, or the module.
-  if (const DataLayout *TD = Target.getDataLayout())
-    PM->add(new DataLayout(*TD));
-  else
-    PM->add(new DataLayout(mod));
+  // Add internal analysis passes from the target machine.
+  Target.addAnalysisPasses(*PM);
 
   // Ask the target to add backend passes as necessary. We explicitly ask it
   // not to add the verifier pass because we added it earlier.
@@ -422,26 +475,61 @@ static int runCompilePasses(Module *mod,
     return 1;
   }
 
-  if (LazyBitcode || ReduceMemoryFootprint) {
-    FunctionPassManager* P = static_cast<FunctionPassManager*>(PM.get());
-    P->doInitialization();
+  if (LazyBitcode) {
+    auto FPM = static_cast<FunctionPassManager *>(PM.get());
+    FPM->doInitialization();
     unsigned FuncIndex = 0;
-    for (Module::iterator I = mod->begin(), E = mod->end(); I != E; ++I) {
-      if (FuncIndex++ % SplitModuleCount == ModuleIndex) {
-        P->run(*I);
-        CheckABIVerifyErrors(ABIErrorReporter, "Function " + I->getName());
-        if (ReduceMemoryFootprint) {
-          I->Dematerialize();
+    switch (SplitModuleSched) {
+    case SplitModuleStatic:
+      for (Function &F : *ModuleRef) {
+        if (FuncQueue->GrabFunctionStatic(FuncIndex, ModuleIndex)) {
+          FPM->run(F);
+          CheckABIVerifyErrors(ABIErrorReporter, "Function " + F.getName());
+          F.Dematerialize();
+        }
+        ++FuncIndex;
+      }
+      break;
+    case SplitModuleDynamic:
+      unsigned ChunkSize = 0;
+      unsigned NumFunctions = FuncQueue->Size();
+      Module::iterator I = ModuleRef->begin();
+      while (FuncIndex < NumFunctions) {
+        ChunkSize = FuncQueue->RecommendedChunkSize();
+        unsigned NextIndex;
+        bool grabbed = FuncQueue->GrabFunctionDynamic(FuncIndex, ChunkSize,
+                                                      NextIndex);
+        if (grabbed) {
+          while (FuncIndex < NextIndex) {
+            if (!I->isMaterializable() && I->isDeclaration()) {
+              ++I;
+              continue;
+            }
+            FPM->run(*I);
+            CheckABIVerifyErrors(ABIErrorReporter, "Function " + I->getName());
+            I->Dematerialize();
+            ++FuncIndex;
+            ++I;
+          }
+        } else {
+          while (FuncIndex < NextIndex) {
+            if (!I->isMaterializable() && I->isDeclaration()) {
+              ++I;
+              continue;
+            }
+            ++FuncIndex;
+            ++I;
+          }
         }
       }
+      break;
     }
-    P->doFinalization();
-  } else {
-    static_cast<PassManager*>(PM.get())->run(*mod);
-  }
+    FPM->doFinalization();
+  } else
+    static_cast<PassManager *>(PM.get())->run(*ModuleRef);
+
   return 0;
 }
-
 
 static int compileSplitModule(const TargetOptions &Options,
                               const Triple &TheTriple,
@@ -449,9 +537,10 @@ static int compileSplitModule(const TargetOptions &Options,
                               const std::string &FeaturesStr,
                               CodeGenOpt::Level OLvl,
                               const StringRef &ProgramName,
-                              Module *GlobalModule,
+                              Module *GlobalModuleRef,
                               StreamingMemoryObject *StreamingObject,
-                              unsigned ModuleIndex) {
+                              unsigned ModuleIndex,
+                              ThreadedFunctionQueue *FuncQueue) {
   std::auto_ptr<TargetMachine>
     target(TheTarget->createTargetMachine(TheTriple.getTriple(),
                                           MCPU, FeaturesStr, Options,
@@ -460,57 +549,66 @@ static int compileSplitModule(const TargetOptions &Options,
   TargetMachine &Target = *target.get();
   // Override default to generate verbose assembly.
   Target.setAsmVerbosityDefault(true);
-  if (RelaxAll) {
-    if (FileType != TargetMachine::CGFT_ObjectFile)
-      errs() << ProgramName
+  if (RelaxAll.getNumOccurrences() > 0 &&
+      FileType != TargetMachine::CGFT_ObjectFile)
+    errs() << ProgramName
              << ": warning: ignoring -mc-relax-all because filetype != obj";
-    else
-      Target.setMCRelaxAll(true);
-  }
   // The OwningPtrs are only used if we are not the primary module.
-  OwningPtr<LLVMContext> C;
-  OwningPtr<Module> M;
-  Module *mod(NULL);
+  std::unique_ptr<LLVMContext> C;
+  std::unique_ptr<Module> M;
+  Module *ModuleRef = nullptr;
 
   if (ModuleIndex == 0) {
-    mod = GlobalModule;
+    ModuleRef = GlobalModuleRef;
   } else {
     C.reset(new LLVMContext());
-    mod = getModule(ProgramName, *C, StreamingObject);
-    if (!mod)
+    M = getModule(ProgramName, *C, StreamingObject);
+    if (!M)
       return 1;
-    M.reset(mod);
+    // M owns the temporary module, but use a reference through ModuleRef
+    // to also work in the case we are using GlobalModuleRef.
+    ModuleRef = M.get();
+
+    // Add declarations for external functions required by PNaCl. The
+    // ResolvePNaClIntrinsics function pass running during streaming
+    // depends on these declarations being in the module.
+    std::unique_ptr<ModulePass> AddPNaClExternalDeclsPass(
+        createAddPNaClExternalDeclsPass());
+    AddPNaClExternalDeclsPass->runOnModule(*ModuleRef);
+    AddPNaClExternalDeclsPass.reset();
   }
 
-  mod->setTargetTriple(Triple::normalize(UserDefinedTriple));
+  ModuleRef->setTargetTriple(Triple::normalize(UserDefinedTriple));
+
   {
-#if !defined(__native_client__)
+#if !defined(PNACL_BROWSER_TRANSLATOR)
       // Figure out where we are going to send the output.
     std::string N(OutputFilename);
     raw_string_ostream OutFileName(N);
     if (ModuleIndex > 0)
       OutFileName << ".module" << ModuleIndex;
-    OwningPtr<tool_output_file> Out
-    (GetOutputStream(TheTarget->getName(), TheTriple.getOS(),
-     OutFileName.str()));
+    std::unique_ptr<tool_output_file> Out
+        (GetOutputStream(TheTarget->getName(), TheTriple.getOS(),
+                         OutFileName.str()));
     if (!Out) return 1;
     formatted_raw_ostream FOS(Out->os());
 #else
-    raw_fd_ostream ROS(getObjectFileFD(ModuleIndex), true);
+    raw_fd_ostream ROS(getObjectFileFD(ModuleIndex), /* ShouldClose */ true);
     ROS.SetBufferSize(1 << 20);
     formatted_raw_ostream FOS(ROS);
 #endif
-    int ret = runCompilePasses(mod, ModuleIndex, TheTriple, Target, ProgramName,
+    int ret = runCompilePasses(ModuleRef, ModuleIndex, FuncQueue,
+                               TheTriple, Target, ProgramName,
                                FOS);
     if (ret)
       return ret;
-#if defined (__native_client__)
+#if defined(PNACL_BROWSER_TRANSLATOR)
     FOS.flush();
     ROS.flush();
 #else
     // Declare success.
     Out->keep();
-#endif // __native_client__
+#endif // PNACL_BROWSER_TRANSLATOR
   }
   return 0;
 }
@@ -522,9 +620,10 @@ struct ThreadData {
   std::string FeaturesStr;
   CodeGenOpt::Level OLvl;
   std::string ProgramName;
-  Module *GlobalModule;
+  Module *GlobalModuleRef;
   StreamingMemoryObject *StreamingObject;
   unsigned ModuleIndex;
+  ThreadedFunctionQueue *FuncQueue;
 };
 
 
@@ -536,9 +635,10 @@ static void *runCompileThread(void *arg) {
                                Data->FeaturesStr,
                                Data->OLvl,
                                Data->ProgramName,
-                               Data->GlobalModule,
+                               Data->GlobalModuleRef,
                                Data->StreamingObject,
-                               Data->ModuleIndex);
+                               Data->ModuleIndex,
+                               Data->FuncQueue);
   return reinterpret_cast<void *>(static_cast<intptr_t>(ret));
 }
 
@@ -549,16 +649,17 @@ static int compileModule(StringRef ProgramName) {
   // races with any other use of the context. Rather than doing an invasive
   // plumbing change to fix it, we work around it by using a new context here
   // and leaving PseudoSourceValue as the only user of the global context.
-  OwningPtr<LLVMContext> MainContext(new LLVMContext());
-  OwningPtr<Module> mod;
+  std::unique_ptr<LLVMContext> MainContext(new LLVMContext());
+  std::unique_ptr<Module> MainMod;
   Triple TheTriple;
   PNaClABIErrorReporter ABIErrorReporter;
-  OwningPtr<StreamingMemoryObject> StreamingObject;
+  std::unique_ptr<StreamingMemoryObject> StreamingObject;
 
   if (!MainContext) return 1;
 
-#if defined(__native_client__)
-  StreamingObject.reset(new StreamingMemoryObject(getNaClBitcodeStreamer()));
+#if defined(PNACL_BROWSER_TRANSLATOR)
+  StreamingObject.reset(
+      new StreamingMemoryObjectImpl(getNaClBitcodeStreamer()));
 #else
   if (LazyBitcode) {
     std::string StrError;
@@ -569,26 +670,35 @@ static int compileModule(StringRef ProgramName) {
     }
     if (!FileStreamer)
       return 1;
-    StreamingObject.reset(new StreamingMemoryObject(FileStreamer));
+    StreamingObject.reset(new StreamingMemoryObjectImpl(FileStreamer));
   }
 #endif
-  mod.reset(getModule(ProgramName, *MainContext.get(), StreamingObject.get()));
+  MainMod = getModule(ProgramName, *MainContext.get(), StreamingObject.get());
 
-  if (!mod) return 1;
+  if (!MainMod) return 1;
 
   if (PNaClABIVerify) {
     // Verify the module (but not the functions yet)
-    ModulePass *VerifyPass = createPNaClABIVerifyModulePass(&ABIErrorReporter,
-                                                            LazyBitcode);
-    VerifyPass->runOnModule(*mod);
+    std::unique_ptr<ModulePass> VerifyPass(
+        createPNaClABIVerifyModulePass(&ABIErrorReporter, LazyBitcode));
+    VerifyPass->runOnModule(*MainMod);
     CheckABIVerifyErrors(ABIErrorReporter, "Module");
+    VerifyPass.reset();
   }
+
+  // Add declarations for external functions required by PNaCl. The
+  // ResolvePNaClIntrinsics function pass running during streaming
+  // depends on these declarations being in the module.
+  std::unique_ptr<ModulePass> AddPNaClExternalDeclsPass(
+      createAddPNaClExternalDeclsPass());
+  AddPNaClExternalDeclsPass->runOnModule(*MainMod);
+  AddPNaClExternalDeclsPass.reset();
 
   if (UserDefinedTriple.empty()) {
     report_fatal_error("-mtriple must be set to a target triple for pnacl-llc");
   } else {
-    mod->setTargetTriple(Triple::normalize(UserDefinedTriple));
-    TheTriple = Triple(mod->getTargetTriple());
+    MainMod->setTargetTriple(Triple::normalize(UserDefinedTriple));
+    TheTriple = Triple(MainMod->getTargetTriple());
   }
 
   // Get the target specific parser.
@@ -600,26 +710,8 @@ static int compileModule(StringRef ProgramName) {
     return 1;
   }
 
-  TargetOptions Options;
-  Options.LessPreciseFPMADOption = EnableFPMAD;
-  Options.NoFramePointerElim = DisableFPElim;
-  Options.AllowFPOpFusion = FuseFPOps;
-  Options.UnsafeFPMath = EnableUnsafeFPMath;
-  Options.NoInfsFPMath = EnableNoInfsFPMath;
-  Options.NoNaNsFPMath = EnableNoNaNsFPMath;
-  Options.HonorSignDependentRoundingFPMathOption =
-      EnableHonorSignDependentRoundingFPMath;
-  Options.UseSoftFloat = GenerateSoftFloatCalls;
-  if (FloatABIForCalls != FloatABI::Default)
-    Options.FloatABIType = FloatABIForCalls;
-  Options.NoZerosInBSS = DontPlaceZerosInBSS;
-  Options.GuaranteedTailCallOpt = EnableGuaranteedTailCallOpt;
-  Options.DisableTailCalls = DisableTailCalls;
-  Options.StackAlignmentOverride = OverrideStackAlignment;
-  Options.TrapFuncName = TrapFuncName;
-  Options.PositionIndependentExecutable = EnablePIE;
-  Options.EnableSegmentedStacks = SegmentedStacks;
-  Options.UseInitArray = UseInitArray;
+  TargetOptions Options = InitTargetOptionsFromCodeGenFlags();
+  Options.DisableIntegratedAS = NoIntegratedAssembler;
 
   if (GenerateSoftFloatCalls)
     FloatABIForCalls = FloatABI::Soft;
@@ -647,10 +739,14 @@ static int compileModule(StringRef ProgramName) {
 
   SmallVector<pthread_t, 4> Pthreads(SplitModuleCount);
   SmallVector<ThreadData, 4> ThreadDatas(SplitModuleCount);
+  ThreadedFunctionQueue FuncQueue(MainMod.get(), SplitModuleCount);
 
   if (SplitModuleCount == 1) {
+    // No need for dynamic scheduling with one thread.
+    SplitModuleSched = SplitModuleStatic;
     return compileSplitModule(Options, TheTriple, TheTarget, FeaturesStr,
-                              OLvl, ProgramName, mod.get(), NULL, 0);
+                              OLvl, ProgramName, MainMod.get(), nullptr, 0,
+                              &FuncQueue);
   }
 
   for(unsigned ModuleIndex = 0; ModuleIndex < SplitModuleCount; ++ModuleIndex) {
@@ -660,10 +756,11 @@ static int compileModule(StringRef ProgramName) {
     ThreadDatas[ModuleIndex].FeaturesStr = FeaturesStr;
     ThreadDatas[ModuleIndex].OLvl = OLvl;
     ThreadDatas[ModuleIndex].ProgramName = ProgramName.str();
-    ThreadDatas[ModuleIndex].GlobalModule = mod.get();
+    ThreadDatas[ModuleIndex].GlobalModuleRef = MainMod.get();
     ThreadDatas[ModuleIndex].StreamingObject = StreamingObject.get();
     ThreadDatas[ModuleIndex].ModuleIndex = ModuleIndex;
-    if (pthread_create(&Pthreads[ModuleIndex], NULL, runCompileThread,
+    ThreadDatas[ModuleIndex].FuncQueue = &FuncQueue;
+    if (pthread_create(&Pthreads[ModuleIndex], nullptr, runCompileThread,
                         &ThreadDatas[ModuleIndex])) {
       report_fatal_error("Failed to create thread");
     }
@@ -680,9 +777,9 @@ static int compileModule(StringRef ProgramName) {
 }
 
 int main(int argc, char **argv) {
-#if defined(__native_client__)
+#if defined(PNACL_BROWSER_TRANSLATOR)
   return srpc_main(argc, argv);
 #else
   return llc_main(argc, argv);
-#endif // __native_client__
+#endif // PNACL_BROWSER_TRANSLATOR
 }

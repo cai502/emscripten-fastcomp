@@ -33,14 +33,15 @@
 #include "llvm/IR/Operator.h"
 #include "llvm/Pass.h"
 #include "llvm/PassManager.h"
-#include "llvm/Support/CallSite.h"
+#include "llvm/IR/CallSite.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormattedStream.h"
-#include "llvm/Support/GetElementPtrTypeIterator.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/TargetRegistry.h"
-#include "llvm/DebugInfo.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/Transforms/NaCl.h"
 #include <algorithm>
 #include <cstdio>
 #include <map>
@@ -87,11 +88,6 @@ static cl::opt<bool>
 NoAliasingFunctionPointers("emscripten-no-aliasing-function-pointers",
                            cl::desc("Forces function pointers to not alias (this is more correct, but rarely needed, and has the cost of much larger function tables; it is useful for debugging though; see emscripten ALIASING_FUNCTION_POINTERS option)"),
                            cl::init(false));
-
-static cl::opt<int>
-MaxSetjmps("emscripten-max-setjmps",
-           cl::desc("Maximum amount of setjmp() calls per function stack frame (see emscripten MAX_SETJMPS)"),
-           cl::init(20));
 
 static cl::opt<int>
 GlobalBase("emscripten-global-base",
@@ -156,6 +152,7 @@ namespace {
     std::vector<std::string> GlobalInitializers;
     std::vector<std::string> Exports; // additional exports
     BlockAddressMap BlockAddresses;
+    NameIntMap AsmConsts;
     AddressList objcSelectorRefs;
     AddressList objcMessageRefs;
     AddressList objcClassRefs;
@@ -171,7 +168,8 @@ namespace {
     bool UsesSIMD;
     int InvokeState; // cycles between 0, 1 after preInvoke, 2 after call, 0 again after postInvoke. hackish, no argument there.
     CodeGenOpt::Level OptLevel;
-    DataLayout *DL;
+    const DataLayout *DL;
+    bool StackBumped;
 
     #include "CallHandlers.h"
 
@@ -179,15 +177,15 @@ namespace {
     static char ID;
     JSWriter(formatted_raw_ostream &o, CodeGenOpt::Level OptLevel)
       : ModulePass(ID), Out(o), UniqueNum(0), NextFunctionIndex(0), CantValidate(""), UsesSIMD(false), InvokeState(0),
-        OptLevel(OptLevel) {}
+        OptLevel(OptLevel), StackBumped(false) {}
 
-    virtual const char *getPassName() const { return "JavaScript backend"; }
+    const char *getPassName() const override { return "JavaScript backend"; }
 
-    virtual bool runOnModule(Module &M);
+    bool runOnModule(Module &M) override;
 
-    virtual void getAnalysisUsage(AnalysisUsage &AU) const {
+    void getAnalysisUsage(AnalysisUsage &AU) const override {
       AU.setPreservesAll();
-      AU.addRequired<DataLayout>();
+      AU.addRequired<DataLayoutPass>();
       ModulePass::getAnalysisUsage(AU);
     }
 
@@ -196,7 +194,7 @@ namespace {
     void printFunction(const Function *F);
 	void printAddressList(AddressList &addressList);
 
-    void error(const std::string& msg);
+    LLVM_ATTRIBUTE_NORETURN void error(const std::string& msg);
 
     formatted_raw_ostream& nl(formatted_raw_ostream &Out, int delta = 0);
 
@@ -384,6 +382,37 @@ namespace {
         }
         return getGlobalAddress(V->getName().str());
       }
+    }
+
+    // Transform the string input into emscripten_asm_const_*(str, args1, arg2)
+    // into an id. We emit a map of id => string contents, and emscripten
+    // wraps it up so that calling that id calls that function.
+    unsigned getAsmConstId(const Value *V) {
+      V = resolveFully(V);
+      const Constant *CI = cast<GlobalVariable>(V)->getInitializer();
+      std::string code;
+      if (isa<ConstantAggregateZero>(CI)) {
+        code = " ";
+      } else {
+        const ConstantDataSequential *CDS = cast<ConstantDataSequential>(CI);
+        code = CDS->getAsString();
+        // replace newlines quotes with escaped newlines
+        size_t curr = 0;
+        while ((curr = code.find("\\n", curr)) != std::string::npos) {
+          code = code.replace(curr, 2, "\\\\n");
+          curr += 3; // skip this one
+        }
+        // replace double quotes with escaped single quotes
+        curr = 0;
+        while ((curr = code.find('"', curr)) != std::string::npos) {
+          code = code.replace(curr, 1, "\\" "\"");
+          curr += 2; // skip this one
+        }
+      }
+      if (AsmConsts.count(code) > 0) return AsmConsts[code];
+      unsigned id = AsmConsts.size();
+      AsmConsts[code] = id;
+      return id;
     }
 
     // Test whether the given value is known to be an absolute value or one we turn into an absolute value
@@ -721,8 +750,8 @@ std::string JSWriter::getCast(const StringRef &s, Type *t, AsmCast sign) {
     }
     case Type::VectorTyID:
       return (cast<VectorType>(t)->getElementType()->isIntegerTy() ?
-              "SIMD_int32x4(" + s + ")" :
-              "SIMD_float32x4(" + s + ")").str();
+              "SIMD_int32x4_check(" + s + ")" :
+              "SIMD_float32x4_check(" + s + ")").str();
     case Type::FloatTyID: {
       if (PreciseF32 && !(sign & ASM_FFI_OUT)) {
         if (sign & ASM_FFI_IN) {
@@ -1073,6 +1102,7 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
   } else if (isa<UndefValue>(CV)) {
     std::string S;
     if (VectorType *VT = dyn_cast<VectorType>(CV->getType())) {
+      checkVectorType(VT);
       if (VT->getElementType()->isIntegerTy()) {
         S = "SIMD_int32x4_splat(0)";
       } else {
@@ -1087,6 +1117,7 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
     return S;
   } else if (isa<ConstantAggregateZero>(CV)) {
     if (VectorType *VT = dyn_cast<VectorType>(CV->getType())) {
+      checkVectorType(VT);
       if (VT->getElementType()->isIntegerTy()) {
         return "SIMD_int32x4_splat(0)";
       } else {
@@ -1097,6 +1128,7 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
       return "0";
     }
   } else if (const ConstantDataVector *DV = dyn_cast<ConstantDataVector>(CV)) {
+    checkVectorType(DV->getType());
     unsigned NumElts = cast<VectorType>(DV->getType())->getNumElements();
     Type *EltTy = cast<VectorType>(DV->getType())->getElementType();
     Constant *Undef = UndefValue::get(EltTy);
@@ -1106,6 +1138,7 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
                              getConstant(NumElts > 2 ? DV->getElementAsConstant(2) : Undef),
                              getConstant(NumElts > 3 ? DV->getElementAsConstant(3) : Undef));
   } else if (const ConstantVector *V = dyn_cast<ConstantVector>(CV)) {
+    checkVectorType(V->getType());
     unsigned NumElts = cast<VectorType>(CV->getType())->getNumElements();
     Type *EltTy = cast<VectorType>(CV->getType())->getElementType();
     Constant *Undef = UndefValue::get(EltTy);
@@ -1204,7 +1237,7 @@ void JSWriter::generateInsertElementExpression(const InsertElementInst *III, raw
   // is part of either such sequence, skip it for now; we'll process it when we
   // reach the end.
   if (III->hasOneUse()) {
-      const User *U = *III->use_begin();
+      const User *U = *III->user_begin();
       if (isa<InsertElementInst>(U))
           return;
       if (isa<ShuffleVectorInst>(U) &&
@@ -1249,7 +1282,13 @@ void JSWriter::generateInsertElementExpression(const InsertElementInst *III, raw
       if (VT->getElementType()->isIntegerTy()) {
         Code << "SIMD_int32x4_splat(" << getValueAsStr(Splat) << ")";
       } else {
-        Code << "SIMD_float32x4_splat(" << getValueAsStr(Splat) << ")";
+        std::string operand = getValueAsStr(Splat);
+        if (!PreciseF32) {
+          // SIMD_float32x4_splat requires an actual float32 even if we're
+          // otherwise not being precise about it.
+          operand = "Math_fround(" + operand + ")";
+        }
+        Code << "SIMD_float32x4_splat(" << operand << ")";
       }
     } else {
       // Emit constructor code.
@@ -1261,7 +1300,13 @@ void JSWriter::generateInsertElementExpression(const InsertElementInst *III, raw
       for (unsigned Index = 0; Index < NumElems; ++Index) {
         if (Index != 0)
           Code << ", ";
-        Code << getValueAsStr(Operands[Index]);
+        std::string operand = getValueAsStr(Operands[Index]);
+        if (!PreciseF32 && VT->getElementType()->isFloatTy()) {
+          // SIMD_float32x4_splat requires an actual float32 even if we're
+          // otherwise not being precise about it.
+          operand = "Math_fround(" + operand + ")";
+        }
+        Code << operand;
       }
       Code << ")";
     }
@@ -1277,7 +1322,11 @@ void JSWriter::generateInsertElementExpression(const InsertElementInst *III, raw
       } else {
         with = "SIMD_float32x4_with";
       }
-      Result = with + SIMDLane[Index] + "(" + Result + ',' + getValueAsStr(Operands[Index]) + ')';
+      std::string operand = getValueAsStr(Operands[Index]);
+      if (!PreciseF32) {
+        operand = "Math_fround(" + operand + ")";
+      }
+      Result = with + SIMDLane[Index] + "(" + Result + ',' + operand + ')';
     }
     Code << Result;
   }
@@ -1314,12 +1363,18 @@ void JSWriter::generateShuffleVectorExpression(const ShuffleVectorInst *SVI, raw
     InsertElementInst *IEI = cast<InsertElementInst>(SVI->getOperand(0));
     if (ConstantInt *CI = dyn_cast<ConstantInt>(IEI->getOperand(2))) {
       if (CI->isZero()) {
+        std::string operand = getValueAsStr(IEI->getOperand(1));
+        if (!PreciseF32) {
+          // SIMD_float32x4_splat requires an actual float32 even if we're
+          // otherwise not being precise about it.
+          operand = "Math_fround(" + operand + ")";
+        }
         if (SVI->getType()->getElementType()->isIntegerTy()) {
           Code << "SIMD_int32x4_splat(";
         } else {
           Code << "SIMD_float32x4_splat(";
         }
-        Code << getValueAsStr(IEI->getOperand(1)) << ")";
+        Code << operand << ")";
         return;
       }
     }
@@ -1554,6 +1609,9 @@ void JSWriter::generateUnrolledExpression(const User *I, raw_string_ostream& Cod
   for (unsigned Index = 0; Index < VT->getNumElements(); ++Index) {
     if (Index != 0)
         Code << ", ";
+    if (!PreciseF32 && VT->getElementType()->isFloatTy()) {
+        Code << "Math_fround(";
+    }
     std::string Lane = VT->getNumElements() <= 4 ?
                        std::string(".") + simdLane[Index] :
                        ".s" + utostr(Index);
@@ -1587,6 +1645,9 @@ void JSWriter::generateUnrolledExpression(const User *I, raw_string_ostream& Cod
              << getValueAsStr(I->getOperand(1)) << Lane << "|0)|0";
         break;
       default: I->dump(); error("invalid unrolled vector instr"); break;
+    }
+    if (!PreciseF32 && VT->getElementType()->isFloatTy()) {
+        Code << ")";
     }
   }
 
@@ -1769,7 +1830,9 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
   case Instruction::Ret: {
     const ReturnInst* ret =  cast<ReturnInst>(I);
     const Value *RV = ret->getReturnValue();
-    Code << "STACKTOP = sp;";
+    if (StackBumped) {
+      Code << "STACKTOP = sp;";
+    }
     Code << "return";
     if (RV != NULL) {
       Code << " " << getValueAsCastParenStr(RV, ASM_NONSPECIFIC | ASM_MUST_CAST);
@@ -1943,6 +2006,13 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
   case Instruction::Alloca: {
     const AllocaInst* AI = cast<AllocaInst>(I);
 
+    // We've done an alloca, so we'll have bumped the stack and will
+    // need to restore it.
+    // Yes, we shouldn't have to bump it for nativized vars, however
+    // they are included in the frame offset, so the restore is still
+    // needed until that is fixed.
+    StackBumped = true;
+
     if (NativizedVars.count(AI)) {
       // nativized stack variable, we just need a 'var' definition
       UsedVars[getJSName(AI)] = AI->getType()->getElementType();
@@ -2020,8 +2090,10 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
     gep_type_iterator GTI = gep_type_begin(GEP);
     int32_t ConstantOffset = 0;
     std::string text = getValueAsParenStr(GEP->getPointerOperand());
-    for (GetElementPtrInst::const_op_iterator I = llvm::next(GEP->op_begin()),
-                                              E = GEP->op_end();
+
+    GetElementPtrInst::const_op_iterator I = GEP->op_begin();
+    I++;
+    for (GetElementPtrInst::const_op_iterator E = GEP->op_end();
        I != E; ++I) {
       const Value *Index = *I;
       if (StructType *STy = dyn_cast<StructType>(*GTI++)) {
@@ -2131,14 +2203,6 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
                                     getValueAsStr(I->getOperand(2));
     break;
   }
-  case Instruction::AtomicCmpXchg: {
-    const AtomicCmpXchgInst *cxi = cast<AtomicCmpXchgInst>(I);
-    const Value *P = I->getOperand(0);
-    Code << getLoad(cxi, P, I->getType(), 0) << ';' <<
-           "if ((" << getCast(getJSName(I), I->getType()) << ") == " << getValueAsCastParenStr(I->getOperand(1)) << ") " <<
-              getStore(cxi, P, I->getType(), getValueAsStr(I->getOperand(2)), 0);
-    break;
-  }
   case Instruction::AtomicRMW: {
     const AtomicRMWInst *rmwi = cast<AtomicRMWInst>(I);
     const Value *P = rmwi->getOperand(0);
@@ -2217,6 +2281,10 @@ void JSWriter::printFunctionBody(const Function *F) {
   Relooper::MakeOutputBuffer(1024*1024);
   Relooper R;
   //if (!canReloop(F)) R.SetEmulate(true);
+  if (F->getAttributes().hasAttribute(AttributeSet::FunctionIndex, Attribute::MinSize) ||
+      F->getAttributes().hasAttribute(AttributeSet::FunctionIndex, Attribute::OptimizeForSize)) {
+    R.SetMinSize(true);
+  }
   R.SetAsmJSMode(1);
   Block *Entry = NULL;
   LLVMToRelooperMap LLVMToRelooper;
@@ -2364,6 +2432,14 @@ void JSWriter::printFunctionBody(const Function *F) {
     nl(Out);
   }
 
+  {
+    static bool Warned = false;
+    if (!Warned && OptLevel < 2 && UsedVars.size() > 2000) {
+      prettyWarning() << "emitted code will contain very large numbers of local variables, which is bad for performance (build to JS with -O2 or above to avoid this - make sure to do so both on source files, and during 'linking')\n";
+      Warned = true;
+    }
+  }
+
   // Emit stack entry
   Out << " " << getAdHocAssign("sp", Type::getInt32Ty(F->getContext())) << "STACKTOP;";
   if (uint64_t FrameSize = Allocas.getFrameSize()) {
@@ -2428,7 +2504,7 @@ void JSWriter::processConstants() {
   for (std::vector<std::string>::iterator i = objcSections.begin(), e = objcSections.end(); i != e; ++i) {
     for (Module::const_global_iterator I = TheModule->global_begin(),
            E = TheModule->global_end(); I != E; ++I) {
-      if (I->hasInitializer() && I->getSection().find(*i, 0) != std::string::npos) {
+      if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
         parseConstant(I->getName().str(), I->getInitializer(), true);
       }
     }
@@ -2443,7 +2519,7 @@ void JSWriter::processConstants() {
   for (std::vector<std::string>::iterator i = objcSections.begin(), e = objcSections.end(); i != e; ++i) {
     for (Module::const_global_iterator I = TheModule->global_begin(),
            E = TheModule->global_end(); I != E; ++I) {
-      if (I->hasInitializer() && I->getSection().find(*i, 0) != std::string::npos) {
+      if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
         parseConstant(I->getName().str(), I->getInitializer(), false);
       }
     }
@@ -2531,6 +2607,7 @@ void JSWriter::printFunction(const Function *F) {
   nl(Out);
 
   Allocas.clear();
+  StackBumped = false;
 }
 
 static std::string escapeJSONString(llvm::StringRef str)
@@ -2688,6 +2765,8 @@ void JSWriter::printModuleBody() {
       } else {
         Out << ", \n";
       }
+      std::string name = I->getName();
+      sanitizeGlobal(name);
       Out << "\"_" << escapeJSONString(I->getName()) << '"';
     }
   }
@@ -2751,6 +2830,18 @@ void JSWriter::printModuleBody() {
       Out << ", \n";
     }
     Out << "\"_" << escapeJSONString(I->first) << "\": \"" << escapeJSONString(utostr(I->second)) << "\"";
+  }
+  Out << "},";
+
+  Out << "\"asmConsts\": {";
+  first = true;
+  for (NameIntMap::const_iterator I = AsmConsts.begin(), E = AsmConsts.end(); I != E; ++I) {
+    if (first) {
+      first = false;
+    } else {
+      Out << ", ";
+    }
+    Out << "\"" << utostr(I->second) << "\": \"" << I->first.c_str() << "\"";
   }
   Out << "},";
 
@@ -2846,7 +2937,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
     }
   } else if (const ConstantArray *CA = dyn_cast<ConstantArray>(CV)) {
     if (calculate) {
-      for (Constant::const_use_iterator UI = CV->use_begin(), UE = CV->use_end(); UI != UE; ++UI) {
+      for (Constant::const_user_iterator UI = CV->user_begin(), UE = CV->user_end(); UI != UE; ++UI) {
         if ((*UI)->getName() == "llvm.used") {
           // export the kept-alives
           for (unsigned i = 0; i < CA->getNumOperands(); i++) {
@@ -3008,7 +3099,7 @@ void JSWriter::calculateNativizedVars(const Function *F) {
         if (AI->getAllocatedType()->isAggregateType()) continue; // we do not nativize aggregates either
         // this is on the stack. if its address is never used nor escaped, we can nativize it
         bool Fail = false;
-        for (Instruction::const_use_iterator UI = I->use_begin(), UE = I->use_end(); UI != UE && !Fail; ++UI) {
+        for (Instruction::const_user_iterator UI = I->user_begin(), UE = I->user_end(); UI != UE && !Fail; ++UI) {
           const Instruction *U = dyn_cast<Instruction>(*UI);
           if (!U) { Fail = true; break; } // not an instruction, not cool
           switch (U->getOpcode()) {
@@ -3055,12 +3146,8 @@ void JSWriter::printModule(const std::string& fname,
 }
 
 bool JSWriter::runOnModule(Module &M) {
-  if (M.getTargetTriple() != "asmjs-unknown-emscripten") {
-    prettyWarning() << "incorrect target triple '" << M.getTargetTriple() << "' (did you use emcc/em++ on all source files and not clang directly?)\n";
-  }
-
   TheModule = &M;
-  DL = &getAnalysis<DataLayout>();
+  DL = &getAnalysis<DataLayoutPass>().getDataLayout();
 
   setupCallHandlers();
 
@@ -3070,6 +3157,24 @@ bool JSWriter::runOnModule(Module &M) {
 }
 
 char JSWriter::ID = 0;
+
+class CheckTriple : public ModulePass {
+public:
+  static char ID;
+  CheckTriple() : ModulePass(ID) {}
+  bool runOnModule(Module &M) override {
+    if (M.getTargetTriple() != "asmjs-unknown-emscripten") {
+      prettyWarning() << "incorrect target triple '" << M.getTargetTriple() << "' (did you use emcc/em++ on all source files and not clang directly?)\n";
+    }
+    return false;
+  }
+};
+
+char CheckTriple::ID;
+
+Pass *createCheckTriplePass() {
+  return new CheckTriple();
+}
 
 //===----------------------------------------------------------------------===//
 //                       External Interface declaration
@@ -3083,6 +3188,7 @@ bool JSTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
                                           AnalysisID StopAfter) {
   assert(FileType == TargetMachine::CGFT_AssemblyFile);
 
+  PM.add(createCheckTriplePass());
   PM.add(createExpandInsertExtractElementPass());
   PM.add(createExpandI64Pass());
 
@@ -3092,7 +3198,7 @@ bool JSTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
   // because the regular optimizer should have taken them all (GVN, and possibly
   // also SROA).
   if (OptLevel == CodeGenOpt::None)
-    PM.add(createSimplifyAllocasPass());
+    PM.add(createEmscriptenSimplifyAllocasPass());
 
   PM.add(new JSWriter(o, OptLevel));
 

@@ -26,12 +26,15 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "hexagon-instrinfo"
+
 #define GET_INSTRINFO_CTOR_DTOR
 #define GET_INSTRMAP_INFO
 #include "HexagonGenInstrInfo.inc"
 #include "HexagonGenDFAPacketizer.inc"
-
-using namespace llvm;
 
 ///
 /// Constants for Hexagon instructions.
@@ -135,7 +138,7 @@ HexagonInstrInfo::InsertBranch(MachineBasicBlock &MBB,MachineBasicBlock *TBB,
       regPos = 1;
     }
 
-    if (FBB == 0) {
+    if (!FBB) {
       if (Cond.empty()) {
         // Due to a bug in TailMerging/CFG Optimization, we need to add a
         // special case handling of a predicated jump followed by an
@@ -147,11 +150,11 @@ HexagonInstrInfo::InsertBranch(MachineBasicBlock &MBB,MachineBasicBlock *TBB,
         if (isPredicated(Term) && !AnalyzeBranch(MBB, NewTBB, NewFBB, Cond,
                                                  false)) {
           MachineBasicBlock *NextBB =
-            llvm::next(MachineFunction::iterator(&MBB));
+            std::next(MachineFunction::iterator(&MBB));
           if (NewTBB == NextBB) {
             ReverseBranchCondition(Cond);
             RemoveBranch(MBB);
-            return InsertBranch(MBB, TBB, 0, Cond, DL);
+            return InsertBranch(MBB, TBB, nullptr, Cond, DL);
           }
         }
         BuildMI(&MBB, DL, get(BOpc)).addMBB(TBB);
@@ -174,8 +177,8 @@ bool HexagonInstrInfo::AnalyzeBranch(MachineBasicBlock &MBB,
                                  MachineBasicBlock *&FBB,
                                  SmallVectorImpl<MachineOperand> &Cond,
                                  bool AllowModify) const {
-  TBB = NULL;
-  FBB = NULL;
+  TBB = nullptr;
+  FBB = nullptr;
 
   // If the block has no terminators, it just falls into the block after it.
   MachineBasicBlock::instr_iterator I = MBB.instr_end();
@@ -224,7 +227,7 @@ bool HexagonInstrInfo::AnalyzeBranch(MachineBasicBlock &MBB,
 
   // Get the last instruction in the block.
   MachineInstr *LastInst = I;
-  MachineInstr *SecondLastInst = NULL;
+  MachineInstr *SecondLastInst = nullptr;
   // Find one more terminator if present.
   do {
     if (&*I != LastInst && !I->isBundle() && isUnpredicatedTerminator(I)) {
@@ -344,14 +347,14 @@ bool HexagonInstrInfo::analyzeCompare(const MachineInstr *MI,
   // Set mask and the first source register.
   switch (Opc) {
     case Hexagon::CMPEHexagon4rr:
-    case Hexagon::CMPEQri:
-    case Hexagon::CMPEQrr:
+    case Hexagon::C2_cmpeqi:
+    case Hexagon::C2_cmpeq:
     case Hexagon::CMPGT64rr:
     case Hexagon::CMPGTU64rr:
-    case Hexagon::CMPGTUri:
-    case Hexagon::CMPGTUrr:
-    case Hexagon::CMPGTri:
-    case Hexagon::CMPGTrr:
+    case Hexagon::C2_cmpgtui:
+    case Hexagon::C2_cmpgtu:
+    case Hexagon::C2_cmpgti:
+    case Hexagon::C2_cmpgt:
       SrcReg = MI->getOperand(1).getReg();
       Mask = ~0;
       break;
@@ -378,11 +381,11 @@ bool HexagonInstrInfo::analyzeCompare(const MachineInstr *MI,
   // Set the value/second source register.
   switch (Opc) {
     case Hexagon::CMPEHexagon4rr:
-    case Hexagon::CMPEQrr:
+    case Hexagon::C2_cmpeq:
     case Hexagon::CMPGT64rr:
     case Hexagon::CMPGTU64rr:
-    case Hexagon::CMPGTUrr:
-    case Hexagon::CMPGTrr:
+    case Hexagon::C2_cmpgtu:
+    case Hexagon::C2_cmpgt:
     case Hexagon::CMPbEQrr_sbsb_V4:
     case Hexagon::CMPbEQrr_ubub_V4:
     case Hexagon::CMPbGTUrr_V4:
@@ -394,9 +397,9 @@ bool HexagonInstrInfo::analyzeCompare(const MachineInstr *MI,
       SrcReg2 = MI->getOperand(2).getReg();
       return true;
 
-    case Hexagon::CMPEQri:
-    case Hexagon::CMPGTUri:
-    case Hexagon::CMPGTri:
+    case Hexagon::C2_cmpeqi:
+    case Hexagon::C2_cmpgtui:
+    case Hexagon::C2_cmpgti:
     case Hexagon::CMPbEQri_V4:
     case Hexagon::CMPbGTUri_V4:
     case Hexagon::CMPhEQri_V4:
@@ -557,7 +560,7 @@ MachineInstr *HexagonInstrInfo::foldMemoryOperandImpl(MachineFunction &MF,
                                           const SmallVectorImpl<unsigned> &Ops,
                                                     int FI) const {
   // Hexagon_TODO: Implement.
-  return(0);
+  return nullptr;
 }
 
 unsigned HexagonInstrInfo::createVR(MachineFunction* MF, MVT VT) const {
@@ -710,12 +713,12 @@ bool HexagonInstrInfo::isPredicable(MachineInstr *MI) const {
   case Hexagon::ADD_ri:
     return isInt<8>(MI->getOperand(2).getImm());
 
-  case Hexagon::ASLH:
-  case Hexagon::ASRH:
-  case Hexagon::SXTB:
-  case Hexagon::SXTH:
-  case Hexagon::ZXTB:
-  case Hexagon::ZXTH:
+  case Hexagon::A2_aslh:
+  case Hexagon::A2_asrh:
+  case Hexagon::A2_sxtb:
+  case Hexagon::A2_sxth:
+  case Hexagon::A2_zxtb:
+  case Hexagon::A2_zxth:
     return Subtarget.hasV4TOps();
   }
 
@@ -1261,12 +1264,12 @@ isSpillPredRegOp(const MachineInstr *MI) const {
 bool HexagonInstrInfo::isNewValueJumpCandidate(const MachineInstr *MI) const {
   switch (MI->getOpcode()) {
     default: return false;
-    case Hexagon::CMPEQrr:
-    case Hexagon::CMPEQri:
-    case Hexagon::CMPGTrr:
-    case Hexagon::CMPGTri:
-    case Hexagon::CMPGTUrr:
-    case Hexagon::CMPGTUri:
+    case Hexagon::C2_cmpeq:
+    case Hexagon::C2_cmpeqi:
+    case Hexagon::C2_cmpgt:
+    case Hexagon::C2_cmpgti:
+    case Hexagon::C2_cmpgtu:
+    case Hexagon::C2_cmpgtui:
       return true;
   }
 }
@@ -1288,38 +1291,58 @@ isConditionalTransfer (const MachineInstr *MI) const {
 }
 
 bool HexagonInstrInfo::isConditionalALU32 (const MachineInstr* MI) const {
-  const HexagonRegisterInfo& QRI = getRegisterInfo();
   switch (MI->getOpcode())
   {
     default: return false;
+    case Hexagon::A2_paddf:
+    case Hexagon::A2_paddfnew:
+    case Hexagon::A2_paddt:
+    case Hexagon::A2_paddtnew:
+    case Hexagon::A2_pandf:
+    case Hexagon::A2_pandfnew:
+    case Hexagon::A2_pandt:
+    case Hexagon::A2_pandtnew:
+    case Hexagon::A4_paslhf:
+    case Hexagon::A4_paslhfnew:
+    case Hexagon::A4_paslht:
+    case Hexagon::A4_paslhtnew:
+    case Hexagon::A4_pasrhf:
+    case Hexagon::A4_pasrhfnew:
+    case Hexagon::A4_pasrht:
+    case Hexagon::A4_pasrhtnew:
+    case Hexagon::A2_porf:
+    case Hexagon::A2_porfnew:
+    case Hexagon::A2_port:
+    case Hexagon::A2_portnew:
+    case Hexagon::A2_psubf:
+    case Hexagon::A2_psubfnew:
+    case Hexagon::A2_psubt:
+    case Hexagon::A2_psubtnew:
+    case Hexagon::A2_pxorf:
+    case Hexagon::A2_pxorfnew:
+    case Hexagon::A2_pxort:
+    case Hexagon::A2_pxortnew:
+    case Hexagon::A4_psxthf:
+    case Hexagon::A4_psxthfnew:
+    case Hexagon::A4_psxtht:
+    case Hexagon::A4_psxthtnew:
+    case Hexagon::A4_psxtbf:
+    case Hexagon::A4_psxtbfnew:
+    case Hexagon::A4_psxtbt:
+    case Hexagon::A4_psxtbtnew:
+    case Hexagon::A4_pzxtbf:
+    case Hexagon::A4_pzxtbfnew:
+    case Hexagon::A4_pzxtbt:
+    case Hexagon::A4_pzxtbtnew:
+    case Hexagon::A4_pzxthf:
+    case Hexagon::A4_pzxthfnew:
+    case Hexagon::A4_pzxtht:
+    case Hexagon::A4_pzxthtnew:
     case Hexagon::ADD_ri_cPt:
     case Hexagon::ADD_ri_cNotPt:
-    case Hexagon::ADD_rr_cPt:
-    case Hexagon::ADD_rr_cNotPt:
-    case Hexagon::XOR_rr_cPt:
-    case Hexagon::XOR_rr_cNotPt:
-    case Hexagon::AND_rr_cPt:
-    case Hexagon::AND_rr_cNotPt:
-    case Hexagon::OR_rr_cPt:
-    case Hexagon::OR_rr_cNotPt:
-    case Hexagon::SUB_rr_cPt:
-    case Hexagon::SUB_rr_cNotPt:
     case Hexagon::COMBINE_rr_cPt:
     case Hexagon::COMBINE_rr_cNotPt:
       return true;
-    case Hexagon::ASLH_cPt_V4:
-    case Hexagon::ASLH_cNotPt_V4:
-    case Hexagon::ASRH_cPt_V4:
-    case Hexagon::ASRH_cNotPt_V4:
-    case Hexagon::SXTB_cPt_V4:
-    case Hexagon::SXTB_cNotPt_V4:
-    case Hexagon::SXTH_cPt_V4:
-    case Hexagon::SXTH_cNotPt_V4:
-    case Hexagon::ZXTB_cPt_V4:
-    case Hexagon::ZXTB_cNotPt_V4:
-    case Hexagon::ZXTH_cPt_V4:
-    case Hexagon::ZXTH_cNotPt_V4:
-      return QRI.Subtarget.hasV4TOps();
   }
 }
 
@@ -1535,14 +1558,13 @@ int HexagonInstrInfo::GetDotOldOp(const int opc) const {
   int NewOp = opc;
   if (isPredicated(NewOp) && isPredicatedNew(NewOp)) { // Get predicate old form
     NewOp = Hexagon::getPredOldOpcode(NewOp);
-    if (NewOp < 0)
-      assert(0 && "Couldn't change predicate new instruction to its old form.");
+    assert(NewOp >= 0 &&
+           "Couldn't change predicate new instruction to its old form.");
   }
 
-  if (isNewValueStore(NewOp)) { // Convert into non new-value format
+  if (isNewValueStore(NewOp)) { // Convert into non-new-value format
     NewOp = Hexagon::getNonNVStore(NewOp);
-    if (NewOp < 0)
-      assert(0 && "Couldn't change new-value store to its old form.");
+    assert(NewOp >= 0 && "Couldn't change new-value store to its old form.");
   }
   return NewOp;
 }
@@ -1634,11 +1656,10 @@ void HexagonInstrInfo::immediateExtend(MachineInstr *MI) const {
   MO.addTargetFlag(HexagonII::HMOTF_ConstExtended);
 }
 
-DFAPacketizer *HexagonInstrInfo::
-CreateTargetScheduleState(const TargetMachine *TM,
-                           const ScheduleDAG *DAG) const {
-  const InstrItineraryData *II = TM->getInstrItineraryData();
-  return TM->getSubtarget<HexagonGenSubtargetInfo>().createDFAPacketizer(II);
+DFAPacketizer *HexagonInstrInfo::CreateTargetScheduleState(
+    const TargetSubtargetInfo &STI) const {
+  const InstrItineraryData *II = STI.getInstrItineraryData();
+  return static_cast<const HexagonSubtarget &>(STI).createDFAPacketizer(II);
 }
 
 bool HexagonInstrInfo::isSchedulingBoundary(const MachineInstr *MI,
@@ -1654,7 +1675,7 @@ bool HexagonInstrInfo::isSchedulingBoundary(const MachineInstr *MI,
     return false;
 
   // Terminators and labels can't be scheduled around.
-  if (MI->getDesc().isTerminator() || MI->isLabel() || MI->isInlineAsm())
+  if (MI->getDesc().isTerminator() || MI->isPosition() || MI->isInlineAsm())
     return true;
 
   return false;
@@ -1763,7 +1784,7 @@ int HexagonInstrInfo::getMinValue(const MachineInstr *MI) const {
                     & HexagonII::ExtentBitsMask;
 
   if (isSigned) // if value is signed
-    return -1 << (bits - 1);
+    return -1U << (bits - 1);
   else
     return 0;
 }
@@ -1777,9 +1798,9 @@ int HexagonInstrInfo::getMaxValue(const MachineInstr *MI) const {
                     & HexagonII::ExtentBitsMask;
 
   if (isSigned) // if value is signed
-    return ~(-1 << (bits - 1));
+    return ~(-1U << (bits - 1));
   else
-    return ~(-1 << bits);
+    return ~(-1U << bits);
 }
 
 // Returns true if an instruction can be converted into a non-extended
@@ -1793,7 +1814,7 @@ bool HexagonInstrInfo::NonExtEquivalentExists (const MachineInstr *MI) const {
     return true;
 
   if (MI->getDesc().mayLoad() || MI->getDesc().mayStore()) {
-    // Check addressing mode and retreive non-ext equivalent instruction.
+    // Check addressing mode and retrieve non-ext equivalent instruction.
 
     switch (getAddrMode(MI)) {
     case HexagonII::Absolute :
@@ -1827,7 +1848,7 @@ short HexagonInstrInfo::getNonExtOpcode (const MachineInstr *MI) const {
       return NonExtOpcode;
 
   if (MI->getDesc().mayLoad() || MI->getDesc().mayStore()) {
-    // Check addressing mode and retreive non-ext equivalent instruction.
+    // Check addressing mode and retrieve non-ext equivalent instruction.
     switch (getAddrMode(MI)) {
     case HexagonII::Absolute :
       return Hexagon::getBasedWithImmOffset(MI->getOpcode());

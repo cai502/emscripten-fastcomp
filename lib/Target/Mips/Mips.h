@@ -12,37 +12,21 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef TARGET_MIPS_H
-#define TARGET_MIPS_H
+#ifndef LLVM_LIB_TARGET_MIPS_MIPS_H
+#define LLVM_LIB_TARGET_MIPS_MIPS_H
 
 #include "MCTargetDesc/MipsMCTargetDesc.h"
 #include "llvm/Target/TargetMachine.h"
-
-/* @LOCALMOD-START */
-namespace llvm {
-
-namespace Mips {
-  extern unsigned LoadStoreStackMaskReg;
-  extern unsigned IndirectBranchMaskReg;
-}
-} // End llvm namespace
-/* @LOCALMOD-END */
 
 namespace llvm {
   class MipsTargetMachine;
   class FunctionPass;
 
   FunctionPass *createMipsISelDag(MipsTargetMachine &TM);
+  FunctionPass *createMipsOptimizePICCallPass(MipsTargetMachine &TM);
   FunctionPass *createMipsDelaySlotFillerPass(MipsTargetMachine &TM);
   FunctionPass *createMipsLongBranchPass(MipsTargetMachine &TM);
-  FunctionPass *createMipsJITCodeEmitterPass(MipsTargetMachine &TM,
-                                             JITCodeEmitter &JCE);
   FunctionPass *createMipsConstantIslandPass(MipsTargetMachine &tm);
-
-  // @LOCALMOD-START
-  FunctionPass *createMipsNaClRewritePass();
-  // @LOCALMOD-END
-
 } // end namespace llvm;
 
 #endif

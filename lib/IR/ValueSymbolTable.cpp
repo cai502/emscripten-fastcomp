@@ -11,7 +11,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "valuesymtab"
 #include "llvm/IR/ValueSymbolTable.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/IR/GlobalValue.h"
@@ -19,6 +18,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace llvm;
+
+#define DEBUG_TYPE "valuesymtab"
 
 // Class destructor
 ValueSymbolTable::~ValueSymbolTable() {
@@ -55,11 +56,10 @@ void ValueSymbolTable::reinsertValue(Value* V) {
     raw_svector_ostream(UniqueName) << ++LastUnique;
 
     // Try insert the vmap entry with this suffix.
-    ValueName &NewName = vmap.GetOrCreateValue(UniqueName);
-    if (NewName.getValue() == 0) {
+    auto IterBool = vmap.insert(std::make_pair(UniqueName, V));
+    if (IterBool.second) {
       // Newly inserted name.  Success!
-      NewName.setValue(V);
-      V->Name = &NewName;
+      V->Name = &*IterBool.first;
      //DEBUG(dbgs() << " Inserted value: " << UniqueName << ": " << *V << "\n");
       return;
     }
@@ -77,12 +77,11 @@ void ValueSymbolTable::removeValueName(ValueName *V) {
 /// auto-renames the name and returns that instead.
 ValueName *ValueSymbolTable::createValueName(StringRef Name, Value *V) {
   // In the common case, the name is not already in the symbol table.
-  ValueName &Entry = vmap.GetOrCreateValue(Name);
-  if (Entry.getValue() == 0) {
-    Entry.setValue(V);
+  auto IterBool = vmap.insert(std::make_pair(Name, V));
+  if (IterBool.second) {
     //DEBUG(dbgs() << " Inserted value: " << Entry.getKeyData() << ": "
     //           << *V << "\n");
-    return &Entry;
+    return &*IterBool.first;
   }
   
   // Otherwise, there is a naming conflict.  Rename this value.
@@ -94,12 +93,11 @@ ValueName *ValueSymbolTable::createValueName(StringRef Name, Value *V) {
     raw_svector_ostream(UniqueName) << ++LastUnique;
     
     // Try insert the vmap entry with this suffix.
-    ValueName &NewName = vmap.GetOrCreateValue(UniqueName);
-    if (NewName.getValue() == 0) {
-      // Newly inserted name.  Success!
-      NewName.setValue(V);
-     //DEBUG(dbgs() << " Inserted value: " << UniqueName << ": " << *V << "\n");
-      return &NewName;
+    auto IterBool = vmap.insert(std::make_pair(UniqueName, V));
+    if (IterBool.second) {
+      // DEBUG(dbgs() << " Inserted value: " << UniqueName << ": " << *V <<
+      //       "\n");
+      return &*IterBool.first;
     }
   }
 }

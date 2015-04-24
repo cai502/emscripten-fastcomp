@@ -11,20 +11,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/IR/LLVMContext.h"
-// Note: We need the following to provide the API for calling the NaCl
-// Bitcode Reader to read the frozen file.
 #include "llvm/Bitcode/NaCl/NaClReaderWriter.h"
-// Note: We need the following to provide the API for calling the (LLVM)
-// Bitcode Writer to generate the corresponding LLVM bitcode file.
 #include "llvm/Bitcode/ReaderWriter.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DataStream.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Signals.h"
-#include "llvm/Support/StreamableMemoryObject.h"
+#include "llvm/Support/StreamingMemoryObject.h"
 #include "llvm/Support/ToolOutputFile.h"
 
 using namespace llvm;
@@ -36,14 +33,19 @@ OutputFilename("o", cl::desc("Specify thawed pexe filename"),
 static cl::opt<std::string>
 InputFilename(cl::Positional, cl::desc("<frozen file>"), cl::init("-"));
 
+static cl::opt<bool>
+VerboseErrors(
+    "verbose-parse-errors",
+    cl::desc("Print out more descriptive PNaCl bitcode parse errors"),
+    cl::init(false));
+
 static void WriteOutputFile(const Module *M) {
 
-  std::string ErrorInfo;
-  OwningPtr<tool_output_file> Out
-    (new tool_output_file(OutputFilename.c_str(), ErrorInfo,
-                          sys::fs::F_Binary));
-  if (!ErrorInfo.empty()) {
-    errs() << ErrorInfo << '\n';
+  std::error_code EC;
+  std::unique_ptr<tool_output_file> Out(
+      new tool_output_file(OutputFilename, EC, sys::fs::F_None));
+  if (EC) {
+    errs() << EC.message() << '\n';
     exit(1);
   }
 
@@ -69,22 +71,27 @@ int main(int argc, char **argv) {
 
   // Use the bitcode streaming interface
   DataStreamer *streamer = getDataFileStreamer(InputFilename, &ErrorMessage);
-  StreamingMemoryObject *Buffer = new StreamingMemoryObject(streamer);
+  std::unique_ptr<StreamingMemoryObject> Buffer(
+      new StreamingMemoryObjectImpl(streamer));
   if (streamer) {
     std::string DisplayFilename;
     if (InputFilename == "-")
       DisplayFilename = "<stdin>";
     else
       DisplayFilename = InputFilename;
-    M.reset(getNaClStreamedBitcodeModule(
-        DisplayFilename, Buffer, Context,
-        &ErrorMessage, /*AcceptSupportedOnly=*/false));
-    if(M.get() != 0 && M->MaterializeAllPermanently(&ErrorMessage)) {
-      M.reset();
-    }
+    raw_ostream *Verbose = VerboseErrors ? &errs() : nullptr;
+    M.reset(getNaClStreamedBitcodeModule(DisplayFilename, Buffer.release(),
+                                         Context, Verbose,
+                                         &ErrorMessage,
+                                         /*AcceptSupportedOnly=*/false));
+    if (M.get())
+      if (std::error_code EC = M->materializeAllPermanently()) {
+        ErrorMessage = EC.message();
+        M.reset();
+      }
   }
 
-  if (M.get() == 0) {
+  if (!M.get()) {
     errs() << argv[0] << ": ";
     if (ErrorMessage.size())
       errs() << ErrorMessage << "\n";

@@ -46,11 +46,7 @@
 //===----------------------------------------------------------------------===//
 
 class NaClPI32<dag outs, dag ins, string asm>
-  : I<0, CustomFrm, outs, ins, asm, []>, Requires<[IsNaCl, In32BitMode]>;
-
-let isTerminator = 1, isBarrier = 1, hasCtrlDep = 1, isAsmParserOnly = 1 in {
-  def NACL_TRAP32  : NaClPI32<(outs), (ins), "nacltrap">;
-}
+  : I<0, CustomFrm, outs, ins, asm, []>, Requires<[IsNaCl, Not64BitMode]>;
 
 let isTerminator = 1, isReturn = 1, isBarrier = 1,
     hasCtrlDep = 1, FPForm = SpecialFP, isAsmParserOnly = 1 in {
@@ -64,27 +60,10 @@ let isBranch = 1, isTerminator = 1, isBarrier = 1, isIndirectBranch = 1,
 }
 
 let isCall = 1, isAsmParserOnly = 1 in {
-  def NACL_CALL32d : NaClPI32<(outs), (ins i32imm_pcrel:$dst),
-                     "naclcall\t$dst">;
   def NACL_CALL32r : NaClPI32<(outs), (ins GR32:$dst),
                      "naclcall\t$dst">;
 }
 
-// nacltlsaddr32 gets rewritten to:
-//     .bundle_align_end
-//     .bundle_lock
-//     leal\t$sym@TLSGD, %eax
-//     call\t___tls_get_addr@PLT
-//     .bundle_unlock
-// (The linker expects the leal+call sequence to be directly adjacent)
-let Defs = [EAX, ECX, EDX, FP0, FP1, FP2, FP3, FP4, FP5, FP6, ST0,
-            MM0, MM1, MM2, MM3, MM4, MM5, MM6, MM7,
-            XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
-            XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, XMM15, EFLAGS],
-    Uses = [ESP],
-    isAsmParserOnly = 1 in
-def NACL_TLS_addr32 : NaClPI32<(outs), (ins i32mem:$sym),
-                      "nacltlsaddr32\t$sym">;
 
 //===----------------------------------------------------------------------===//
 // 64-bit Native Client Pseudo Instructions
@@ -92,10 +71,6 @@ def NACL_TLS_addr32 : NaClPI32<(outs), (ins i32mem:$sym),
 
 class NaClPI64<dag outs, dag ins, string asm>
   : I<0, CustomFrm, outs, ins, asm, []>, Requires<[IsNaCl, In64BitMode]>;
-
-let isTerminator = 1, isBarrier = 1, hasCtrlDep = 1, isAsmParserOnly = 1 in {
-  def NACL_TRAP64  : NaClPI64<(outs), (ins), "nacltrap">;
-}
 
 let isTerminator = 1, isReturn = 1, isBarrier = 1,
     hasCtrlDep = 1, FPForm = SpecialFP, isAsmParserOnly = 1 in {
@@ -113,7 +88,7 @@ let isBranch = 1, isTerminator = 1, isBarrier = 1, isIndirectBranch = 1,
 
 let isCall = 1, isAsmParserOnly = 1 in {
   def NACL_CALL64d : NaClPI64<(outs), (ins i32imm_pcrel:$dst),
-                     "naclcall\t$dst">;
+                     "call{q}\t$dst">;
   def NACL_CALL64r : NaClPI64<(outs), (ins GR32:$dst, GR64:$rZP),
                      "naclcall\t$dst,$rZP">;
 }
@@ -130,6 +105,9 @@ let Defs = [RSP, EFLAGS], Uses = [RSP], isAsmParserOnly = 1 in {
 
   def NACL_SSPi32: NaClPI64<(outs), (ins i64i32imm:$off, GR64:$rZP),
                    "naclssp{q}\t{$off, $rZP|$rZP, $off}">;
+
+  def NACL_ANDSPi8: NaClPI64<(outs), (ins i64i8imm:$off, GR64:$rZP),
+                   "naclandsp{q}\t{$off, $rZP|$rZP, $off}">;
 
   def NACL_ANDSPi32: NaClPI64<(outs), (ins i64i32imm:$off, GR64:$rZP),
                    "naclandsp{q}\t{$off, $rZP|$rZP, $off}">;
@@ -171,50 +149,6 @@ let Defs = [RBP], isAsmParserOnly = 1 in {
 // or TableGen, and may become unnecessary in the future.
 //===----------------------------------------------------------------------===//
 
-
-//===----------------------------------------------------------------------===//
-//
-// CodeGen 32-bit
-//
-//===----------------------------------------------------------------------===//
-
-
-// To avoid a naming conflict between call/naclcall, we have to
-// disable the real CALLpcrel32 and CALL32r instructions when targeting
-// for NaCl. Thus, they need to be produced here.
-
-let isCall = 1 in
-  // All calls clobber the non-callee saved registers. ESP is marked as
-  // a use to prevent stack-pointer assignments that appear immediately
-  // before calls from potentially appearing dead. Uses for argument
-  // registers are added manually.
-  let Defs = [EAX, ECX, EDX, FP0, FP1, FP2, FP3, FP4, FP5, FP6, ST0,
-              MM0, MM1, MM2, MM3, MM4, MM5, MM6, MM7,
-              XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
-              XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, XMM15, EFLAGS],
-      Uses = [ESP] in {
-
-    def NACL_CG_CALLpcrel32 : I<0, Pseudo,
-                              (outs), (ins i32imm_pcrel:$dst),
-                              "naclcall\t$dst", []>,
-                              Requires<[IsNaCl, In32BitMode]>;
-    def NACL_CG_CALL32r     : I<0, Pseudo,
-                              (outs), (ins GR32:$dst),
-                              "naclcall\t$dst", [(X86call GR32:$dst)]>,
-                              Requires<[IsNaCl, In32BitMode]>;
-}
-
-// Normal calls, with various flavors of addresses.
-def : Pat<(X86call (i32 tglobaladdr:$dst)),
-          (NACL_CG_CALLpcrel32 tglobaladdr:$dst)>,
-          Requires<[IsNaCl, In32BitMode]>;
-def : Pat<(X86call (i32 texternalsym:$dst)),
-          (NACL_CG_CALLpcrel32 texternalsym:$dst)>,
-          Requires<[IsNaCl, In32BitMode]>;
-def : Pat<(X86call (i32 imm:$dst)),
-          (NACL_CG_CALLpcrel32 imm:$dst)>,
-          Requires<[IsNaCl, In32BitMode, CallImmAddr]>;
-
 //===----------------------------------------------------------------------===//
 //
 // CodeGen 64-bit
@@ -225,6 +159,10 @@ def : Pat<(X86call (i32 imm:$dst)),
 // Because pointers are 32-bit on X86-64 Native Client, we need to
 // produce new versions of the JMP64/CALL64 instructions which can accept
 // addresses which are i32 instead of i64.
+//
+// Indirect calls have been changed to zero extend i32 to i64, so
+// we don't need a NaCl-specific CALL64r. We could possibly do the same for
+// indirect branches (switch jump tables) and direct calls.
 
 let isBranch = 1, isTerminator = 1, isBarrier = 1, isIndirectBranch = 1 in {
   def NACL_CG_JMP64r     : I<0, Pseudo, (outs), (ins GR32:$dst),
@@ -233,26 +171,13 @@ let isBranch = 1, isTerminator = 1, isBarrier = 1, isIndirectBranch = 1 in {
                            Requires<[IsNaCl, In64BitMode]>;
 }
 
-let isCall = 1 in
-  // All calls clobber the non-callee saved registers. RSP is marked as
-  // a use to prevent stack-pointer assignments that appear immediately
-  // before calls from potentially appearing dead. Uses for argument
-  // registers are added manually.
-  let Defs = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11,
-              FP0, FP1, FP2, FP3, FP4, FP5, FP6, ST0, ST1,
-              MM0, MM1, MM2, MM3, MM4, MM5, MM6, MM7,
-              XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
-              XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, XMM15, EFLAGS],
-      Uses = [RSP] in {
-
+// RSP is marked as a use to prevent stack-pointer assignments that appear
+// immediately before calls from potentially appearing dead. Uses for argument
+// registers are added manually.
+let isCall = 1, Uses = [RSP] in {
     def NACL_CG_CALL64pcrel32 : I<0, Pseudo, (outs),
                                 (ins i32imm_pcrel:$dst),
-                                "naclcall\t$dst", []>,
-                                Requires<[IsNaCl, In64BitMode]>;
-
-    def NACL_CG_CALL64r       : I<0, Pseudo, (outs), (ins GR32:$dst),
-                                "naclcall\t$dst,%r15",
-                                [(X86call GR32:$dst)]>,
+                                "call{q}\t$dst", []>,
                                 Requires<[IsNaCl, In64BitMode]>;
 }
 
@@ -267,59 +192,28 @@ def : Pat<(X86call (i32 texternalsym:$dst)),
 // Also needed due to the i64 / i32 pointer problem.
 let isCall = 1, isTerminator = 1, isReturn = 1, isBarrier = 1,
     isCodeGenOnly = 1 in
-  let Defs = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11,
-              FP0, FP1, FP2, FP3, FP4, FP5, FP6, ST0, ST1,
-              MM0, MM1, MM2, MM3, MM4, MM5, MM6, MM7,
-              XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
-              XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, XMM15, EFLAGS],
-      Uses = [RSP] in {
+  let Uses = [RSP] in {
 
   def NACL_CG_TCRETURNdi64 : I<0, Pseudo, (outs),
                              (ins i32imm_pcrel:$dst, i32imm:$offset),
                              "#TC_RETURN $dst $offset", []>,
                           Requires<[IsNaCl, In64BitMode]>;
-  def NACL_CG_TCRETURNri64 : I<0, Pseudo, (outs),
-                            (ins GR32_TC_64:$dst, i32imm:$offset),
-                            "#TC_RETURN $dst $offset", []>,
-                            Requires<[IsNaCl, In64BitMode]>;
 
   def NACL_CG_TAILJMPd64 : I<0, Pseudo, (outs),
                            (ins i32imm_pcrel:$dst),
                            "jmp\t$dst  # TAILCALL", []>,
                            Requires<[IsNaCl, In64BitMode]>;
-  def NACL_CG_TAILJMPr64 : I<0, Pseudo, (outs),
-                           (ins GR32_TC_64:$dst),
-                           "nacljmp\t$dst,%r15  # TAILCALL", []>,
-                           Requires<[IsNaCl, In64BitMode]>;
 }
 
 def : Pat<(X86tcret (i32 tglobaladdr:$dst), imm:$off),
           (NACL_CG_TCRETURNdi64 tglobaladdr:$dst, imm:$off)>,
-	  Requires<[IsNaCl, In64BitMode]>;
+         Requires<[IsNaCl, In64BitMode]>;
 
 def : Pat<(X86tcret (i32 texternalsym:$dst), imm:$off),
           (NACL_CG_TCRETURNdi64 texternalsym:$dst, imm:$off)>,
-	  Requires<[IsNaCl, In64BitMode]>;
-
-def : Pat<(X86tcret GR32_TC_64:$dst, imm:$off),
-          (NACL_CG_TCRETURNri64 GR32_TC_64:$dst, imm:$off)>,
-	  Requires<[IsNaCl, In64BitMode]>;
+         Requires<[IsNaCl, In64BitMode]>;
 
 // ELF TLS Support
-
-let Defs = [EAX, ECX, EDX, FP0, FP1, FP2, FP3, FP4, FP5, FP6, ST0,
-            MM0, MM1, MM2, MM3, MM4, MM5, MM6, MM7,
-            XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
-            XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, XMM15, EFLAGS],
-    Uses = [ESP] in
-def NACL_CG_TLS_addr32 : I<0, Pseudo, (outs), (ins i32mem:$sym),
-                         ".bundle_align_end"
-                         ".bundle_lock"
-                         "leal\t$sym, %eax; "
-                         "call\t___tls_get_addr@PLT"
-                         ".bundle_unlock",
-                         [(X86tlsaddr tls32addr:$sym)]>,
-                         Requires<[In32BitMode, IsNaCl]>;
 
 // These are lowered in X86NaClRewritePass.
 let Defs = [RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11,
@@ -340,10 +234,10 @@ def NACL_CG_IE_TLS_addr64 : I<0, Pseudo, (outs), (ins i32mem:$sym), "",
 // For mtls-use-call.
 def NACL_CG_LE_TLS_addr32 : I<0, Pseudo, (outs), (ins i32mem:$sym), "",
                             [(X86tlsaddr_le tls32addr:$sym)]>,
-                            Requires<[IsNaCl, In32BitMode]>;
+                            Requires<[IsNaCl, Not64BitMode]>;
 def NACL_CG_IE_TLS_addr32 : I<0, Pseudo, (outs), (ins i32mem:$sym), "",
                             [(X86tlsaddr_ie tls32addr:$sym)]>,
-                            Requires<[IsNaCl, In32BitMode]>;
+                            Requires<[IsNaCl, Not64BitMode]>;
 }
 
 let usesCustomInserter = 1, Defs = [EFLAGS] in

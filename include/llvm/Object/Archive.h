@@ -14,9 +14,11 @@
 #ifndef LLVM_OBJECT_ARCHIVE_H
 #define LLVM_OBJECT_ARCHIVE_H
 
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Object/Binary.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 
@@ -71,7 +73,7 @@ public:
 
     Child getNext() const;
 
-    error_code getName(StringRef &Result) const;
+    ErrorOr<StringRef> getName() const;
     StringRef getRawName() const { return getHeader()->getName(); }
     sys::TimeValue getLastModified() const {
       return getHeader()->getLastModified();
@@ -88,20 +90,20 @@ public:
       return StringRef(Data.data() + StartOfFile, getSize());
     }
 
-    error_code getMemoryBuffer(OwningPtr<MemoryBuffer> &Result,
-                               bool FullPath = false) const;
+    ErrorOr<MemoryBufferRef> getMemoryBufferRef() const;
 
-    error_code getAsBinary(OwningPtr<Binary> &Result) const;
+    ErrorOr<std::unique_ptr<Binary>>
+    getAsBinary(LLVMContext *Context = nullptr) const;
   };
 
   class child_iterator {
     Child child;
+
   public:
-    child_iterator() : child(Child(0, 0)) {}
+    child_iterator() : child(Child(nullptr, nullptr)) {}
     child_iterator(const Child &c) : child(c) {}
-    const Child* operator->() const {
-      return &child;
-    }
+    const Child *operator->() const { return &child; }
+    const Child &operator*() const { return child; }
 
     bool operator==(const child_iterator &other) const {
       return child == other.child;
@@ -111,11 +113,11 @@ public:
       return !(*this == other);
     }
 
-    bool operator <(const child_iterator &other) const {
+    bool operator<(const child_iterator &other) const {
       return child < other.child;
     }
 
-    child_iterator& operator++() {  // Preincrement
+    child_iterator &operator++() { // Preincrement
       child = child.getNext();
       return *this;
     }
@@ -135,8 +137,8 @@ public:
       : Parent(p)
       , SymbolIndex(symi)
       , StringIndex(stri) {}
-    error_code getName(StringRef &Result) const;
-    error_code getMember(child_iterator &Result) const;
+    StringRef getName() const;
+    ErrorOr<child_iterator> getMember() const;
     Symbol getNext() const;
   };
 
@@ -162,7 +164,8 @@ public:
     }
   };
 
-  Archive(MemoryBuffer *source, error_code &ec);
+  Archive(MemoryBufferRef Source, std::error_code &EC);
+  static ErrorOr<std::unique_ptr<Archive>> create(MemoryBufferRef Source);
 
   enum Kind {
     K_GNU,
@@ -174,11 +177,15 @@ public:
     return Format;
   }
 
-  child_iterator begin_children(bool SkipInternal = true) const;
-  child_iterator end_children() const;
+  child_iterator child_begin(bool SkipInternal = true) const;
+  child_iterator child_end() const;
+  iterator_range<child_iterator> children(bool SkipInternal = true) const {
+    return iterator_range<child_iterator>(child_begin(SkipInternal),
+                                          child_end());
+  }
 
-  symbol_iterator begin_symbols() const;
-  symbol_iterator end_symbols() const;
+  symbol_iterator symbol_begin() const;
+  symbol_iterator symbol_end() const;
 
   // Cast methods.
   static inline bool classof(Binary const *v) {

@@ -11,6 +11,8 @@
 #define LLVM_TRANSFORMS_NACL_H
 
 #include "llvm/CodeGen/Passes.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/LLVMContext.h"
 
 namespace llvm {
 
@@ -20,19 +22,28 @@ class FunctionPass;
 class FunctionType;
 class Instruction;
 class ModulePass;
+class Triple;
 class Use;
 class Value;
 
+BasicBlockPass *createConstantInsertExtractElementIndexPass();
 BasicBlockPass *createExpandGetElementPtrPass();
+BasicBlockPass *createExpandShuffleVectorPass();
+BasicBlockPass *createFixVectorLoadStoreAlignmentPass();
 BasicBlockPass *createPromoteI1OpsPass();
+BasicBlockPass *createSimplifyAllocasPass();
+FunctionPass *createBackendCanonicalizePass();
 FunctionPass *createExpandConstantExprPass();
+FunctionPass *createExpandLargeIntegersPass();
 FunctionPass *createExpandStructRegsPass();
 FunctionPass *createInsertDivideCheckPass();
+FunctionPass *createNormalizeAlignmentPass();
 FunctionPass *createPromoteIntegersPass();
 FunctionPass *createRemoveAsmMemoryPass();
 FunctionPass *createResolvePNaClIntrinsicsPass();
 ModulePass *createAddPNaClExternalDeclsPass();
 ModulePass *createCanonicalizeMemIntrinsicsPass();
+ModulePass *createCleanupUsedGlobalsMetadataPass();
 ModulePass *createExpandArithWithOverflowPass();
 ModulePass *createExpandByValPass();
 ModulePass *createExpandCtorsPass();
@@ -43,30 +54,39 @@ ModulePass *createExpandTlsPass();
 ModulePass *createExpandVarArgsPass();
 ModulePass *createFlattenGlobalsPass();
 ModulePass *createGlobalCleanupPass();
+ModulePass *createGlobalizeConstantVectorsPass();
+ModulePass *createInternalizeUsedGlobalsPass();
 ModulePass *createPNaClSjLjEHPass();
 ModulePass *createReplacePtrsWithIntsPass();
 ModulePass *createResolveAliasesPass();
 ModulePass *createRewriteAtomicsPass();
 ModulePass *createRewriteLLVMIntrinsicsPass();
 ModulePass *createRewritePNaClLibraryCallsPass();
+ModulePass *createSimplifyStructRegSignaturesPass();
 ModulePass *createStripAttributesPass();
 ModulePass *createStripMetadataPass();
+ModulePass *createStripModuleFlagsPass();
 
-ModulePass *createExpandI64Pass(); // XXX EMSCRIPTEN
-ModulePass *createExpandInsertExtractElementPass(); // XXX EMSCRIPTEN
-ModulePass *createLowerEmExceptionsPass(); // XXX EMSCRIPTEN
-ModulePass *createLowerEmSetjmpPass(); // XXX EMSCRIPTEN
-ModulePass *createNoExitRuntimePass(); // XXX EMSCRIPTEN
-ModulePass *createLowerEmAsyncifyPass(); // XXX EMSCRIPTEN
+// Emscripten passes:
+FunctionPass *createExpandInsertExtractElementPass();
+ModulePass *createExpandI64Pass();
+ModulePass *createLowerEmAsyncifyPass();
+ModulePass *createLowerEmExceptionsPass();
+ModulePass *createLowerEmSetjmpPass();
+ModulePass *createNoExitRuntimePass();
+// Emscripten passes end.
 
-void PNaClABISimplifyAddPreOptPasses(PassManagerBase &PM);
-void PNaClABISimplifyAddPostOptPasses(PassManagerBase &PM);
+void PNaClABISimplifyAddPreOptPasses(Triple *T, PassManagerBase &PM);
+void PNaClABISimplifyAddPostOptPasses(Triple *T, PassManagerBase &PM);
 
 Instruction *PhiSafeInsertPt(Use *U);
 void PhiSafeReplaceUses(Use *U, Value *NewVal);
 
-// Copy debug information from Original to NewInst, and return NewInst.
-Instruction *CopyDebug(Instruction *NewInst, Instruction *Original);
+// Copy debug information from Original to New, and return New.
+template <typename T> T *CopyDebug(T *New, Instruction *Original) {
+  New->setDebugLoc(Original->getDebugLoc());
+  return New;
+}
 
 template <class InstType>
 static void CopyLoadOrStoreAttrs(InstType *Dest, InstType *Src) {

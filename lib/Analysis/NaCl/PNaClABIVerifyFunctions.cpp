@@ -12,61 +12,19 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/ADT/OwningPtr.h"
+#include "llvm/Analysis/NaCl/PNaClABIVerifyFunctions.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Analysis/NaCl.h"
+#include "llvm/Analysis/NaCl/PNaClABITypeChecker.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/NaClAtomicIntrinsics.h"
 #include "llvm/IR/Operator.h"
-#include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include "PNaClABITypeChecker.h"
 using namespace llvm;
-
-namespace {
-
-// Checks that examine anything in the function body should be in
-// FunctionPasses to make them streaming-friendly
-class PNaClABIVerifyFunctions : public FunctionPass {
- public:
-  static char ID;
-  PNaClABIVerifyFunctions() :
-      FunctionPass(ID),
-      Reporter(new PNaClABIErrorReporter),
-      ReporterIsOwned(true) {
-    initializePNaClABIVerifyFunctionsPass(*PassRegistry::getPassRegistry());
-  }
-  explicit PNaClABIVerifyFunctions(PNaClABIErrorReporter *Reporter_) :
-      FunctionPass(ID),
-      Reporter(Reporter_),
-      ReporterIsOwned(false) {
-    initializePNaClABIVerifyFunctionsPass(*PassRegistry::getPassRegistry());
-  }
-  ~PNaClABIVerifyFunctions() {
-    if (ReporterIsOwned)
-      delete Reporter;
-  }
-  virtual bool doInitialization(Module &M) {
-    AtomicIntrinsics.reset(new NaCl::AtomicIntrinsics(M.getContext()));
-    return false;
-  }
-  bool runOnFunction(Function &F);
-  virtual void print(raw_ostream &O, const Module *M) const;
- private:
-  bool IsWhitelistedMetadata(unsigned MDKind);
-  const char *checkInstruction(const Instruction *Inst);
-  PNaClABIErrorReporter *Reporter;
-  bool ReporterIsOwned;
-  OwningPtr<NaCl::AtomicIntrinsics> AtomicIntrinsics;
-};
-
-} // and anonymous namespace
 
 // There's no built-in way to get the name of an MDNode, so use a
 // string ostream to print it.
@@ -82,12 +40,14 @@ static std::string getMDNodeString(unsigned Kind,
   return N.str();
 }
 
-bool PNaClABIVerifyFunctions::IsWhitelistedMetadata(unsigned MDKind) {
-  return MDKind == LLVMContext::MD_dbg && PNaClABIAllowDebugMetadata;
+PNaClABIVerifyFunctions::~PNaClABIVerifyFunctions() {
+  if (ReporterIsOwned)
+    delete Reporter;
 }
 
 // A valid pointer type is either:
 //  * a pointer to a valid PNaCl scalar type (except i1), or
+//  * a pointer to a valid PNaCl vector type (except i1), or
 //  * a function pointer (with valid argument and return types).
 //
 // i1 is disallowed so that all loads and stores are a whole number of
@@ -98,8 +58,10 @@ static bool isValidPointerType(Type *Ty) {
     if (PtrTy->getAddressSpace() != 0)
       return false;
     Type *EltTy = PtrTy->getElementType();
-    if (PNaClABITypeChecker::isValidScalarType(EltTy) &&
-        !EltTy->isIntegerTy(1))
+    if (PNaClABITypeChecker::isValidScalarType(EltTy) && !EltTy->isIntegerTy(1))
+      return true;
+    if (PNaClABITypeChecker::isValidVectorType(EltTy) &&
+        !cast<VectorType>(EltTy)->getElementType()->isIntegerTy(1))
       return true;
     if (FunctionType *FTy = dyn_cast<FunctionType>(EltTy))
       return PNaClABITypeChecker::isValidFunctionType(FTy);
@@ -152,20 +114,16 @@ static bool isValidScalarOperand(const Value *Val) {
           isa<UndefValue>(Val));
 }
 
-static bool isAllowedAlignment(unsigned Alignment, Type *Ty) {
-  // Non-atomic integer operations must always use "align 1", since we
-  // do not want the backend to generate code with non-portable
-  // undefined behaviour (such as misaligned access faults) if user
-  // code specifies "align 4" but uses a misaligned pointer.  As a
-  // concession to performance, we allow larger alignment values for
-  // floating point types.
-  //
-  // To reduce the set of alignment values that need to be encoded in
-  // pexes, we disallow other alignment values.  We require alignments
-  // to be explicit by disallowing Alignment == 0.
-  return Alignment == 1 ||
-         (Ty->isDoubleTy() && Alignment == 8) ||
-         (Ty->isFloatTy() && Alignment == 4);
+static bool isValidVectorOperand(const Value *Val) {
+  // The types of Instructions and Arguments are checked elsewhere.
+  if (isa<Instruction>(Val) || isa<Argument>(Val))
+    return true;
+  // Contrary to scalars, constant vector values aren't allowed on
+  // instructions, except undefined. Constant vectors are loaded from
+  // constant global memory instead, and can be rematerialized as
+  // constants by the backend if need be.
+  return PNaClABITypeChecker::isValidVectorType(Val->getType()) &&
+         isa<UndefValue>(Val);
 }
 
 static bool hasAllowedAtomicRMWOperation(
@@ -187,29 +145,87 @@ static bool hasAllowedAtomicRMWOperation(
   return true;
 }
 
-static bool hasAllowedAtomicMemoryOrder(
-    const NaCl::AtomicIntrinsics::AtomicIntrinsic *I, const CallInst *Call) {
+static bool
+hasAllowedAtomicMemoryOrder(const NaCl::AtomicIntrinsics::AtomicIntrinsic *I,
+                            const CallInst *Call) {
+  NaCl::MemoryOrder PreviousOrder = NaCl::MemoryOrderInvalid;
+
   for (size_t P = 0; P != I->NumParams; ++P) {
     if (I->ParamType[P] != NaCl::AtomicIntrinsics::Mem)
       continue;
 
-    const Value *MemoryOrder = Call->getOperand(P);
-    if (!MemoryOrder)
+    NaCl::MemoryOrder Order = NaCl::MemoryOrderInvalid;
+    if (const Value *MemoryOrderOperand = Call->getOperand(P))
+      if (const Constant *C = dyn_cast<Constant>(MemoryOrderOperand)) {
+        const APInt &I = C->getUniqueInteger();
+        if (I.ugt(NaCl::MemoryOrderInvalid) && I.ult(NaCl::MemoryOrderNum))
+          Order = static_cast<NaCl::MemoryOrder>(I.getLimitedValue());
+      }
+    if (Order == NaCl::MemoryOrderInvalid)
       return false;
-    const Constant *C = dyn_cast<Constant>(MemoryOrder);
-    if (!C)
+
+    // Validate PNaCl restrictions.
+    switch (Order) {
+    case NaCl::MemoryOrderInvalid:
+    case NaCl::MemoryOrderNum:
+      llvm_unreachable("Invalid memory order");
+    case NaCl::MemoryOrderRelaxed:
+    case NaCl::MemoryOrderConsume:
+      // TODO(jfb) PNaCl doesn't allow relaxed or consume memory ordering.
       return false;
-    const APInt &I = C->getUniqueInteger();
-    if (I.ule(NaCl::MemoryOrderInvalid) || I.uge(NaCl::MemoryOrderNum))
-      return false;
-    // TODO For now only sequential consistency is allowed. When more
-    //      are allowed we need to validate that the memory order is
-    //      allowed on the specific atomic operation (e.g. no store
-    //      acquire, and relationship between success/failure memory
-    //      order on compare exchange).
-    if (I != NaCl::MemoryOrderSequentiallyConsistent)
-      return false;
+    case NaCl::MemoryOrderAcquire:
+    case NaCl::MemoryOrderRelease:
+    case NaCl::MemoryOrderAcquireRelease:
+    case NaCl::MemoryOrderSequentiallyConsistent:
+      break; // Allowed by PNaCl.
+    }
+
+    // Validate conformance to the C++11 memory model.
+    switch (I->ID) {
+    default:
+      llvm_unreachable("unexpected atomic operation");
+    case Intrinsic::nacl_atomic_load:
+      // C++11 [atomics.types.operations.req]: The order argument shall not be
+      // release nor acq_rel.
+      if (Order == NaCl::MemoryOrderRelease ||
+          Order == NaCl::MemoryOrderAcquireRelease)
+        return false;
+      break;
+    case Intrinsic::nacl_atomic_store:
+      // C++11 [atomics.types.operations.req]: The order argument shall not be
+      // consume, acquire, nor acq_rel.
+      if (Order == NaCl::MemoryOrderConsume ||
+          Order == NaCl::MemoryOrderAcquire ||
+          Order == NaCl::MemoryOrderAcquireRelease)
+        return false;
+      break;
+    case Intrinsic::nacl_atomic_rmw:
+      break; // No restriction.
+    case Intrinsic::nacl_atomic_cmpxchg:
+      // C++11 [atomics.types.operations.req]: The failure argument shall not be
+      // release nor acq_rel. The failure argument shall be no stronger than the
+      // success argument.
+      // Where the partial ordering is:
+      //   relaxed < consume < acquire           < acq_rel < seq_cst
+      //   relaxed <                     release < acq_rel < seq_cst
+      if (PreviousOrder != NaCl::MemoryOrderInvalid) { // Failure ordering.
+        NaCl::MemoryOrder Success = PreviousOrder, Failure = Order;
+        if (Failure == NaCl::MemoryOrderRelease ||
+            Failure == NaCl::MemoryOrderAcquireRelease)
+          return false;
+        if ((Success < Failure) || (Success == NaCl::MemoryOrderRelease &&
+                                    Failure != NaCl::MemoryOrderRelaxed))
+          return false;
+      }
+      break; // Success ordering has no restriction.
+    case Intrinsic::nacl_atomic_fence:
+    case Intrinsic::nacl_atomic_fence_all:
+      break; // No restrictions.
+    }
+
+    PreviousOrder = Order;
   }
+
   return true;
 }
 
@@ -236,10 +252,15 @@ static bool hasAllowedLockFreeByteSize(const CallInst *Call) {
 //
 // This returns an error string if the instruction is rejected, or
 // NULL if the instruction is allowed.
-const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
+const char *PNaClABIVerifyFunctions::checkInstruction(const DataLayout *DL,
+                                                      const Instruction *Inst) {
   // If the instruction has a single pointer operand, PtrOperandIndex is
   // set to its operand index.
   unsigned PtrOperandIndex = -1;
+
+  // True if we should apply the default operand checks, at the end
+  // of this function.
+  bool ApplyDefaultOperandTypeChecks = true;
 
   switch (Inst->getOpcode()) {
     // Disallowed instructions. Default is to disallow.
@@ -253,9 +274,7 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
     case Instruction::Resume:
     // indirectbr may interfere with streaming
     case Instruction::IndirectBr:
-    // No vector instructions yet
-    case Instruction::ExtractElement:
-    case Instruction::InsertElement:
+    // TODO(jfb) Figure out ShuffleVector.
     case Instruction::ShuffleVector:
     // ExtractValue and InsertValue operate on struct values.
     case Instruction::ExtractValue:
@@ -312,10 +331,39 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
     case Instruction::SRem:
     case Instruction::Shl:
     case Instruction::LShr:
-    case Instruction::AShr:
-      if (Inst->getOperand(0)->getType()->isIntegerTy(1))
-        return "arithmetic on i1";
+    case Instruction::AShr: {
+      const Type *Ty = Inst->getOperand(0)->getType();
+      if (!PNaClABITypeChecker::isValidIntArithmeticType(
+              Inst->getOperand(0)->getType())) {
+        if (Ty->isIntegerTy() ||
+            (Ty->isVectorTy() && Ty->getVectorElementType()->isIntegerTy())) {
+          return "Invalid integer arithmetic type";
+        } else {
+          return "Expects integer arithmetic type";
+        }
+      }
+      ApplyDefaultOperandTypeChecks = false;
       break;
+    }
+
+    // Vector.
+    case Instruction::ExtractElement:
+    case Instruction::InsertElement: {
+      // Insert and extract element are restricted to constant indices
+      // that are in range to prevent undefined behavior.
+      // TODO(kschimpf) Figure out way to put test into pnacl-bcdis?
+      Value *Vec = Inst->getOperand(0);
+      Value *Idx = Inst->getOperand(
+          Instruction::InsertElement == Inst->getOpcode() ? 2 : 1);
+      if (!isa<ConstantInt>(Idx))
+        return "non-constant vector insert/extract index";
+      if (!PNaClABIProps::isVectorIndexSafe(
+              cast<ConstantInt>(Idx)->getValue(),
+              cast<VectorType>(Vec->getType())->getNumElements())) {
+        return "out of range vector insert/extract index";
+      }
+      break;
+    }
 
     // Memory accesses.
     case Instruction::Load: {
@@ -325,11 +373,11 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
         return "atomic load";
       if (Load->isVolatile())
         return "volatile load";
-      if (!isAllowedAlignment(Load->getAlignment(),
-                              Load->getType()))
-        return "bad alignment";
       if (!isNormalizedPtr(Inst->getOperand(PtrOperandIndex)))
         return "bad pointer";
+      if (!PNaClABIProps::
+          isAllowedAlignment(DL, Load->getAlignment(), Load->getType()))
+        return "bad alignment";
       break;
     }
     case Instruction::Store: {
@@ -339,11 +387,12 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
         return "atomic store";
       if (Store->isVolatile())
         return "volatile store";
-      if (!isAllowedAlignment(Store->getAlignment(),
-                              Store->getValueOperand()->getType()))
-        return "bad alignment";
       if (!isNormalizedPtr(Inst->getOperand(PtrOperandIndex)))
         return "bad pointer";
+      if (!PNaClABIProps::
+          isAllowedAlignment(DL, Store->getAlignment(),
+                             Store->getValueOperand()->getType()))
+        return "bad alignment";
       break;
     }
 
@@ -369,10 +418,10 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
 
     case Instruction::Alloca: {
       const AllocaInst *Alloca = cast<AllocaInst>(Inst);
-      if (!Alloca->getAllocatedType()->isIntegerTy(8))
+      if (!PNaClABIProps::isAllocaAllocatedType(Alloca->getAllocatedType()))
         return "non-i8 alloca";
-      if (!Alloca->getArraySize()->getType()->isIntegerTy(32))
-        return "alloca array size is not i32";
+      if (!PNaClABIProps::isAllocaSizeType(Alloca->getArraySize()->getType()))
+        return PNaClABIProps::ExpectedAllocaSizeType();
       break;
     }
 
@@ -382,16 +431,18 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
         return "inline assembly";
       if (!Call->getAttributes().isEmpty())
         return "bad call attributes";
-      if (Call->getCallingConv() != CallingConv::C)
+      if (!PNaClABIProps::isValidCallingConv(Call->getCallingConv()))
         return "bad calling convention";
 
       // Intrinsic calls can have multiple pointer arguments and
       // metadata arguments, so handle them specially.
+      // TODO(kschimpf) How can we lift this to pnacl-bcdis.
       if (const IntrinsicInst *Call = dyn_cast<IntrinsicInst>(Inst)) {
         for (unsigned ArgNum = 0, E = Call->getNumArgOperands();
              ArgNum < E; ++ArgNum) {
           const Value *Arg = Call->getArgOperand(ArgNum);
           if (!(isValidScalarOperand(Arg) ||
+                isValidVectorOperand(Arg) ||
                 isNormalizedPtr(Arg) ||
                 isa<MDNode>(Arg)))
             return "bad intrinsic operand";
@@ -427,6 +478,10 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
                 Inst->getParent()->getParent()->getContext());
             const NaCl::AtomicIntrinsics::AtomicIntrinsic *I =
                 AtomicIntrinsics->find(Call->getIntrinsicID(), T);
+            if (!I)
+              // All intrinsics have an I32 overload. Failure here means there
+              // is no such intrinsic.
+              return "invalid atomic intrinsic";
             if (!hasAllowedAtomicMemoryOrder(I, Call))
               return "invalid memory order";
             if (!hasAllowedAtomicRMWOperation(I, Call))
@@ -458,8 +513,9 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
       const SwitchInst *Switch = cast<SwitchInst>(Inst);
       if (!isValidScalarOperand(Switch->getCondition()))
         return "bad switch condition";
-      if (Switch->getCondition()->getType()->isIntegerTy(1))
-        return "switch on i1";
+      const Type *SwitchType = Switch->getCondition()->getType();
+      if (!PNaClABITypeChecker::isValidSwitchConditionType(SwitchType))
+        return PNaClABITypeChecker::ExpectedSwitchConditionType(SwitchType);
 
       // SwitchInst requires the cases to be ConstantInts, but it
       // doesn't require their types to be the same as the condition
@@ -475,12 +531,15 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
     }
   }
 
-  // Check the instruction's operands.  We have already checked any
-  // pointer operands.  Any remaining operands must be scalars.
-  for (unsigned OpNum = 0, E = Inst->getNumOperands(); OpNum < E; ++OpNum) {
-    if (OpNum != PtrOperandIndex &&
-        !isValidScalarOperand(Inst->getOperand(OpNum)))
-      return "bad operand";
+  if (ApplyDefaultOperandTypeChecks) {
+    // Check the instruction's operands.  We have already checked any
+    // pointer operands.  Any remaining operands must be scalars or vectors.
+    for (unsigned OpNum = 0, E = Inst->getNumOperands(); OpNum < E; ++OpNum) {
+      if (OpNum != PtrOperandIndex &&
+          !(isValidScalarOperand(Inst->getOperand(OpNum)) ||
+            isValidVectorOperand(Inst->getOperand(OpNum))))
+        return "bad operand";
+    }
   }
 
   // Check arithmetic attributes.
@@ -502,6 +561,7 @@ const char *PNaClABIVerifyFunctions::checkInstruction(const Instruction *Inst) {
 }
 
 bool PNaClABIVerifyFunctions::runOnFunction(Function &F) {
+  const DataLayout *DL = &getAnalysis<DataLayoutPass>().getDataLayout();
   SmallVector<StringRef, 8> MDNames;
   F.getContext().getMDKindNames(MDNames);
 
@@ -514,16 +574,21 @@ bool PNaClABIVerifyFunctions::runOnFunction(Function &F) {
       // because some instruction opcodes must be rejected out of hand
       // (regardless of the instruction's result type) and the tests
       // check the reason for rejection.
-      const char *Error = checkInstruction(BBI);
+      const char *Error = checkInstruction(DL, BBI);
       // Check the instruction's result type.
+      bool BadResult = false;
       if (!Error && !(PNaClABITypeChecker::isValidScalarType(Inst->getType()) ||
+                      PNaClABITypeChecker::isValidVectorType(Inst->getType()) ||
                       isNormalizedPtr(Inst) ||
                       isa<AllocaInst>(Inst))) {
         Error = "bad result type";
+        BadResult = true;
       }
       if (Error) {
-        Reporter->addError() << "Function " << F.getName() <<
-          " disallowed: " << Error << ": " << *BBI << "\n";
+        Reporter->addError()
+            << "Function " << F.getName() << " disallowed: " << Error << ": "
+            << (BadResult ? PNaClABITypeChecker::getTypeName(BBI->getType())
+                          : "") << " " << *BBI << "\n";
       }
 
       // Check instruction attachment metadata.
@@ -531,7 +596,7 @@ bool PNaClABIVerifyFunctions::runOnFunction(Function &F) {
       BBI->getAllMetadata(MDForInst);
 
       for (unsigned i = 0, e = MDForInst.size(); i != e; i++) {
-        if (!IsWhitelistedMetadata(MDForInst[i].first)) {
+        if (!PNaClABIProps::isWhitelistedMetadata(MDForInst[i].first)) {
           Reporter->addError()
               << "Function " << F.getName()
               << " has disallowed instruction metadata: "

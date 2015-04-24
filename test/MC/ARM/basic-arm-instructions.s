@@ -1,4 +1,5 @@
 @ RUN: llvm-mc -triple=armv7-apple-darwin -mcpu=cortex-a8 -show-encoding < %s | FileCheck %s
+@ RUN: llvm-mc -triple=armebv7-unknown-unknown -mcpu=cortex-a8 -show-encoding < %s | FileCheck --check-prefix=CHECK-BE %s
   .syntax unified
   .globl _func
 
@@ -135,8 +136,12 @@ Lforward:
 @ CHECK: Lback:
 @ CHECK: adr	r2, Lback    @ encoding: [A,0x20'A',0x0f'A',0xe2'A']
 @ CHECK:  @   fixup A - offset: 0, value: Lback, kind: fixup_arm_adr_pcrel_12
+@ CHECK-BE: adr	r2, Lback    @ encoding: [0xe2'A',0x0f'A',0x20'A',A]
+@ CHECK-BE:  @   fixup A - offset: 0, value: Lback, kind: fixup_arm_adr_pcrel_12
 @ CHECK: adr	r3, Lforward @ encoding: [A,0x30'A',0x0f'A',0xe2'A']
 @ CHECK:  @   fixup A - offset: 0, value: Lforward, kind: fixup_arm_adr_pcrel_12
+@ CHECK-BE: adr	r3, Lforward @ encoding: [0xe2'A',0x0f'A',0x30'A',A]
+@ CHECK-BE:  @   fixup A - offset: 0, value: Lforward, kind: fixup_arm_adr_pcrel_12
 @ CHECK: Lforward:
 @ CHECK: adr	r2, #3                  @ encoding: [0x03,0x20,0x8f,0xe2]
 @ CHECK: adr	r2, #-3                 @ encoding: [0x03,0x20,0x4f,0xe2]
@@ -186,7 +191,9 @@ Lforward:
 
 	add r0, #-4
 	add r4, r5, #-21
-        add r0, pc, #0xc0000000
+	add r0, pc, #0xc0000000
+
+	add r0, pc, #(Lback - .)
 
 @ CHECK: add	r4, r5, #61440          @ encoding: [0x0f,0x4a,0x85,0xe2]
 @ CHECK: add	r4, r5, r6              @ encoding: [0x06,0x40,0x85,0xe0]
@@ -217,7 +224,11 @@ Lforward:
 
 @ CHECK: sub	r0, r0, #4              @ encoding: [0x04,0x00,0x40,0xe2]
 @ CHECK: sub	r4, r5, #21             @ encoding: [0x15,0x40,0x45,0xe2]
-@ CHECK: adr    r0, #-1073741824        @ encoding: [0x03,0x01,0x8f,0xe2]
+@ CHECK: adr	r0, #-1073741824        @ encoding: [0x03,0x01,0x8f,0xe2]
+@ CHECK:        Ltmp0:
+@ CHECK-NEXT:   Ltmp1:
+@ CHECK-NEXT:   adr	r0, (Ltmp1+8)+(Lback-Ltmp0) @ encoding: [A,A,0x0f'A',0xe2'A']
+@ CHECK-NEXT:                           @   fixup A - offset: 0, value: (Ltmp1+8)+(Lback-Ltmp0), kind: fixup_arm_adr_pcrel_12
 
     @ Test right shift by 32, which is encoded as 0
     add r3, r1, r2, lsr #32
@@ -310,9 +321,13 @@ Lforward:
         beq _baz
 
 @ CHECK: b	_bar                    @ encoding: [A,A,A,0xea]
-             @   fixup A - offset: 0, value: _bar, kind: fixup_arm_uncondbranch
+@ CHECK: @   fixup A - offset: 0, value: _bar, kind: fixup_arm_uncondbranch
+@ CHECK-BE: b	_bar                    @ encoding: [0xea,A,A,A]
+@ CHECK-BE: @   fixup A - offset: 0, value: _bar, kind: fixup_arm_uncondbranch
 @ CHECK: beq	_baz                    @ encoding: [A,A,A,0x0a]
-             @   fixup A - offset: 0, value: _baz, kind: fixup_arm_condbranch
+@ CHECK: @   fixup A - offset: 0, value: _baz, kind: fixup_arm_condbranch
+@ CHECK-BE: beq	_baz                    @ encoding: [0x0a,A,A,A]
+@ CHECK-BE: @   fixup A - offset: 0, value: _baz, kind: fixup_arm_condbranch
 
 
 @------------------------------------------------------------------------------
@@ -420,10 +435,16 @@ Lforward:
 
 @ CHECK: bl  _bar @ encoding: [A,A,A,0xeb]
 @ CHECK:   @   fixup A - offset: 0, value: _bar, kind: fixup_arm_uncondbl
+@ CHECK-BE: bl  _bar @ encoding: [0xeb,A,A,A]
+@ CHECK-BE:   @   fixup A - offset: 0, value: _bar, kind: fixup_arm_uncondbl
 @ CHECK: bleq  _bar @ encoding: [A,A,A,0x0b]
 @ CHECK:   @   fixup A - offset: 0, value: _bar, kind: fixup_arm_condbl
+@ CHECK-BE: bleq  _bar @ encoding: [0x0b,A,A,A]
+@ CHECK-BE:   @   fixup A - offset: 0, value: _bar, kind: fixup_arm_condbl
 @ CHECK: blx	_bar @ encoding: [A,A,A,0xfa]
-           @   fixup A - offset: 0, value: _bar, kind: fixup_arm_blx
+@ CHECK:   @   fixup A - offset: 0, value: _bar, kind: fixup_arm_blx
+@ CHECK-BE: blx	_bar @ encoding: [0xfa,A,A,A]
+@ CHECK-BE:   @   fixup A - offset: 0, value: _bar, kind: fixup_arm_blx
 @ CHECK: blls	#28634268               @ encoding: [0x27,0x3b,0x6d,0x9b]
 @ CHECK: blx	#32424576               @ encoding: [0xa0,0xb0,0x7b,0xfa]
 @ CHECK: blx	#16212288               @ encoding: [0x50,0xd8,0x3d,0xfa]

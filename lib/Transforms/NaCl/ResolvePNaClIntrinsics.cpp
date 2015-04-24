@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
@@ -26,12 +27,13 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NaClAtomicIntrinsics.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Transforms/NaCl.h"
-#if defined(__pnacl__)
+#include "llvm/Transforms/Utils/Local.h"
+#if defined(PNACL_BROWSER_TRANSLATOR)
 #include "native_client/src/untrusted/nacl/pnacl.h"
 #endif
 
@@ -45,7 +47,7 @@ public:
   }
 
   static char ID;
-  virtual bool runOnFunction(Function &F);
+  bool runOnFunction(Function &F) override;
 
   /// Interface specifying how intrinsic calls should be resolved. Each
   /// intrinsic call handled by the implementor will be visited by the
@@ -76,13 +78,16 @@ public:
 
     /// The following pure virtual methods must be defined by
     /// implementors, and will be called once per intrinsic call.
+    /// NOTE: doGetDeclaration() should only "get" the intrinsic declaration
+    /// and not *add* decls to the module. Declarations should be added
+    /// up front by the AddPNaClExternalDecls module pass.
     virtual Function *doGetDeclaration() const = 0;
     /// Returns true if the Function was changed.
     virtual bool doResolve(IntrinsicInst *Call) = 0;
 
   private:
-    CallResolver(const CallResolver &) LLVM_DELETED_FUNCTION;
-    CallResolver &operator=(const CallResolver &) LLVM_DELETED_FUNCTION;
+    CallResolver(const CallResolver &) = delete;
+    CallResolver &operator=(const CallResolver &) = delete;
   };
 
 private:
@@ -96,35 +101,39 @@ class IntrinsicCallToFunctionCall :
     public ResolvePNaClIntrinsics::CallResolver {
 public:
   IntrinsicCallToFunctionCall(Function &F, Intrinsic::ID IntrinsicID,
-                              const char *TargetFunctionName,
-                              ArrayRef<Type *> Tys = None)
+                              const char *TargetFunctionName)
       : CallResolver(F, IntrinsicID),
-        TargetFunction(M->getFunction(TargetFunctionName)), Tys(Tys) {
+        TargetFunction(M->getFunction(TargetFunctionName)) {
     // Expect to find the target function for this intrinsic already
     // declared, even if it is never used.
     if (!TargetFunction)
       report_fatal_error(std::string(
           "Expected to find external declaration of ") + TargetFunctionName);
   }
-  virtual ~IntrinsicCallToFunctionCall() {}
+  ~IntrinsicCallToFunctionCall() override {}
 
 private:
   Function *TargetFunction;
-  ArrayRef<Type *> Tys;
 
-  virtual Function *doGetDeclaration() const {
-    return Intrinsic::getDeclaration(M, IntrinsicID, Tys);
+  Function *doGetDeclaration() const override {
+    return Intrinsic::getDeclaration(M, IntrinsicID);
   }
 
-  virtual bool doResolve(IntrinsicInst *Call) {
+  bool doResolve(IntrinsicInst *Call) override {
     Call->setCalledFunction(TargetFunction);
+    if (IntrinsicID == Intrinsic::nacl_setjmp) {
+      // The "returns_twice" attribute is required for correctness,
+      // otherwise the backend will reuse stack slots in a way that is
+      // incorrect for setjmp().  See:
+      // https://code.google.com/p/nativeclient/issues/detail?id=3733
+      Call->setCanReturnTwice();
+    }
     return true;
   }
 
-  IntrinsicCallToFunctionCall(const IntrinsicCallToFunctionCall &)
-      LLVM_DELETED_FUNCTION;
-  IntrinsicCallToFunctionCall &operator=(const IntrinsicCallToFunctionCall &)
-      LLVM_DELETED_FUNCTION;
+  IntrinsicCallToFunctionCall(const IntrinsicCallToFunctionCall &) = delete;
+  IntrinsicCallToFunctionCall &
+  operator=(const IntrinsicCallToFunctionCall &) = delete;
 };
 
 /// Rewrite intrinsic calls to a constant whose value is determined by a
@@ -133,45 +142,43 @@ private:
 template <class Callable>
 class ConstantCallResolver : public ResolvePNaClIntrinsics::CallResolver {
 public:
-  ConstantCallResolver(Function &F, Intrinsic::ID IntrinsicID, Callable Functor,
-                       ArrayRef<Type *> Tys = None)
+  ConstantCallResolver(Function &F, Intrinsic::ID IntrinsicID,
+                       Callable Functor)
       : CallResolver(F, IntrinsicID), Functor(Functor) {}
-  virtual ~ConstantCallResolver() {}
+  ~ConstantCallResolver() override {}
 
 private:
   Callable Functor;
-  ArrayRef<Type *> Tys;
 
-  virtual Function *doGetDeclaration() const {
-    return Intrinsic::getDeclaration(M, IntrinsicID, Tys);
+  Function *doGetDeclaration() const override {
+    return Intrinsic::getDeclaration(M, IntrinsicID);
   }
 
-  virtual bool doResolve(IntrinsicInst *Call) {
+  bool doResolve(IntrinsicInst *Call) override {
     Constant *C = Functor(Call);
     Call->replaceAllUsesWith(C);
     Call->eraseFromParent();
     return true;
   }
 
-  ConstantCallResolver(const ConstantCallResolver &) LLVM_DELETED_FUNCTION;
-  ConstantCallResolver &operator=(const ConstantCallResolver &)
-      LLVM_DELETED_FUNCTION;
+  ConstantCallResolver(const ConstantCallResolver &) = delete;
+  ConstantCallResolver &operator=(const ConstantCallResolver &) = delete;
 };
 
 /// Resolve __nacl_atomic_is_lock_free to true/false at translation
-/// time. PNaCl's currently supported platforms all support lock-free
-/// atomics at byte sizes {1,2,4,8} except for MIPS arch that supports
-/// lock-free atomics at byte sizes {1,2,4}, and the alignment of the
-/// pointer is always expected to be natural (as guaranteed by C11 and
-/// C++11). PNaCl's Module-level ABI verification checks that the byte
-/// size is constant and in {1,2,4,8}.
+/// time. PNaCl's currently supported platforms all support lock-free atomics at
+/// byte sizes {1,2,4,8} except for MIPS and asmjs architectures that supports
+/// lock-free atomics at byte sizes {1,2,4}, and the alignment of the pointer is
+/// always expected to be natural (as guaranteed by C11 and C++11). PNaCl's
+/// Module-level ABI verification checks that the byte size is constant and in
+/// {1,2,4,8}.
 struct IsLockFreeToConstant {
   Constant *operator()(CallInst *Call) {
     uint64_t MaxLockFreeByteSize = 8;
     const APInt &ByteSize =
         cast<Constant>(Call->getOperand(0))->getUniqueInteger();
 
-#   if defined(__pnacl__)
+#   if defined(PNACL_BROWSER_TRANSLATOR)
     switch (__builtin_nacl_target_arch()) {
     case PnaclTargetArchitectureX86_32:
     case PnaclTargetArchitectureX86_64:
@@ -181,20 +188,34 @@ struct IsLockFreeToConstant {
       MaxLockFreeByteSize = 4;
       break;
     default:
-      return false;
+      errs() << "Architecture: " << Triple::getArchTypeName(Arch) << "\n";
+      report_fatal_error("is_lock_free: unhandled architecture");
     }
-#   elif defined(__i386__) || defined(__x86_64__) || defined(__arm__) || defined(_M_X64) // XXX Emscripten TODO: Move this fix to PNaCl upstream.
-    // Continue.
-#   elif defined(__mips__) || defined(_M_IX86) // XXX Emscripten TODO: Move this fix to PNaCl upstream.
-    MaxLockFreeByteSize = 4;
 #   else
-#     error "Unknown architecture"
+    switch (Arch) {
+    case Triple::x86:
+    case Triple::x86_64:
+    case Triple::arm:
+      break;
+    case Triple::mipsel:
+    case Triple::asmjs:
+      MaxLockFreeByteSize = 4;
+      break;
+    default:
+      errs() << "Architecture: " << Triple::getArchTypeName(Arch) << "\n";
+      report_fatal_error("is_lock_free: unhandled architecture");
+    }
 #   endif
 
     bool IsLockFree = ByteSize.ule(MaxLockFreeByteSize);
-    Constant *C = ConstantInt::get(Call->getType(), IsLockFree);
+    auto *C = ConstantInt::get(Call->getType(), IsLockFree);
     return C;
   }
+
+  Triple::ArchType Arch;
+  IsLockFreeToConstant(Module *M)
+      : Arch(Triple(M->getTargetTriple()).getArch()) {}
+  IsLockFreeToConstant() = delete;
 };
 
 /// Rewrite atomic intrinsics to LLVM IR instructions.
@@ -203,19 +224,20 @@ public:
   AtomicCallResolver(Function &F,
                      const NaCl::AtomicIntrinsics::AtomicIntrinsic *I)
       : CallResolver(F, I->ID), I(I) {}
-  virtual ~AtomicCallResolver() {}
+  ~AtomicCallResolver() override {}
 
 private:
   const NaCl::AtomicIntrinsics::AtomicIntrinsic *I;
 
-  virtual Function *doGetDeclaration() const { return I->getDeclaration(M); }
+  Function *doGetDeclaration() const override { return I->getDeclaration(M); }
 
-  virtual bool doResolve(IntrinsicInst *Call) {
+  bool doResolve(IntrinsicInst *Call) override {
     // Assume the @llvm.nacl.atomic.* intrinsics follow the PNaCl ABI:
     // this should have been checked by the verifier.
     bool isVolatile = false;
     SynchronizationScope SS = CrossThread;
     Instruction *I;
+    SmallVector<Instruction *, 16> MaybeDead;
 
     switch (Call->getIntrinsicID()) {
     default:
@@ -232,37 +254,103 @@ private:
                         thawMemoryOrder(Call->getArgOperand(2)), SS, Call);
       break;
     case Intrinsic::nacl_atomic_rmw:
-      if (needsX8632HackFor16BitAtomics(cast<PointerType>(
-              Call->getArgOperand(1)->getType())->getElementType())) {
-        // TODO(jfb) Remove this hack. See below.
-        atomic16BitX8632Hack(Call, false, Call->getArgOperand(1),
-                             Call->getArgOperand(2), Call->getArgOperand(0),
-                             NULL);
-        return true;
-      }
       I = new AtomicRMWInst(thawRMWOperation(Call->getArgOperand(0)),
                             Call->getArgOperand(1), Call->getArgOperand(2),
                             thawMemoryOrder(Call->getArgOperand(3)), SS, Call);
       break;
     case Intrinsic::nacl_atomic_cmpxchg:
-      if (needsX8632HackFor16BitAtomics(cast<PointerType>(
-              Call->getArgOperand(0)->getType())->getElementType())) {
-        // TODO(jfb) Remove this hack. See below.
-        atomic16BitX8632Hack(Call, true, Call->getArgOperand(0),
-                             Call->getArgOperand(2), NULL,
-                             Call->getArgOperand(1));
-        return true;
+      I = new AtomicCmpXchgInst(
+          Call->getArgOperand(0), Call->getArgOperand(1),
+          Call->getArgOperand(2), thawMemoryOrder(Call->getArgOperand(3)),
+          thawMemoryOrder(Call->getArgOperand(4)), SS, Call);
+
+      // cmpxchg returns struct { T loaded, i1 success } whereas the PNaCl
+      // intrinsic only returns the loaded value. The Call can't simply be
+      // replaced. Identify loaded+success structs that can be replaced by the
+      // cmxpchg's returned struct.
+      {
+        Instruction *Loaded = nullptr;
+        Instruction *Success = nullptr;
+        for (User *CallUser : Call->users()) {
+          if (auto ICmp = dyn_cast<ICmpInst>(CallUser)) {
+            // Identify comparisons for cmpxchg's success.
+            if (ICmp->getPredicate() != CmpInst::ICMP_EQ)
+              continue;
+            Value *LHS = ICmp->getOperand(0);
+            Value *RHS = ICmp->getOperand(1);
+            Value *Old = I->getOperand(1);
+            if (RHS != Old && LHS != Old) // Call is either RHS or LHS.
+              continue; // The comparison isn't checking for cmpxchg's success.
+
+            // Recognize the pattern creating struct { T loaded, i1 success }:
+            // it can be replaced by cmpxchg's result.
+            for (User *InsUser : ICmp->users()) {
+              if (!isa<Instruction>(InsUser) ||
+                  cast<Instruction>(InsUser)->getParent() != Call->getParent())
+                continue; // Different basic blocks, don't be clever.
+              auto Ins = dyn_cast<InsertValueInst>(InsUser);
+              if (!Ins)
+                continue;
+              auto InsTy = dyn_cast<StructType>(Ins->getType());
+              if (!InsTy)
+                continue;
+              if (!InsTy->isLayoutIdentical(cast<StructType>(I->getType())))
+                continue; // Not a struct { T loaded, i1 success }.
+              if (Ins->getNumIndices() != 1 || Ins->getIndices()[0] != 1)
+                continue; // Not an insert { T, i1 } %something, %success, 1.
+              auto TIns = dyn_cast<InsertValueInst>(Ins->getAggregateOperand());
+              if (!TIns)
+                continue; // T wasn't inserted into the struct, don't be clever.
+              if (!isa<UndefValue>(TIns->getAggregateOperand()))
+                continue; // Not an insert into an undef value, don't be clever.
+              if (TIns->getInsertedValueOperand() != Call)
+                continue; // Not inserting the loaded value.
+              if (TIns->getNumIndices() != 1 || TIns->getIndices()[0] != 0)
+                continue; // Not an insert { T, i1 } undef, %loaded, 0.
+              // Hooray! This is the struct you're looking for.
+
+              // Keep track of values extracted from the struct, instead of
+              // recreating them.
+              for (User *StructUser : Ins->users()) {
+                if (auto Extract = dyn_cast<ExtractValueInst>(StructUser)) {
+                  MaybeDead.push_back(Extract);
+                  if (!Loaded && Extract->getIndices()[0] == 0) {
+                    Loaded = cast<Instruction>(StructUser);
+                    Loaded->moveBefore(Call);
+                  } else if (!Success && Extract->getIndices()[0] == 1) {
+                    Success = cast<Instruction>(StructUser);
+                    Success->moveBefore(Call);
+                  }
+                }
+              }
+
+              MaybeDead.push_back(Ins);
+              MaybeDead.push_back(TIns);
+              Ins->replaceAllUsesWith(I);
+            }
+
+            MaybeDead.push_back(ICmp);
+            if (!Success)
+              Success = ExtractValueInst::Create(I, 1, "success", Call);
+            ICmp->replaceAllUsesWith(Success);
+          }
+        }
+
+        // Clean up remaining uses of the loaded value, if any. Later code will
+        // try to replace Call with I, make sure the types match.
+        if (Call->hasNUsesOrMore(1)) {
+          if (!Loaded)
+            Loaded = ExtractValueInst::Create(I, 0, "loaded", Call);
+          I = Loaded;
+        } else {
+          I = nullptr;
+        }
+
+        if (Loaded)
+          MaybeDead.push_back(Loaded);
+        if (Success)
+          MaybeDead.push_back(Success);
       }
-      // TODO LLVM currently doesn't support specifying separate memory
-      //      orders for compare exchange's success and failure cases:
-      //      LLVM IR implicitly drops the Release part of the specified
-      //      memory order on failure. It is therefore correct to map
-      //      the success memory order onto the LLVM IR and ignore the
-      //      failure one.
-      I = new AtomicCmpXchgInst(Call->getArgOperand(0), Call->getArgOperand(1),
-                                Call->getArgOperand(2),
-                                thawMemoryOrder(Call->getArgOperand(3)), SS,
-                                Call);
       break;
     case Intrinsic::nacl_atomic_fence:
       I = new FenceInst(M->getContext(),
@@ -283,23 +371,31 @@ private:
       Asm->setDebugLoc(Call->getDebugLoc());
     } break;
     }
-    I->setName(Call->getName());
-    I->setDebugLoc(Call->getDebugLoc());
-    Call->replaceAllUsesWith(I);
+
+    if (I) {
+      I->setName(Call->getName());
+      I->setDebugLoc(Call->getDebugLoc());
+      Call->replaceAllUsesWith(I);
+    }
     Call->eraseFromParent();
+
+    // Remove dead code.
+    for (Instruction *Kill : MaybeDead)
+      if (isInstructionTriviallyDead(Kill))
+        Kill->eraseFromParent();
 
     return true;
   }
 
   unsigned alignmentFromPointer(const Value *Ptr) const {
-    const PointerType *PtrType = cast<PointerType>(Ptr->getType());
+    auto *PtrType = cast<PointerType>(Ptr->getType());
     unsigned BitWidth = PtrType->getElementType()->getIntegerBitWidth();
     return BitWidth / 8;
   }
 
   AtomicOrdering thawMemoryOrder(const Value *MemoryOrder) const {
-    NaCl::MemoryOrder MO = (NaCl::MemoryOrder)
-        cast<Constant>(MemoryOrder)->getUniqueInteger().getLimitedValue();
+    auto MO = static_cast<NaCl::MemoryOrder>(
+        cast<Constant>(MemoryOrder)->getUniqueInteger().getLimitedValue());
     switch (MO) {
     // Only valid values should pass validation.
     default: llvm_unreachable("unknown memory order");
@@ -314,8 +410,8 @@ private:
   }
 
   AtomicRMWInst::BinOp thawRMWOperation(const Value *Operation) const {
-    NaCl::AtomicRMWOperation Op = (NaCl::AtomicRMWOperation)
-        cast<Constant>(Operation)->getUniqueInteger().getLimitedValue();
+    auto Op = static_cast<NaCl::AtomicRMWOperation>(
+        cast<Constant>(Operation)->getUniqueInteger().getLimitedValue());
     switch (Op) {
     // Only valid values should pass validation.
     default: llvm_unreachable("unknown atomic RMW operation");
@@ -327,184 +423,6 @@ private:
     case NaCl::AtomicExchange: return AtomicRMWInst::Xchg;
     }
   }
-
-  // TODO(jfb) Remove the following hacks once NaCl's x86-32 validator
-  // supports 16-bit atomic intrisics. See:
-  //   https://code.google.com/p/nativeclient/issues/detail?id=3579
-  //   https://code.google.com/p/nativeclient/issues/detail?id=2981
-  // ===========================================================================
-  bool needsX8632HackFor16BitAtomics(Type *OverloadedType) const {
-    return Triple(M->getTargetTriple()).getArch() == Triple::x86 &&
-        OverloadedType == Type::getInt16Ty(M->getContext());
-  }
-
-  /// Expand the 16-bit Intrinsic into an equivalent 32-bit
-  /// compare-exchange loop.
-  void atomic16BitX8632Hack(IntrinsicInst *Call, bool IsCmpXChg,
-                            Value *Ptr16, Value *RHS, Value *RMWOp,
-                            Value *CmpXChgOldVal) const {
-    assert((IsCmpXChg ? CmpXChgOldVal : RMWOp) &&
-           "cmpxchg expects an old value, whereas RMW expects an operation");
-    Type *I16 = Type::getInt16Ty(M->getContext());
-    Type *I32 = Type::getInt32Ty(M->getContext());
-    Type *I32Ptr = Type::getInt32PtrTy(M->getContext());
-
-    // Precede this with a compiler fence.
-    FunctionType *FTy =
-        FunctionType::get(Type::getVoidTy(M->getContext()), false);
-    std::string AsmString; // Empty.
-    std::string Constraints("~{memory}");
-    bool HasSideEffect = true;
-    CallInst::Create(InlineAsm::get(
-        FTy, AsmString, Constraints, HasSideEffect), "", Call);
-
-    BasicBlock *CurrentBB = Call->getParent();
-    IRBuilder<> IRB(CurrentBB, Call);
-    BasicBlock *Aligned32BB =
-        BasicBlock::Create(IRB.getContext(), "atomic16aligned32",
-                           CurrentBB->getParent());
-    BasicBlock *Aligned16BB =
-        BasicBlock::Create(IRB.getContext(), "atomic16aligned16",
-                           CurrentBB->getParent());
-
-    // Setup.
-    // Align the 16-bit pointer to 32-bits, and figure out if the 16-bit
-    // operation is to be carried on the top or bottom half of the
-    // 32-bit aligned value.
-    Value *IPtr = IRB.CreatePtrToInt(Ptr16, I32, "uintptr");
-    Value *IPtrAlign = IRB.CreateAnd(IPtr, IRB.getInt32(~3u), "aligneduintptr");
-    Value *Aligned32 = IRB.CreateAnd(IPtr, IRB.getInt32(3u), "aligned32");
-    Value *Ptr32 = IRB.CreateIntToPtr(IPtrAlign, I32Ptr, "ptr32");
-    Value *IsAligned32 = IRB.CreateICmpEQ(Aligned32, IRB.getInt32(0),
-                                          "isaligned32");
-    IRB.CreateCondBr(IsAligned32, Aligned32BB, Aligned16BB);
-
-    // Create a diamond after the setup. The rest of the basic block
-    // that the Call was in is separated into the successor block.
-    BasicBlock *Successor =
-        CurrentBB->splitBasicBlock(IRB.GetInsertPoint(), "atomic16successor");
-    // Remove the extra unconditional branch that the split added.
-    CurrentBB->getTerminator()->eraseFromParent();
-
-    // Aligned 32 block.
-    // The 16-bit value was aligned to 32-bits:
-    //  - Atomically load the full 32-bit value.
-    //  - Get the 16-bit value from its bottom.
-    //  - Perform the 16-bit operation.
-    //  - Truncate and merge the result back with the top half of the
-    //    loaded value.
-    //  - Try to compare-exchange this new 32-bit result. This will
-    //    succeed if the value at the 32-bit location is still what was
-    //    just loaded. If not, try the entire thing again.
-    //  - Return the 16-bit value before the operation was performed.
-    Value *Ret32;
-    {
-      IRB.SetInsertPoint(Aligned32BB);
-      LoadInst *Loaded = IRB.CreateAlignedLoad(Ptr32, 4, "loaded");
-      Loaded->setAtomic(SequentiallyConsistent);
-      Value *TruncVal = IRB.CreateTrunc(Loaded, I16, "truncval");
-      Ret32 = TruncVal;
-      Value *Res;
-      if (IsCmpXChg) {
-        Res = RHS;
-      } else {
-        switch (thawRMWOperation(RMWOp)) {
-        default: llvm_unreachable("unknown atomic RMW operation");
-        case AtomicRMWInst::Add:
-          Res = IRB.CreateAdd(TruncVal, RHS, "res"); break;
-        case AtomicRMWInst::Sub:
-          Res = IRB.CreateSub(TruncVal, RHS, "res"); break;
-        case AtomicRMWInst::Or:
-          Res = IRB.CreateOr(TruncVal, RHS, "res"); break;
-        case AtomicRMWInst::And:
-          Res = IRB.CreateAnd(TruncVal, RHS, "res"); break;
-        case AtomicRMWInst::Xor:
-          Res = IRB.CreateXor(TruncVal, RHS, "res"); break;
-        case AtomicRMWInst::Xchg:
-          Res = RHS; break;
-        }
-      }
-      Value *MergeRes = IRB.CreateZExt(Res, I32, "mergeres");
-      Value *MaskedLoaded = IRB.CreateAnd(Loaded, IRB.getInt32(0xFFFF0000u),
-                                          "maskedloaded");
-      Value *FinalRes = IRB.CreateOr(MergeRes, MaskedLoaded, "finalres");
-      Value *Expected = IsCmpXChg ?
-          IRB.CreateOr(MaskedLoaded, IRB.CreateZExt(CmpXChgOldVal, I32, "zext"),
-                       "expected") :
-          Loaded;
-      Value *OldVal = IRB.CreateAtomicCmpXchg(Ptr32, Expected, FinalRes,
-                                              SequentiallyConsistent);
-      OldVal->setName("oldval");
-      // Test that the entire 32-bit value didn't change during the operation.
-      Value *Success = IRB.CreateICmpEQ(OldVal, Loaded, "success");
-      IRB.CreateCondBr(Success, Successor, Aligned32BB);
-    }
-
-    // Aligned 16 block.
-    // Similar to the above aligned 32 block, but the 16-bit value is in
-    // the top half of the 32-bit value. It needs to be shifted down,
-    // and shifted back up before being merged in.
-    Value *Ret16;
-    {
-      IRB.SetInsertPoint(Aligned16BB);
-      LoadInst *Loaded = IRB.CreateAlignedLoad(Ptr32, 4, "loaded");
-      Loaded->setAtomic(SequentiallyConsistent);
-      Value *ShVal = IRB.CreateTrunc(IRB.CreateLShr(Loaded, 16, "lshr"), I16,
-                                     "shval");
-      Ret16 = ShVal;
-      Value *Res;
-      if (IsCmpXChg) {
-        Res = RHS;
-      } else {
-        switch (thawRMWOperation(RMWOp)) {
-        default: llvm_unreachable("unknown atomic RMW operation");
-        case AtomicRMWInst::Add:
-          Res = IRB.CreateAdd(ShVal, RHS, "res"); break;
-        case AtomicRMWInst::Sub:
-          Res = IRB.CreateSub(ShVal, RHS, "res"); break;
-        case AtomicRMWInst::Or:
-          Res = IRB.CreateOr(ShVal, RHS, "res"); break;
-        case AtomicRMWInst::And:
-          Res = IRB.CreateAnd(ShVal, RHS, "res"); break;
-        case AtomicRMWInst::Xor:
-          Res = IRB.CreateXor(ShVal, RHS, "res"); break;
-        case AtomicRMWInst::Xchg:
-          Res = RHS; break;
-        }
-      }
-      Value *MergeRes = IRB.CreateShl(IRB.CreateZExt(Res, I32, "zext"), 16,
-                                      "mergeres");
-      Value *MaskedLoaded = IRB.CreateAnd(Loaded, IRB.getInt32(0xFFFF),
-                                          "maskedloaded");
-      Value *FinalRes = IRB.CreateOr(MergeRes, MaskedLoaded, "finalres");
-      Value *Expected = IsCmpXChg ?
-          IRB.CreateOr(MaskedLoaded, IRB.CreateShl(
-              IRB.CreateZExt(CmpXChgOldVal, I32, "zext"), 16, "shl"),
-                       "expected") :
-          Loaded;
-      Value *OldVal = IRB.CreateAtomicCmpXchg(Ptr32, Expected, FinalRes,
-                                              SequentiallyConsistent);
-      OldVal->setName("oldval");
-      // Test that the entire 32-bit value didn't change during the operation.
-      Value *Success = IRB.CreateICmpEQ(OldVal, Loaded, "success");
-      IRB.CreateCondBr(Success, Successor, Aligned16BB);
-    }
-
-    // Merge the value, and remove the original intrinsic Call.
-    IRB.SetInsertPoint(Successor->getFirstInsertionPt());
-    PHINode *PHI = IRB.CreatePHI(I16, 2);
-    PHI->addIncoming(Ret32, Aligned32BB);
-    PHI->addIncoming(Ret16, Aligned16BB);
-    Call->replaceAllUsesWith(PHI);
-    Call->eraseFromParent();
-
-    // Finish everything with another compiler fence.
-    CallInst::Create(InlineAsm::get(
-        FTy, AsmString, Constraints, HasSideEffect), "",
-                     Successor->getFirstInsertionPt());
-  }
-  // ===========================================================================
-  // End hacks.
 
   AtomicCallResolver(const AtomicCallResolver &);
   AtomicCallResolver &operator=(const AtomicCallResolver &);
@@ -518,24 +436,26 @@ bool ResolvePNaClIntrinsics::visitCalls(
   if (!IntrinsicFunction)
     return false;
 
-  for (Value::use_iterator UI = IntrinsicFunction->use_begin(),
-                           UE = IntrinsicFunction->use_end();
-       UI != UE;) {
-    // At this point, the only uses of the intrinsic can be calls, since
-    // we assume this pass runs on bitcode that passed ABI verification.
-    IntrinsicInst *Call = dyn_cast<IntrinsicInst>(*UI++);
+  SmallVector<IntrinsicInst *, 64> Calls;
+  for (User *U : IntrinsicFunction->users()) {
+    // At this point, the only uses of the intrinsic can be calls, since we
+    // assume this pass runs on bitcode that passed ABI verification.
+    auto *Call = dyn_cast<IntrinsicInst>(U);
     if (!Call)
       report_fatal_error("Expected use of intrinsic to be a call: " +
                          Resolver.getName());
-
-    Changed |= Resolver.resolve(Call);
+    Calls.push_back(Call);
   }
+
+  for (IntrinsicInst *Call : Calls)
+    Changed |= Resolver.resolve(Call);
 
   return Changed;
 }
 
 bool ResolvePNaClIntrinsics::runOnFunction(Function &F) {
-  LLVMContext &C = F.getParent()->getContext();
+  Module *M = F.getParent();
+  LLVMContext &C = M->getContext();
   bool Changed = false;
 
   IntrinsicCallToFunctionCall SetJmpResolver(F, Intrinsic::nacl_setjmp,
@@ -547,14 +467,13 @@ bool ResolvePNaClIntrinsics::runOnFunction(Function &F) {
 
   NaCl::AtomicIntrinsics AI(C);
   NaCl::AtomicIntrinsics::View V = AI.allIntrinsicsAndOverloads();
-  for (NaCl::AtomicIntrinsics::View::iterator I = V.begin(), E = V.end();
-       I != E; ++I) {
+  for (auto I = V.begin(), E = V.end(); I != E; ++I) {
     AtomicCallResolver AtomicResolver(F, I);
     Changed |= visitCalls(AtomicResolver);
   }
 
   ConstantCallResolver<IsLockFreeToConstant> IsLockFreeResolver(
-      F, Intrinsic::nacl_atomic_is_lock_free, IsLockFreeToConstant());
+      F, Intrinsic::nacl_atomic_is_lock_free, IsLockFreeToConstant(M));
   Changed |= visitCalls(IsLockFreeResolver);
 
   return Changed;

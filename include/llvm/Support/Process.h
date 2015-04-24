@@ -29,9 +29,9 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Allocator.h"
-#include "llvm/Support/system_error.h"
 #include "llvm/Support/DataTypes.h"
 #include "llvm/Support/TimeValue.h"
+#include <system_error>
 
 namespace llvm {
 class StringRef;
@@ -110,10 +110,10 @@ class self_process : public process {
   virtual ~self_process();
 
 public:
-  virtual id_type get_id();
-  virtual TimeValue get_user_time() const;
-  virtual TimeValue get_system_time() const;
-  virtual TimeValue get_wall_time() const;
+  id_type get_id() override;
+  TimeValue get_user_time() const override;
+  TimeValue get_system_time() const override;
+  TimeValue get_wall_time() const override;
 
   /// \name Process configuration (sysconf on POSIX)
   /// @{
@@ -171,13 +171,35 @@ public:
   // string. \arg Name is assumed to be in UTF-8 encoding too.
   static Optional<std::string> GetEnv(StringRef name);
 
+  /// This function searches for an existing file in the list of directories
+  /// in a PATH like environment variable, and returns the first file found,
+  /// according to the order of the entries in the PATH like environment
+  /// variable.
+  static Optional<std::string> FindInEnvPath(const std::string& EnvName,
+                                             const std::string& FileName);
+
   /// This function returns a SmallVector containing the arguments passed from
   /// the operating system to the program.  This function expects to be handed
   /// the vector passed in from main.
-  static error_code
+  static std::error_code
   GetArgumentVector(SmallVectorImpl<const char *> &Args,
                     ArrayRef<const char *> ArgsFromMain,
                     SpecificBumpPtrAllocator<char> &ArgAllocator);
+
+  // This functions ensures that the standard file descriptors (input, output,
+  // and error) are properly mapped to a file descriptor before we use any of
+  // them.  This should only be called by standalone programs, library
+  // components should not call this.
+  static std::error_code FixupStandardFileDescriptors();
+
+  // This function safely closes a file descriptor.  It is not safe to retry
+  // close(2) when it returns with errno equivalent to EINTR; this is because
+  // *nixen cannot agree if the file descriptor is, in fact, closed when this
+  // occurs.
+  //
+  // N.B. Some operating systems, due to thread cancellation, cannot properly
+  // guarantee that it will or will not be closed one way or the other!
+  static std::error_code SafelyCloseFileDescriptor(int FD);
 
   /// This function determines if the standard input is connected directly
   /// to a user's input (keyboard probably), rather than coming from a file

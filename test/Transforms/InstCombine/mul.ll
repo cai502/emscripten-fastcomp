@@ -181,3 +181,77 @@ define i32 @test19(i32 %A, i32 %B) {
   ret i32 %H
 ; CHECK: ret i32 0
 }
+
+define <2 x i64> @test20(<2 x i64> %A) {
+; CHECK-LABEL: @test20(
+        %B = add <2 x i64> %A, <i64 12, i64 14>
+        %C = mul <2 x i64> %B, <i64 3, i64 2>
+        ret <2 x i64> %C
+; CHECK: mul <2 x i64> %A, <i64 3, i64 2>
+; CHECK: add <2 x i64> %{{.}}, <i64 36, i64 28>
+}
+
+define <2 x i1> @test21(<2 x i1> %A, <2 x i1> %B) {
+; CHECK-LABEL: @test21(
+        %C = mul <2 x i1> %A, %B
+        ret <2 x i1> %C
+; CHECK: %C = and <2 x i1> %A, %B
+}
+
+define i32 @test22(i32 %A) {
+; CHECK-LABEL: @test22(
+        %B = mul nsw i32 %A, -1
+        ret i32 %B
+; CHECK: sub nsw i32 0, %A
+}
+
+define i32 @test23(i32 %A) {
+; CHECK-LABEL: @test23(
+        %B = shl nuw i32 %A, 1
+        %C = mul nuw i32 %B, 3
+        ret i32 %C
+; CHECK: mul nuw i32 %A, 6
+}
+
+define i32 @test24(i32 %A) {
+; CHECK-LABEL: @test24(
+        %B = shl nsw i32 %A, 1
+        %C = mul nsw i32 %B, 3
+        ret i32 %C
+; CHECK: mul nsw i32 %A, 6
+}
+
+define i32 @test25(i32 %A, i32 %B) {
+; CHECK-LABEL: @test25(
+        %C = sub nsw i32 0, %A
+        %D = sub nsw i32 0, %B
+        %E = mul nsw i32 %C, %D
+        ret i32 %E
+; CHECK: mul nsw i32 %A, %B
+}
+
+define i32 @test26(i32 %A, i32 %B) {
+; CHECK-LABEL: @test26(
+        %C = shl nsw i32 1, %B
+        %D = mul nsw i32 %A, %C
+        ret i32 %D
+; CHECK: shl nsw i32 %A, %B
+}
+
+define i32 @test27(i32 %A, i32 %B) {
+; CHECK-LABEL: @test27(
+        %C = shl i32 1, %B
+        %D = mul nuw i32 %A, %C
+        ret i32 %D
+; CHECK: shl nuw i32 %A, %B
+}
+
+define i32 @test28(i32 %A) {
+; CHECK-LABEL: @test28(
+        %B = shl i32 1, %A
+        %C = mul nsw i32 %B, %B
+        ret i32 %C
+; CHECK:      %[[shl1:.*]] = shl i32 1, %A
+; CHECK-NEXT: %[[shl2:.*]] = shl i32 %[[shl1]], %A
+; CHECK-NEXT: ret i32 %[[shl2]]
+}

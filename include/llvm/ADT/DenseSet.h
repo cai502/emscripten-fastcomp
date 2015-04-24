@@ -27,11 +27,14 @@ class DenseSet {
   typedef DenseMap<ValueT, char, ValueInfoT> MapTy;
   MapTy TheMap;
 public:
-  DenseSet(const DenseSet &Other) : TheMap(Other.TheMap) {}
+  typedef ValueT key_type;
+  typedef ValueT value_type;
+  typedef unsigned size_type;
+
   explicit DenseSet(unsigned NumInitBuckets = 0) : TheMap(NumInitBuckets) {}
 
   bool empty() const { return TheMap.empty(); }
-  unsigned size() const { return TheMap.size(); }
+  size_type size() const { return TheMap.size(); }
   size_t getMemorySize() const { return TheMap.getMemorySize(); }
 
   /// Grow the DenseSet so that it has at least Size buckets. Will not shrink
@@ -42,7 +45,8 @@ public:
     TheMap.clear();
   }
 
-  bool count(const ValueT &V) const {
+  /// Return 1 if the specified key is in the set, 0 otherwise.
+  size_type count(const ValueT &V) const {
     return TheMap.count(V);
   }
 
@@ -52,11 +56,6 @@ public:
 
   void swap(DenseSet& RHS) {
     TheMap.swap(RHS.TheMap);
-  }
-
-  DenseSet &operator=(const DenseSet &RHS) {
-    TheMap = RHS.TheMap;
-    return *this;
   }
 
   // Iterators.
@@ -111,6 +110,21 @@ public:
   const_iterator end() const { return ConstIterator(TheMap.end()); }
 
   iterator find(const ValueT &V) { return Iterator(TheMap.find(V)); }
+
+  /// Alternative version of find() which allows a different, and possibly less
+  /// expensive, key type.
+  /// The DenseMapInfo is responsible for supplying methods
+  /// getHashValue(LookupKeyT) and isEqual(LookupKeyT, KeyT) for each key type
+  /// used.
+  template <class LookupKeyT>
+  iterator find_as(const LookupKeyT &Val) {
+    return Iterator(TheMap.find_as(Val));
+  }
+  template <class LookupKeyT>
+  const_iterator find_as(const LookupKeyT &Val) const {
+    return ConstIterator(TheMap.find_as(Val));
+  }
+
   void erase(Iterator I) { return TheMap.erase(I.I); }
   void erase(ConstIterator CI) { return TheMap.erase(CI.I); }
 

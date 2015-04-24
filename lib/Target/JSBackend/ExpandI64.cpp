@@ -38,7 +38,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
-#include "llvm/Support/CFG.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/Target/TargetLibraryInfo.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <map>
@@ -69,7 +69,7 @@ namespace {
   // order to expand i64 arguments to pairs of i32s.
   class ExpandI64 : public ModulePass {
     bool Changed;
-    DataLayout *DL;
+    const DataLayout *DL;
     Module *TheModule;
 
     SplitsMap Splits; // old illegal value to new insts
@@ -115,8 +115,8 @@ namespace {
       Add = Sub = Mul = SDiv = UDiv = SRem = URem = LShr = AShr = Shl = GetHigh = SetHigh = NULL;
     }
 
-    virtual bool runOnModule(Module &M);
-    virtual void getAnalysisUsage(AnalysisUsage &AU) const;
+    bool runOnModule(Module &M) override;
+    void getAnalysisUsage(AnalysisUsage &AU) const override;
   };
 }
 
@@ -1069,7 +1069,7 @@ void ExpandI64::ensureFuncs() {
 
 bool ExpandI64::runOnModule(Module &M) {
   TheModule = &M;
-  DL = &getAnalysis<DataLayout>();
+  DL = &getAnalysis<DataLayoutPass>().getDataLayout();
   Splits.clear();
   Changed = false;
 
@@ -1158,10 +1158,14 @@ bool ExpandI64::runOnModule(Module &M) {
 }
 
 void ExpandI64::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.addRequired<DataLayout>();
+  AU.addRequired<DataLayoutPass>();
   ModulePass::getAnalysisUsage(AU);
 }
 
-Pass *llvm::createExpandI64Pass() {
+namespace llvm {
+
+ModulePass *createExpandI64Pass() {
   return new ExpandI64();
+}
+
 }

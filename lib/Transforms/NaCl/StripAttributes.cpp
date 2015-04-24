@@ -14,13 +14,11 @@
 //    calls.
 //  * Calling conventions from functions and function calls.
 //  * The "align" attribute on functions.
-//  * The alignment argument of memcpy/memmove/memset intrinsic calls.
 //  * The "unnamed_addr" attribute on functions and global variables.
 //  * The distinction between "internal" and "private" linkage.
 //  * "protected" and "internal" visibility of functions and globals.
+//  * All sections are stripped. A few sections cause warnings.
 //  * The arithmetic attributes "nsw", "nuw" and "exact".
-//  * It reduces the set of possible "align" attributes on memory
-//    accesses.
 //
 //===----------------------------------------------------------------------===//
 
@@ -30,8 +28,9 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Pass.h"
-#include "llvm/Support/CallSite.h"
+#include "llvm/IR/CallSite.h"
 #include "llvm/Transforms/NaCl.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace llvm;
 
@@ -45,7 +44,7 @@ namespace {
       initializeStripAttributesPass(*PassRegistry::getPassRegistry());
     }
 
-    virtual bool runOnModule(Module &M);
+    bool runOnModule(Module &M) override;
   };
 }
 
@@ -142,12 +141,51 @@ static void CheckAttributes(AttributeSet Attrs) {
   }
 }
 
+static const char* ShouldWarnAboutSection(const char* Section) {
+  static const char* SpecialSections[] = {
+    ".init_array",
+    ".init",
+    ".fini_array",
+    ".fini",
+
+    // Java/LSB:
+    ".jcr",
+
+    // LSB:
+    ".ctors",
+    ".dtors",
+  };
+
+  for (auto CheckSection : SpecialSections) {
+    if (strcmp(Section, CheckSection) == 0) {
+      return CheckSection;
+    }
+  }
+
+  return nullptr;
+}
+
 void stripGlobalValueAttrs(GlobalValue *GV) {
   // In case source code uses __attribute__((visibility("hidden"))) or
   // __attribute__((visibility("protected"))), strip these attributes.
   GV->setVisibility(GlobalValue::DefaultVisibility);
 
   GV->setUnnamedAddr(false);
+
+  if (GV->hasSection()) {
+    const char *Section = GV->getSection();
+    // check for a few special cases
+    if (const char *WarnSection = ShouldWarnAboutSection(Section)) {
+      errs() << "Warning: " << GV->getName() <<
+        " will have its section (" <<
+        WarnSection << ") stripped.\n";
+    }
+
+    if(GlobalObject* GO = dyn_cast<GlobalObject>(GV)) {
+      GO->setSection("");
+    }
+    // Nothing we can do if GV isn't a GlobalObject.
+  }
 
   // Convert "private" linkage to "internal" to reduce the number of
   // linkage types that need to be represented in PNaCl's wire format.
@@ -160,63 +198,26 @@ void stripGlobalValueAttrs(GlobalValue *GV) {
     GV->setLinkage(GlobalValue::InternalLinkage);
 }
 
-static unsigned normalizeAlignment(DataLayout *DL, unsigned Alignment,
-                                   Type *Ty, bool IsAtomic) {
-#if 0
-  unsigned MaxAllowed = 1;
-  if (Ty->isDoubleTy() || Ty->isFloatTy() || IsAtomic)
-    MaxAllowed = DL->getTypeAllocSize(Ty);
-  // If the alignment is set to 0, this means "use the default
-  // alignment for the target", which we fill in explicitly.
-  if (Alignment == 0 || Alignment >= MaxAllowed)
-    return MaxAllowed;
-  return 1;
-#else
-  return Alignment; // EMSCRIPTEN: no need to change alignment
-#endif
-}
+void stripFunctionAttrs(DataLayout *DL, Function *F) {
+  CheckAttributes(F->getAttributes());
+  F->setAttributes(AttributeSet());
+  F->setCallingConv(CallingConv::C);
+  F->setAlignment(0);
 
-void stripFunctionAttrs(DataLayout *DL, Function *Func) {
-  CheckAttributes(Func->getAttributes());
-  Func->setAttributes(AttributeSet());
-  Func->setCallingConv(CallingConv::C);
-  Func->setAlignment(0);
-
-  for (Function::iterator BB = Func->begin(), E = Func->end();
-       BB != E; ++BB) {
-    for (BasicBlock::iterator Inst = BB->begin(), E = BB->end();
-         Inst != E; ++Inst) {
-      CallSite Call(Inst);
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      CallSite Call(&I);
       if (Call) {
         CheckAttributes(Call.getAttributes());
         Call.setAttributes(AttributeSet());
         Call.setCallingConv(CallingConv::C);
-
-#if 0 // EMSCRIPTEN: we do support alignment info in these calls
-        // Set memcpy(), memmove() and memset() to use pessimistic
-        // alignment assumptions.
-        if (MemIntrinsic *MemOp = dyn_cast<MemIntrinsic>(Inst)) {
-          Type *AlignTy = MemOp->getAlignmentCst()->getType();
-          MemOp->setAlignment(ConstantInt::get(AlignTy, 1));
-        }
-#endif
       } else if (OverflowingBinaryOperator *Op =
-                     dyn_cast<OverflowingBinaryOperator>(Inst)) {
+                     dyn_cast<OverflowingBinaryOperator>(&I)) {
         cast<BinaryOperator>(Op)->setHasNoUnsignedWrap(false);
         cast<BinaryOperator>(Op)->setHasNoSignedWrap(false);
       } else if (PossiblyExactOperator *Op =
-                     dyn_cast<PossiblyExactOperator>(Inst)) {
+                     dyn_cast<PossiblyExactOperator>(&I)) {
         cast<BinaryOperator>(Op)->setIsExact(false);
-      } else if (LoadInst *Load = dyn_cast<LoadInst>(Inst)) {
-        Load->setAlignment(normalizeAlignment(
-                               DL, Load->getAlignment(),
-                               Load->getType(),
-                               Load->isAtomic()));
-      } else if (StoreInst *Store = dyn_cast<StoreInst>(Inst)) {
-        Store->setAlignment(normalizeAlignment(
-                                DL, Store->getAlignment(),
-                                Store->getValueOperand()->getType(),
-                                Store->isAtomic()));
       }
     }
   }
@@ -224,20 +225,19 @@ void stripFunctionAttrs(DataLayout *DL, Function *Func) {
 
 bool StripAttributes::runOnModule(Module &M) {
   DataLayout DL(&M);
-  for (Module::iterator Func = M.begin(), E = M.end(); Func != E; ++Func) {
+  for (Function &F : M)
     // Avoid stripping attributes from intrinsics because the
     // constructor for Functions just adds them back again.  It would
     // be confusing if the attributes were sometimes present on
     // intrinsics and sometimes not.
-    if (!Func->isIntrinsic()) {
-      stripGlobalValueAttrs(Func);
-      stripFunctionAttrs(&DL, Func);
+    if (!F.isIntrinsic()) {
+      stripGlobalValueAttrs(&F);
+      stripFunctionAttrs(&DL, &F);
     }
-  }
-  for (Module::global_iterator GV = M.global_begin(), E = M.global_end();
-       GV != E; ++GV) {
-    stripGlobalValueAttrs(GV);
-  }
+
+  for (GlobalVariable &GV : M.globals())
+    stripGlobalValueAttrs(&GV);
+
   return true;
 }
 

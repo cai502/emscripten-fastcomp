@@ -82,6 +82,7 @@ namespace llvm {
   public:
     Value *getAddress() const;
     MDNode *getVariable() const { return cast<MDNode>(getArgOperand(1)); }
+    MDNode *getExpression() const { return cast<MDNode>(getArgOperand(2)); }
 
     // Methods for support type inquiry through isa, cast, and dyn_cast:
     static inline bool classof(const IntrinsicInst *I) {
@@ -103,6 +104,7 @@ namespace llvm {
                           const_cast<Value*>(getArgOperand(1)))->getZExtValue();
     }
     MDNode *getVariable() const { return cast<MDNode>(getArgOperand(2)); }
+    MDNode *getExpression() const { return cast<MDNode>(getArgOperand(3)); }
 
     // Methods for support type inquiry through isa, cast, and dyn_cast:
     static inline bool classof(const IntrinsicInst *I) {
@@ -118,8 +120,13 @@ namespace llvm {
   class MemIntrinsic : public IntrinsicInst {
   public:
     Value *getRawDest() const { return const_cast<Value*>(getArgOperand(0)); }
+    const Use &getRawDestUse() const { return getArgOperandUse(0); }
+    Use &getRawDestUse() { return getArgOperandUse(0); }
 
     Value *getLength() const { return const_cast<Value*>(getArgOperand(2)); }
+    const Use &getLengthUse() const { return getArgOperandUse(2); }
+    Use &getLengthUse() { return getArgOperandUse(2); }
+
     ConstantInt *getAlignmentCst() const {
       return cast<ConstantInt>(const_cast<Value*>(getArgOperand(3)));
     }
@@ -192,6 +199,8 @@ namespace llvm {
     /// get* - Return the arguments to the instruction.
     ///
     Value *getValue() const { return const_cast<Value*>(getArgOperand(1)); }
+    const Use &getValueUse() const { return getArgOperandUse(1); }
+    Use &getValueUse() { return getArgOperandUse(1); }
 
     void setValue(Value *Val) {
       assert(getValue()->getType() == Val->getType() &&
@@ -215,6 +224,8 @@ namespace llvm {
     /// get* - Return the arguments to the instruction.
     ///
     Value *getRawSource() const { return const_cast<Value*>(getArgOperand(1)); }
+    const Use &getRawSourceUse() const { return getArgOperandUse(1); }
+    Use &getRawSourceUse() { return getArgOperandUse(1); }
 
     /// getSource - This is just like getRawSource, but it strips off any cast
     /// instructions that feed it, giving the original input.  The returned
