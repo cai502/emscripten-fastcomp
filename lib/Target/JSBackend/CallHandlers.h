@@ -48,11 +48,16 @@ DEF_CALL_HANDLER(__default__, {
   bool NeedCasts = true;
   FunctionType *FT;
   bool Invoke = false;
+  bool Emulated = false;
   if (InvokeState == 1) {
     InvokeState = 2;
     Invoke = canInvoke(CV);
   }
   std::string Sig;
+
+  bool ForcedNumArgs = NumArgs != -1;
+  if (!ForcedNumArgs) NumArgs = getNumArgOperands(CI);
+
   const Function *F = dyn_cast<const Function>(CV);
   if (F) {
     NeedCasts = F->isDeclaration(); // if ffi call, need casts
@@ -66,14 +71,17 @@ DEF_CALL_HANDLER(__default__, {
       ensureFunctionTable(FT);
       if (!Invoke) {
         Sig = getFunctionSignature(FT, &Name);
-        Name = std::string("FUNCTION_TABLE_") + Sig + "[" + Name + " & #FM_" + Sig + "#]";
-        NeedCasts = false; // function table call, so stays in asm module
+        if (!EmulatedFunctionPointers) {
+          Name = std::string("FUNCTION_TABLE_") + Sig + "[" + Name + " & #FM_" + Sig + "#]";
+          NeedCasts = false; // function table call, so stays in asm module
+        } else {
+          Name = std::string("ftCall_") + Sig + "(" + getCast(Name, Type::getInt32Ty(CI->getContext()));
+          if (NumArgs > 0) Name += ',';
+          Emulated = true;
+        }
       }
     }
   }
-
-  bool ForcedNumArgs = NumArgs != -1;
-  if (!ForcedNumArgs) NumArgs = getNumArgOperands(CI);
 
   bool ObjcMsgSendFuncs = Name.find("_objc_msg") != std::string::npos;
   if(ObjcMsgSendFuncs) {
@@ -122,11 +130,12 @@ DEF_CALL_HANDLER(__default__, {
     Name = "invoke_" + Sig;
     NeedCasts = true;
   }
-  std::string text = Name + "(";
+  std::string text = Name;
+  if (!Emulated) text += "(";
   if (Invoke) {
     // add first param
     if (F) {
-      text += utostr(getFunctionIndex(F)); // convert to function pointer
+      text += relocateFunctionPointer(utostr(getFunctionIndex(F))); // convert to function pointer
     } else {
       text += getValueAsCastStr(CV); // already a function pointer
     }
@@ -521,9 +530,12 @@ DEF_CALL_HANDLER(emscripten_float32x4_storexy, {
 
 // EM_ASM support
 
-std::string handleAsmConst(const Instruction *CI, std::string suffix="") {
-  std::string ret = "_emscripten_asm_const" + suffix + "(" + utostr(getAsmConstId(CI->getOperand(0)));
+std::string handleAsmConst(const Instruction *CI) {
   unsigned Num = getNumArgOperands(CI);
+  unsigned ActualNum = Num - 1; // ignore the first argument, which is a pointer to the code
+  std::string func = "emscripten_asm_const_" + utostr(ActualNum);
+  AsmConstArities.insert(ActualNum);
+  std::string ret = "_" + func + "(" + utostr(getAsmConstId(CI->getOperand(0)));
   for (unsigned i = 1; i < Num; i++) {
     ret += ", " + getValueAsCastParenStr(CI->getOperand(i), ASM_NONSPECIFIC);
   }
@@ -536,11 +548,11 @@ DEF_CALL_HANDLER(emscripten_asm_const, {
 })
 DEF_CALL_HANDLER(emscripten_asm_const_int, {
   Declares.insert("emscripten_asm_const_int");
-  return getAssign(CI) + getCast(handleAsmConst(CI, "_int"), Type::getInt32Ty(CI->getContext()));
+  return getAssign(CI) + getCast(handleAsmConst(CI), Type::getInt32Ty(CI->getContext()));
 })
 DEF_CALL_HANDLER(emscripten_asm_const_double, {
   Declares.insert("emscripten_asm_const_double");
-  return getAssign(CI) + getCast(handleAsmConst(CI, "_double"), Type::getDoubleTy(CI->getContext()));
+  return getAssign(CI) + getCast(handleAsmConst(CI), Type::getDoubleTy(CI->getContext()));
 })
 
 #define DEF_BUILTIN_HANDLER(name, to) \

@@ -79,6 +79,11 @@ ReservedFunctionPointers("emscripten-reserved-function-pointers",
                          cl::desc("Number of reserved slots in function tables for functions to be added at runtime (see emscripten RESERVED_FUNCTION_POINTERS option)"),
                          cl::init(0));
 
+static cl::opt<bool>
+EmulatedFunctionPointers("emscripten-emulated-function-pointers",
+                         cl::desc("Emulate function pointers, avoiding asm.js function tables (see emscripten EMULATED_FUNCTION_POINTERS option)"),
+                         cl::init(false));
+
 static cl::opt<int>
 EmscriptenAssertions("emscripten-assertions",
                      cl::desc("Additional JS-specific assertions (see emscripten ASSERTIONS)"),
@@ -93,6 +98,11 @@ static cl::opt<int>
 GlobalBase("emscripten-global-base",
            cl::desc("Where global variables start out in memory (see emscripten GLOBAL_BASE option)"),
            cl::init(8));
+
+static cl::opt<bool>
+Relocatable("emscripten-relocatable",
+            cl::desc("Whether to emit relocatable code (see emscripten RELOCATABLE option)"),
+            cl::init(false));
 
 
 extern "C" void LLVMInitializeJSBackendTarget() {
@@ -114,6 +124,7 @@ namespace {
 
   typedef std::map<const Value*,std::string> ValueMap;
   typedef std::set<std::string> NameSet;
+  typedef std::set<int> IntSet;
   typedef std::vector<unsigned char> HeapData;
   typedef std::pair<unsigned, unsigned> Address;
   typedef std::map<std::string, Type *> VarMap;
@@ -151,8 +162,11 @@ namespace {
     FunctionTableMap FunctionTables; // sig => list of functions
     std::vector<std::string> GlobalInitializers;
     std::vector<std::string> Exports; // additional exports
+    StringMap Aliases;
     BlockAddressMap BlockAddresses;
     NameIntMap AsmConsts;
+    IntSet AsmConstArities;
+    NameSet BlockRelocatableExterns; // which externals are accessed in this block; we load them once at the beginning (avoids a potential call in a heap access, and might be faster)
     AddressList objcSelectorRefs;
     AddressList objcMessageRefs;
     AddressList objcClassRefs;
@@ -361,11 +375,23 @@ namespace {
       return V;
     }
 
+    std::string relocateFunctionPointer(std::string FP) {
+      return Relocatable ? "(fb + (" + FP + ") | 0)" : FP;
+    }
+
+    std::string relocateGlobal(std::string G) {
+      return Relocatable ? "(gb + (" + G + ") | 0)" : G;
+    }
+
     // Return a constant we are about to write into a global as a numeric offset. If the
     // value is not known at compile time, emit a postSet to that location.
     unsigned getConstAsOffset(const Value *V, unsigned AbsoluteTarget) {
       V = resolveFully(V);
       if (const Function *F = dyn_cast<const Function>(V)) {
+        if (Relocatable) {
+          PostSets += "\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + relocateFunctionPointer(utostr(getFunctionIndex(F))) + ';';
+          return 0; // emit zero in there for now, until the postSet
+        }
         return getFunctionIndex(F);
       } else if (const BlockAddress *BA = dyn_cast<const BlockAddress>(V)) {
         return getBlockAddress(BA);
@@ -376,10 +402,18 @@ namespace {
             // All postsets are of external values, so they are pointers, hence 32-bit
             std::string Name = getOpName(V);
             Externals.insert(Name);
-            PostSets += "HEAP32[" + utostr(AbsoluteTarget>>2) + "] = " + Name + ';';
+            if (Relocatable) Name = "g$" + Name + "() | 0"; // we access linked externs through calls
+            PostSets += "\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + Name + ';';
+            return 0; // emit zero in there for now, until the postSet
+          } else if (Relocatable) {
+            // this is one of our globals, but we must relocate it. we return zero, but the caller may store
+            // an added offset, which we read at postSet time; in other words, we just add to that offset
+            std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
+            PostSets += "\n " + access + " = (" + access + " | 0) + " + relocateGlobal(utostr(getGlobalAddress(V->getName().str()))) + ';';
             return 0; // emit zero in there for now, until the postSet
           }
         }
+        assert(!Relocatable);
         return getGlobalAddress(V->getName().str());
       }
     }
@@ -405,8 +439,13 @@ namespace {
         // replace double quotes with escaped single quotes
         curr = 0;
         while ((curr = code.find('"', curr)) != std::string::npos) {
-          code = code.replace(curr, 1, "\\" "\"");
-          curr += 2; // skip this one
+          if (curr == 0 || code[curr-1] != '\\') {
+            code = code.replace(curr, 1, "\\" "\"");
+            curr += 2; // skip this one
+          } else { // already escaped, escape the slash as well
+            code = code.replace(curr, 1, "\\" "\\" "\"");
+            curr += 3; // skip this one
+          }
         }
       }
       if (AsmConsts.count(code) > 0) return AsmConsts[code];
@@ -1046,8 +1085,10 @@ std::string JSWriter::getPtrUse(const Value* Ptr) {
   Type *t = cast<PointerType>(Ptr->getType())->getElementType();
   unsigned Bytes = DL->getTypeAllocSize(t);
   if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr)) {
-    std::string text = "";
     unsigned Addr = getGlobalAddress(GV->getName().str());
+    if (Relocatable) {
+      return getHeapAccess(relocateGlobal(utostr(Addr)), Bytes, t->isIntegerTy() || t->isPointerTy());
+    }
     switch (Bytes) {
     default: llvm_unreachable("Unsupported type");
     case 8: return "HEAPF64[" + utostr(Addr >> 3) + "]";
@@ -1062,22 +1103,26 @@ std::string JSWriter::getPtrUse(const Value* Ptr) {
     case 2: return "HEAP16[" + utostr(Addr >> 1) + "]";
     case 1: return "HEAP8[" + utostr(Addr) + "]";
     }
-  } else {
-    return getHeapAccess(getValueAsStr(Ptr), Bytes, t->isIntegerTy() || t->isPointerTy());
   }
+  return getHeapAccess(getValueAsStr(Ptr), Bytes, t->isIntegerTy() || t->isPointerTy());
 }
 
 std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
   if (isa<ConstantPointerNull>(CV)) return "0";
 
   if (const Function *F = dyn_cast<Function>(CV)) {
-    return utostr(getFunctionIndex(F));
+    return relocateFunctionPointer(utostr(getFunctionIndex(F)));
   }
 
   if (const GlobalValue *GV = dyn_cast<GlobalValue>(CV)) {
     if (GV->isDeclaration()) {
       std::string Name = getOpName(GV);
       Externals.insert(Name);
+      if (Relocatable) {
+        // we access linked externs through calls, which we load at the beginning of basic blocks
+        BlockRelocatableExterns.insert(Name);
+        Name = "t$" + Name;
+      }
       return Name;
     }
     if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(CV)) {
@@ -1085,7 +1130,7 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
       // to worry about weak or other kinds of aliases.
       return getConstant(GA->getAliasee(), sign);
     }
-    return utostr(getGlobalAddress(GV->getName().str()));
+    return relocateGlobal(utostr(getGlobalAddress(GV->getName().str())));
   }
 
   if (const ConstantFP *CFP = dyn_cast<ConstantFP>(CV)) {
@@ -2268,6 +2313,18 @@ void JSWriter::addBlock(const BasicBlock *BB, Relooper& R, LLVMToRelooperMap& LL
     }
   }
   CodeStream.flush();
+  if (Relocatable) {
+    // add code to load externals once at the beginning
+    if (BlockRelocatableExterns.size() > 0) {
+      for (auto& RE : BlockRelocatableExterns) {
+        std::string Temp = "t$" + RE;
+        std::string Call = "g$" + RE;
+        UsedVars[Temp] = Type::getInt32Ty(BB->getContext());
+        Code = Temp + " = " + Call + "() | 0; " + Code;
+      }
+      BlockRelocatableExterns.clear();
+    }
+  }
   const Value* Condition = considerConditionVar(BB->getTerminator());
   Block *Curr = new Block(Code.c_str(), Condition ? getValueAsCastStr(Condition).c_str() : NULL);
   LLVMToRelooper[BB] = Curr;
@@ -2466,6 +2523,12 @@ void JSWriter::printFunctionBody(const Function *F) {
       Out << " return " << getParenCast(getConstant(UndefValue::get(RT)), RT, ASM_NONSPECIFIC) << ";\n";
     }
   }
+
+  if (Relocatable) {
+    if (!F->hasInternalLinkage()) {
+      Exports.push_back(getJSName(F));
+    }
+  }
 }
 
 static std::string tmp[] = {
@@ -2514,6 +2577,20 @@ void JSWriter::processConstants() {
          E = TheModule->global_end(); I != E; ++I) {
     if (I->hasInitializer() && !isObjCMetaVar(I->getSection())) {
       parseConstant(I->getName().str(), I->getInitializer(), false);
+    }
+  }
+  if (Relocatable) {
+    for (Module::const_global_iterator I = TheModule->global_begin(),
+           E = TheModule->global_end(); I != E; ++I) {
+      if (I->hasInitializer() && !I->hasInternalLinkage()) {
+        std::string Name = I->getName().str();
+        if (GlobalAddresses.find(Name) != GlobalAddresses.end()) {
+          std::string JSName = getJSName(I).substr(1);
+          if (Name == JSName) { // don't export things that have weird internal names, that C can't dlsym anyhow
+            NamedGlobals[Name] = getGlobalAddress(Name);
+          }
+        }
+      }
     }
   }
   for (std::vector<std::string>::iterator i = objcSections.begin(), e = objcSections.end(); i != e; ++i) {
@@ -2641,6 +2718,16 @@ void JSWriter::printAddressList(AddressList &addressList) {
 void JSWriter::printModuleBody() {
   processConstants();
 
+  if (Relocatable) {
+    for (Module::const_alias_iterator I = TheModule->alias_begin(), E = TheModule->alias_end();
+         I != E; ++I) {
+      if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(I)) {
+        const Value* Target = resolveFully(GA);
+        Aliases[getJSName(GA)] = getJSName(Target);
+      }
+    }
+  }
+
   // Emit function bodies.
   nl(Out) << "// EMSCRIPTEN_START_FUNCTIONS"; nl(Out);
   for (Module::const_iterator I = TheModule->begin(), E = TheModule->end();
@@ -2648,7 +2735,7 @@ void JSWriter::printModuleBody() {
     if (!I->isDeclaration()) printFunction(I);
   }
   Out << "function runPostSets() {\n";
-  Out << " " << PostSets << "\n";
+  Out << PostSets << "\n";
   Out << "}\n";
   PostSets = "";
   Out << "// EMSCRIPTEN_END_FUNCTIONS\n\n";
@@ -2815,6 +2902,19 @@ void JSWriter::printModuleBody() {
   }
   Out << "],";
 
+  Out << "\"aliases\": {";
+  first = true;
+  for (StringMap::const_iterator I = Aliases.begin(), E = Aliases.end();
+       I != E; ++I) {
+    if (first) {
+      first = false;
+    } else {
+      Out << ", ";
+    }
+    Out << "\"" << I->first << "\": \"" << I->second << "\"";
+  }
+  Out << "},";
+
   Out << "\"cantValidate\": \"" << CantValidate << "\",";
 
   Out << "\"simd\": ";
@@ -2844,6 +2944,19 @@ void JSWriter::printModuleBody() {
     Out << "\"" << utostr(I->second) << "\": \"" << I->first.c_str() << "\"";
   }
   Out << "},";
+
+  Out << "\"asmConstArities\": [";
+  first = true;
+  for (IntSet::const_iterator I = AsmConstArities.begin(), E = AsmConstArities.end();
+       I != E; ++I) {
+    if (first) {
+      first = false;
+    } else {
+      Out << ", ";
+    }
+    Out << utostr(*I);
+  }
+  Out << "],";
 
   Out << "\"objc\": {";
   first = true;
@@ -2945,7 +3058,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
             if (const ConstantExpr *CE = dyn_cast<ConstantExpr>(C)) {
               C = CE->getOperand(0); // ignore bitcasts
             }
-            Exports.push_back(getJSName(C));
+            if (isa<Function>(C)) Exports.push_back(getJSName(C));
           }
         } else if ((*UI)->getName() == "llvm.global.annotations") {
           // llvm.global.annotations can be ignored.
@@ -3148,6 +3261,10 @@ void JSWriter::printModule(const std::string& fname,
 bool JSWriter::runOnModule(Module &M) {
   TheModule = &M;
   DL = &getAnalysis<DataLayoutPass>().getDataLayout();
+
+  // sanity checks on options
+  assert(Relocatable ? GlobalBase == 0 : true);
+  assert(Relocatable ? EmulatedFunctionPointers : true);
 
   setupCallHandlers();
 
