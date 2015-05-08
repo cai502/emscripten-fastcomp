@@ -3062,6 +3062,8 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
           }
         } else if ((*UI)->getName() == "llvm.global.annotations") {
           // llvm.global.annotations can be ignored.
+        } else if ((*UI)->getName() == "llvm.compiler.used") {
+          // can be ignored
         } else {
           llvm_unreachable("Unexpected constant array");
         }
