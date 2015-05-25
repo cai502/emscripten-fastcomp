@@ -166,7 +166,7 @@ namespace {
     BlockAddressMap BlockAddresses;
     NameIntMap AsmConsts;
     IntSet AsmConstArities;
-    NameSet BlockRelocatableExterns; // which externals are accessed in this block; we load them once at the beginning (avoids a potential call in a heap access, and might be faster)
+    NameSet FuncRelocatableExterns; // which externals are accessed in this function; we load them once at the beginning (avoids a potential call in a heap access, and might be faster)
     AddressList objcSelectorRefs;
     AddressList objcMessageRefs;
     AddressList objcClassRefs;
@@ -402,8 +402,12 @@ namespace {
             // All postsets are of external values, so they are pointers, hence 32-bit
             std::string Name = getOpName(V);
             Externals.insert(Name);
-            if (Relocatable) Name = "g$" + Name + "() | 0"; // we access linked externs through calls
-            PostSets += "\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + Name + ';';
+            if (Relocatable) {
+              PostSets += "\n temp = g$" + Name + "() | 0;"; // we access linked externs through calls, and must do so to a temp for heap growth validation
+              PostSets += "\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = temp;";
+            } else {
+              PostSets += "\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + Name + ';';
+            }
             return 0; // emit zero in there for now, until the postSet
           } else if (Relocatable) {
             // this is one of our globals, but we must relocate it. we return zero, but the caller may store
@@ -657,7 +661,8 @@ static void emitDebugInfo(raw_ostream& Code, const Instruction *I) {
     DILocation Loc(N);
     unsigned Line = Loc.getLineNumber();
     StringRef File = Loc.getFilename();
-    Code << " //@line " << utostr(Line) << " \"" << (File.size() > 0 ? File.str() : "?") << "\"";
+    if (Line > 0)
+      Code << " //@line " << utostr(Line) << " \"" << (File.size() > 0 ? File.str() : "?") << "\"";
   }
 }
 
@@ -1120,15 +1125,16 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
       Externals.insert(Name);
       if (Relocatable) {
         // we access linked externs through calls, which we load at the beginning of basic blocks
-        BlockRelocatableExterns.insert(Name);
+        FuncRelocatableExterns.insert(Name);
         Name = "t$" + Name;
+        UsedVars[Name] = Type::getInt32Ty(CV->getContext());
       }
       return Name;
     }
     if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(CV)) {
       // Since we don't currently support linking of our output, we don't need
       // to worry about weak or other kinds of aliases.
-      return getConstant(GA->getAliasee(), sign);
+      return getConstant(GA->getAliasee()->stripPointerCasts(), sign);
     }
     return relocateGlobal(utostr(getGlobalAddress(GV->getName().str())));
   }
@@ -1852,6 +1858,18 @@ static uint64_t LSBMask(unsigned numBits) {
   return numBits >= 64 ? 0xFFFFFFFFFFFFFFFFULL : (1ULL << numBits) - 1;
 }
 
+// Given a string which contains a printed base address, print a new string
+// which contains that address plus the given offset.
+static std::string AddOffset(const std::string &base, int32_t Offset) {
+  if (base.empty())
+    return itostr(Offset);
+
+  if (Offset == 0)
+    return base;
+
+  return "((" + base + ") + " + itostr(Offset) + "|0)";
+}
+
 // Generate code for and operator, either an Instruction or a ConstantExpr.
 void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
   // To avoid emiting code and variables for the no-op pointer bitcasts
@@ -2134,7 +2152,16 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
     const GEPOperator *GEP = cast<GEPOperator>(I);
     gep_type_iterator GTI = gep_type_begin(GEP);
     int32_t ConstantOffset = 0;
-    std::string text = getValueAsParenStr(GEP->getPointerOperand());
+    std::string text;
+
+    // If the base is an initialized global variable, the address is just an
+    // integer constant, so we can fold it into the ConstantOffset directly.
+    const Value *Ptr = GEP->getPointerOperand()->stripPointerCasts();
+    if (isa<GlobalVariable>(Ptr) && cast<GlobalVariable>(Ptr)->hasInitializer() && !Relocatable) {
+      ConstantOffset = getGlobalAddress(Ptr->getName().str());
+    } else {
+      text = getValueAsParenStr(Ptr);
+    }
 
     GetElementPtrInst::const_op_iterator I = GEP->op_begin();
     I++;
@@ -2150,16 +2177,22 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
         // For an array, add the element offset, explicitly scaled.
         uint32_t ElementSize = DL->getTypeAllocSize(*GTI);
         if (const ConstantInt *CI = dyn_cast<ConstantInt>(Index)) {
+          // The index is constant. Add it to the accumulating offset.
           ConstantOffset = (uint32_t)ConstantOffset + (uint32_t)CI->getSExtValue() * ElementSize;
         } else {
-          text = "(" + text + " + (" + getIMul(Index, ConstantInt::get(Type::getInt32Ty(GEP->getContext()), ElementSize)) + ")|0)";
+          // The index is non-constant. To avoid reassociating, which increases
+          // the risk of slow wraparounds, add the accumulated offset first.
+          text = AddOffset(text, ConstantOffset);
+          ConstantOffset = 0;
+
+          // Now add the scaled dynamic index.
+          std::string Mul = getIMul(Index, ConstantInt::get(Type::getInt32Ty(GEP->getContext()), ElementSize));
+          text = text.empty() ? Mul : ("(" + text + " + (" + Mul + ")|0)");
         }
       }
     }
-    if (ConstantOffset != 0) {
-      text = "(" + text + " + " + itostr(ConstantOffset) + "|0)";
-    }
-    Code << text;
+    // Add in the final accumulated offset.
+    Code << AddOffset(text, ConstantOffset);
     break;
   }
   case Instruction::PHI: {
@@ -2313,18 +2346,6 @@ void JSWriter::addBlock(const BasicBlock *BB, Relooper& R, LLVMToRelooperMap& LL
     }
   }
   CodeStream.flush();
-  if (Relocatable) {
-    // add code to load externals once at the beginning
-    if (BlockRelocatableExterns.size() > 0) {
-      for (auto& RE : BlockRelocatableExterns) {
-        std::string Temp = "t$" + RE;
-        std::string Call = "g$" + RE;
-        UsedVars[Temp] = Type::getInt32Ty(BB->getContext());
-        Code = Temp + " = " + Call + "() | 0; " + Code;
-      }
-      BlockRelocatableExterns.clear();
-    }
-  }
   const Value* Condition = considerConditionVar(BB->getTerminator());
   Block *Curr = new Block(Code.c_str(), Condition ? getValueAsCastStr(Condition).c_str() : NULL);
   LLVMToRelooper[BB] = Curr;
@@ -2507,6 +2528,18 @@ void JSWriter::printFunctionBody(const Function *F) {
     }
     Out << "\n ";
     Out << getStackBump(FrameSize);
+  }
+
+  // Emit extern loads, if we have any
+  if (Relocatable) {
+    if (FuncRelocatableExterns.size() > 0) {
+      for (auto& RE : FuncRelocatableExterns) {
+        std::string Temp = "t$" + RE;
+        std::string Call = "g$" + RE;
+        Out << Temp + " = " + Call + "() | 0;\n";
+      }
+      FuncRelocatableExterns.clear();
+    }
   }
 
   // Emit (relooped) code
@@ -2735,6 +2768,7 @@ void JSWriter::printModuleBody() {
     if (!I->isDeclaration()) printFunction(I);
   }
   Out << "function runPostSets() {\n";
+  if (Relocatable) Out << " var temp = 0;\n"; // need a temp var for relocation calls, for proper validation in heap growth
   Out << PostSets << "\n";
   Out << "}\n";
   PostSets = "";
@@ -3318,6 +3352,8 @@ bool JSTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
   // also SROA).
   if (OptLevel == CodeGenOpt::None)
     PM.add(createEmscriptenSimplifyAllocasPass());
+
+  PM.add(createEmscriptenRemoveLLVMAssumePass());
 
   PM.add(new JSWriter(o, OptLevel));
 
