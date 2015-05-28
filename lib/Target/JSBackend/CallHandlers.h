@@ -168,9 +168,12 @@ DEF_CALL_HANDLER(__default__, {
     // does not return a value
     getAssignIfNeeded(CI); // ensure the variable is defined, but do not emit it here
                            // it should have 0 uses, but just to be safe
-  } else if (!ActualRT->isVoidTy()) {
-    unsigned FFI_IN = FFI ? ASM_FFI_IN : 0;
-    text = getAssignIfNeeded(CI) + "(" + getCast(text, ActualRT, ASM_NONSPECIFIC | FFI_IN) + ")";
+  } else {
+    Type *RT = ObjcMsgSendFuncs ? InstRT : ActualRT;
+    if (!RT->isVoidTy()) {
+      unsigned FFI_IN = FFI ? ASM_FFI_IN : 0;
+      text = getAssignIfNeeded(CI) + "(" + getCast(text, RT, ASM_NONSPECIFIC | FFI_IN) + ")";
+    }
   }
   return text;
 })
