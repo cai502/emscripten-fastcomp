@@ -105,7 +105,7 @@ DEF_CALL_HANDLER(__default__, {
       if (EmscriptenAssertions) prettyWarning() << "unexpected number of arguments " << utostr(NumArgs) << " in call to '" << F->getName() << "', should be " << utostr(TypeNumArgs) << "\n";
       if (NumArgs > TypeNumArgs) NumArgs = TypeNumArgs; // lop off the extra params that will not be used and just break validation
     }
-    if (EmscriptenAssertions) {
+    if (EmscriptenAssertions && !ObjcMsgSendFuncs) {
       for (int i = 0; i < std::min(TypeNumArgs, NumArgs); i++) {
         Type *TypeType = FT->getParamType(i);
         Type *ActualType = CI->getOperand(i)->getType();
@@ -115,7 +115,7 @@ DEF_CALL_HANDLER(__default__, {
       }
     }
   }
-  if (EmscriptenAssertions) {
+  if (EmscriptenAssertions && !ObjcMsgSendFuncs) {
     Type *TypeType = FT->getReturnType();
     Type *ActualType = CI->getType();
     if (getFunctionSignatureLetter(TypeType) != getFunctionSignatureLetter(ActualType)) {
