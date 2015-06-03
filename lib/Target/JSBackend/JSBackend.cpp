@@ -32,11 +32,10 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Pass.h"
-#include "llvm/PassManager.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/FormattedStream.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/TargetRegistry.h"
@@ -67,6 +66,11 @@ raw_ostream &prettyWarning() {
 static cl::opt<bool>
 PreciseF32("emscripten-precise-f32",
            cl::desc("Enables Math.fround usage to implement precise float32 semantics and performance (see emscripten PRECISE_F32 option)"),
+           cl::init(false));
+
+static cl::opt<bool>
+EnablePthreads("emscripten-enable-pthreads",
+           cl::desc("Enables compilation targeting JavaScript Shared Array Buffer and Atomics API to implement support for pthreads-based multithreading"),
            cl::init(false));
 
 static cl::opt<bool>
@@ -141,7 +145,7 @@ namespace {
   /// JSWriter - This class is the main chunk of code that converts an LLVM
   /// module to JavaScript.
   class JSWriter : public ModulePass {
-    formatted_raw_ostream &Out;
+    raw_pwrite_stream &Out;
     const Module *TheModule;
     unsigned UniqueNum;
     unsigned NextFunctionIndex; // used with NoAliasingFunctionPointers
@@ -182,14 +186,14 @@ namespace {
     bool UsesSIMD;
     int InvokeState; // cycles between 0, 1 after preInvoke, 2 after call, 0 again after postInvoke. hackish, no argument there.
     CodeGenOpt::Level OptLevel;
-    const DataLayout *DL;
+   const DataLayout *DL;
     bool StackBumped;
 
     #include "CallHandlers.h"
 
   public:
     static char ID;
-    JSWriter(formatted_raw_ostream &o, CodeGenOpt::Level OptLevel)
+    JSWriter(raw_pwrite_stream &o, CodeGenOpt::Level OptLevel)
       : ModulePass(ID), Out(o), UniqueNum(0), NextFunctionIndex(0), CantValidate(""), UsesSIMD(false), InvokeState(0),
         OptLevel(OptLevel), StackBumped(false) {}
 
@@ -199,7 +203,6 @@ namespace {
 
     void getAnalysisUsage(AnalysisUsage &AU) const override {
       AU.setPreservesAll();
-      AU.addRequired<DataLayoutPass>();
       ModulePass::getAnalysisUsage(AU);
     }
 
@@ -210,7 +213,7 @@ namespace {
 
     LLVM_ATTRIBUTE_NORETURN void error(const std::string& msg);
 
-    formatted_raw_ostream& nl(formatted_raw_ostream &Out, int delta = 0);
+    raw_pwrite_stream& nl(raw_pwrite_stream &Out, int delta = 0);
 
   private:
     void printCommaSeparated(const HeapData v);
@@ -327,8 +330,11 @@ namespace {
       if (NoAliasingFunctionPointers) {
         while (Table.size() < NextFunctionIndex) Table.push_back("0");
       }
-      unsigned Alignment = F->getAlignment() || 1; // XXX this is wrong, it's always 1. but, that's fine in the ARM-like ABI we have which allows unaligned functions.
-                                                   //     the one risk is if someone forces a function to be aligned, and relies on that.
+      // XXX this is wrong, it's always 1. but, that's fine in the ARM-like ABI
+      // we have which allows unaligned func the one risk is if someone forces a
+      // function to be aligned, and relies on that. Could do F->getAlignment()
+      // instead.
+      unsigned Alignment = 1;
       while (Table.size() % Alignment) Table.push_back("0");
       unsigned Index = Table.size();
       Table.push_back(Name);
@@ -404,7 +410,9 @@ namespace {
             Externals.insert(Name);
             if (Relocatable) {
               PostSets += "\n temp = g$" + Name + "() | 0;"; // we access linked externs through calls, and must do so to a temp for heap growth validation
-              PostSets += "\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = temp;";
+              // see later down about adding to an offset
+              std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
+              PostSets += "\n " + access + " = (" + access + " | 0) + temp;";
             } else {
               PostSets += "\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + Name + ';';
             }
@@ -510,8 +518,30 @@ namespace {
     }
 
     std::string getPtrLoad(const Value* Ptr);
-    std::string getHeapAccess(const std::string& Name, unsigned Bytes, bool Integer=true);
+
+    /// Given a pointer to memory, returns the HEAP object and index to that object that is used to access that memory.
+    /// @param Ptr [in] The heap object.
+    /// @param HeapName [out] Receives the name of the HEAP object used to perform the memory acess.
+    /// @return The index to the heap HeapName for the memory access.
+    std::string getHeapNameAndIndex(const Value *Ptr, const char **HeapName);
+
+    // Like getHeapNameAndIndex(), but uses the given memory operation size instead of the one from Ptr.
+    std::string getHeapNameAndIndex(const Value *Ptr, const char **HeapName, unsigned Bytes);
+
+    /// Like getHeapNameAndIndex(), but for global variables only.
+    std::string getHeapNameAndIndexToGlobal(const GlobalVariable *GV, const char **HeapName);
+
+    /// Like getHeapNameAndIndex(), but for pointers represented in string expression form.
+    static std::string getHeapNameAndIndexToPtr(const std::string& Ptr, unsigned Bytes, bool Integer, const char **HeapName);
+
+    std::string getShiftedPtr(const Value *Ptr, unsigned Bytes);
+
+    /// Returns a string expression for accessing the given memory address.
     std::string getPtrUse(const Value* Ptr);
+
+    /// Like getPtrUse(), but for pointers represented in string expression form.
+    static std::string getHeapAccess(const std::string& Name, unsigned Bytes, bool Integer=true);
+
     std::string getConstant(const Constant*, AsmCast sign=ASM_SIGNED);
     std::string getConstantVector(Type *ElementType, std::string x, std::string y, std::string z, std::string w);
     std::string getValueAsStr(const Value*, AsmCast sign=ASM_SIGNED);
@@ -572,7 +602,7 @@ namespace {
   };
 } // end anonymous namespace.
 
-formatted_raw_ostream &JSWriter::nl(formatted_raw_ostream &Out, int delta) {
+raw_pwrite_stream &JSWriter::nl(raw_pwrite_stream &Out, int delta) {
   Out << '\n';
   return Out;
 }
@@ -657,12 +687,15 @@ static inline std::string ensureFloat(const std::string &S, Type *T) {
 }
 
 static void emitDebugInfo(raw_ostream& Code, const Instruction *I) {
-  if (MDNode *N = I->getMetadata("dbg")) {
-    DILocation Loc(N);
-    unsigned Line = Loc.getLineNumber();
-    StringRef File = Loc.getFilename();
-    if (Line > 0)
-      Code << " //@line " << utostr(Line) << " \"" << (File.size() > 0 ? File.str() : "?") << "\"";
+  auto &Loc = I->getDebugLoc();
+  if (Loc) {
+    unsigned Line = Loc.getLine();
+    auto *Scope = cast_or_null<MDScope>(Loc.getScope());
+    if (Scope) {
+      StringRef File = Scope->getFilename();
+      if (Line > 0)
+        Code << " //@line " << utostr(Line) << " \"" << (File.size() > 0 ? File.str() : "?") << "\"";
+    }
   }
 }
 
@@ -856,18 +889,111 @@ std::string JSWriter::getIMul(const Value *V1, const Value *V2) {
   return "Math_imul(" + getValueAsStr(V1) + ", " + getValueAsStr(V2) + ")|0"; // unknown or too large, emit imul
 }
 
+static inline const char *getHeapName(int Bytes, int Integer)
+{
+  switch (Bytes) {
+    default: llvm_unreachable("Unsupported type");
+    case 8: return "HEAPF64";
+    case 4: return Integer ? "HEAP32" : "HEAPF32";
+    case 2: return "HEAP16";
+    case 1: return "HEAP8";
+  }
+}
+
+static inline int getHeapShift(int Bytes)
+{
+  switch (Bytes) {
+    default: llvm_unreachable("Unsupported type");
+    case 8: return 3;
+    case 4: return 2;
+    case 2: return 1;
+    case 1: return 0;
+  }
+}
+
+static inline const char *getHeapShiftStr(int Bytes)
+{
+  switch (Bytes) {
+    default: llvm_unreachable("Unsupported type");
+    case 8: return ">>3";
+    case 4: return ">>2";
+    case 2: return ">>1";
+    case 1: return ">>0";
+  }
+}
+
+std::string JSWriter::getHeapNameAndIndexToGlobal(const GlobalVariable *GV, const char **HeapName)
+{
+  Type *t = cast<PointerType>(GV->getType())->getElementType();
+  unsigned Bytes = DL->getTypeAllocSize(t);
+  unsigned Addr = getGlobalAddress(GV->getName().str());
+  *HeapName = getHeapName(Bytes, t->isIntegerTy() || t->isPointerTy());
+  return relocateGlobal(utostr(Addr >> getHeapShift(Bytes)));
+}
+
+std::string JSWriter::getHeapNameAndIndexToPtr(const std::string& Ptr, unsigned Bytes, bool Integer, const char **HeapName)
+{
+  *HeapName = getHeapName(Bytes, Integer);
+  return Ptr + getHeapShiftStr(Bytes);
+}
+
+std::string JSWriter::getHeapNameAndIndex(const Value *Ptr, const char **HeapName, unsigned Bytes)
+{
+  Type *t = cast<PointerType>(Ptr->getType())->getElementType();
+
+  if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr)) {
+    return getHeapNameAndIndexToGlobal(GV, HeapName);
+  } else {
+    return getHeapNameAndIndexToPtr(getValueAsStr(Ptr), Bytes, t->isIntegerTy() || t->isPointerTy(), HeapName);
+  }
+}
+
+std::string JSWriter::getHeapNameAndIndex(const Value *Ptr, const char **HeapName)
+{
+  Type *t = cast<PointerType>(Ptr->getType())->getElementType();
+  unsigned Bytes = DL->getTypeAllocSize(t);
+  return getHeapNameAndIndex(Ptr, HeapName, Bytes);
+}
+
+static const char *heapNameToAtomicTypeName(const char *HeapName)
+{
+  if (!strcmp(HeapName, "HEAPF32")) return "f32";
+  if (!strcmp(HeapName, "HEAPF64")) return "f64";
+  return "";
+}
+
 std::string JSWriter::getLoad(const Instruction *I, const Value *P, Type *T, unsigned Alignment, char sep) {
   std::string Assign = getAssign(I);
   unsigned Bytes = DL->getTypeAllocSize(T);
   std::string text;
   if (Bytes <= Alignment || Alignment == 0) {
-    text = Assign + getPtrLoad(P);
+    if (EnablePthreads && cast<LoadInst>(I)->isVolatile()) {
+      const char *HeapName;
+      std::string Index = getHeapNameAndIndex(P, &HeapName);
+      if (!strcmp(HeapName, "HEAPF32") || !strcmp(HeapName, "HEAPF64")) {
+        bool fround = PreciseF32 && !strcmp(HeapName, "HEAPF32");
+        // TODO: If https://bugzilla.mozilla.org/show_bug.cgi?id=1131613 and https://bugzilla.mozilla.org/show_bug.cgi?id=1131624 are
+        // implemented, we could remove the emulation, but until then we must emulate manually.
+        text = Assign + (fround ? "Math_fround(" : "+") + "_emscripten_atomic_load_" + heapNameToAtomicTypeName(HeapName) + "(" + getValueAsStr(P) + (fround ? "))" : ")");
+      } else {
+        text = Assign + "Atomics_load(" + HeapName + ',' + Index + ')';
+      }
+    } else {
+      text = Assign + getPtrLoad(P);
+    }
     if (isAbsolute(P)) {
       // loads from an absolute constants are either intentional segfaults (int x = *((int*)0)), or code problems
       text += "; abort() /* segfault, load from absolute addr */";
     }
   } else {
     // unaligned in some manner
+
+    if (EnablePthreads && cast<LoadInst>(I)->isVolatile()) {
+      errs() << "emcc: warning: unable to implement unaligned volatile load as atomic in " << I->getParent()->getParent()->getName() << ":" << *I << " | ";
+      emitDebugInfo(errs(), I);
+      errs() << "\n";
+    }
+
     if (WarnOnUnaligned) {
       errs() << "emcc: warning: unaligned load in  " << I->getParent()->getParent()->getName() << ":" << *I << " | ";
       emitDebugInfo(errs(), I);
@@ -959,10 +1085,33 @@ std::string JSWriter::getStore(const Instruction *I, const Value *P, Type *T, co
   unsigned Bytes = DL->getTypeAllocSize(T);
   std::string text;
   if (Bytes <= Alignment || Alignment == 0) {
-    text = getPtrUse(P) + " = " + VS;
+    if (EnablePthreads && cast<StoreInst>(I)->isVolatile()) {
+      const char *HeapName;
+      std::string Index = getHeapNameAndIndex(P, &HeapName);
+      if (!strcmp(HeapName, "HEAPF32") || !strcmp(HeapName, "HEAPF64")) {
+        // TODO: If https://bugzilla.mozilla.org/show_bug.cgi?id=1131613 and https://bugzilla.mozilla.org/show_bug.cgi?id=1131624 are
+        // implemented, we could remove the emulation, but until then we must emulate manually.
+        text = std::string("_emscripten_atomic_store_") + heapNameToAtomicTypeName(HeapName) + "(" + getValueAsStr(P) + ',' + VS + ')';
+        if (PreciseF32 && !strcmp(HeapName, "HEAPF32"))
+          text = "Math_fround(" + text + ")";
+        else
+          text = "+" + text;
+      } else {
+        text = std::string("Atomics_store(") + HeapName + ',' + Index + ',' + VS + ')';
+      }
+    } else {
+      text = getPtrUse(P) + " = " + VS;
+    }
     if (Alignment == 536870912) text += "; abort() /* segfault */";
   } else {
     // unaligned in some manner
+
+    if (EnablePthreads && cast<StoreInst>(I)->isVolatile()) {
+      errs() << "emcc: warning: unable to implement unaligned volatile store as atomic in " << I->getParent()->getParent()->getName() << ":" << *I << " | ";
+      emitDebugInfo(errs(), I);
+      errs() << "\n";
+    }
+
     if (WarnOnUnaligned) {
       errs() << "emcc: warning: unaligned store in " << I->getParent()->getParent()->getName() << ":" << *I << " | ";
       emitDebugInfo(errs(), I);
@@ -1071,45 +1220,20 @@ std::string JSWriter::getPtrLoad(const Value* Ptr) {
 }
 
 std::string JSWriter::getHeapAccess(const std::string& Name, unsigned Bytes, bool Integer) {
-  switch (Bytes) {
-  default: llvm_unreachable("Unsupported type");
-  case 8: return "HEAPF64[" + Name + ">>3]";
-  case 4: {
-    if (Integer) {
-      return "HEAP32[" + Name + ">>2]";
-    } else {
-      return "HEAPF32[" + Name + ">>2]";
-    }
-  }
-  case 2: return "HEAP16[" + Name + ">>1]";
-  case 1: return "HEAP8[" + Name + ">>0]";
-  }
+  const char *HeapName = 0;
+  std::string Index = getHeapNameAndIndexToPtr(Name, Bytes, Integer, &HeapName);
+  return std::string(HeapName) + '[' + Index + ']';
+}
+
+std::string JSWriter::getShiftedPtr(const Value *Ptr, unsigned Bytes) {
+  const char *HeapName = 0; // unused
+  return getHeapNameAndIndex(Ptr, &HeapName, Bytes);
 }
 
 std::string JSWriter::getPtrUse(const Value* Ptr) {
-  Type *t = cast<PointerType>(Ptr->getType())->getElementType();
-  unsigned Bytes = DL->getTypeAllocSize(t);
-  if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr)) {
-    unsigned Addr = getGlobalAddress(GV->getName().str());
-    if (Relocatable) {
-      return getHeapAccess(relocateGlobal(utostr(Addr)), Bytes, t->isIntegerTy() || t->isPointerTy());
-    }
-    switch (Bytes) {
-    default: llvm_unreachable("Unsupported type");
-    case 8: return "HEAPF64[" + utostr(Addr >> 3) + "]";
-    case 4: {
-      if (t->isIntegerTy() || t->isPointerTy()) {
-        return "HEAP32[" + utostr(Addr >> 2) + "]";
-      } else {
-        assert(t->isFloatingPointTy());
-        return "HEAPF32[" + utostr(Addr >> 2) + "]";
-      }
-    }
-    case 2: return "HEAP16[" + utostr(Addr >> 1) + "]";
-    case 1: return "HEAP8[" + utostr(Addr) + "]";
-    }
-  }
-  return getHeapAccess(getValueAsStr(Ptr), Bytes, t->isIntegerTy() || t->isPointerTy());
+  const char *HeapName = 0;
+  std::string Index = getHeapNameAndIndex(Ptr, &HeapName);
+  return std::string(HeapName) + '[' + Index + ']';
 }
 
 std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
@@ -1887,7 +2011,7 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
   if (!generateSIMDExpression(I, Code)) switch (Operator::getOpcode(I)) {
   default: {
     I->dump();
-    error("Invalid instruction");
+    error("Invalid instruction in JSWriter::generateExpression");
     break;
   }
   case Instruction::Ret: {
@@ -2286,26 +2410,67 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
     const Value *P = rmwi->getOperand(0);
     const Value *V = rmwi->getOperand(1);
     std::string VS = getValueAsStr(V);
-    Code << getLoad(rmwi, P, I->getType(), 0) << ';';
-    // Most bitcasts are no-ops for us. However, the exception is int to float and float to int
-    switch (rmwi->getOperation()) {
-      case AtomicRMWInst::Xchg: Code << getStore(rmwi, P, I->getType(), VS, 0); break;
-      case AtomicRMWInst::Add:  Code << getStore(rmwi, P, I->getType(), "((" + getJSName(I) + '+' + VS + ")|0)", 0); break;
-      case AtomicRMWInst::Sub:  Code << getStore(rmwi, P, I->getType(), "((" + getJSName(I) + '-' + VS + ")|0)", 0); break;
-      case AtomicRMWInst::And:  Code << getStore(rmwi, P, I->getType(), "(" + getJSName(I) + '&' + VS + ")", 0); break;
-      case AtomicRMWInst::Nand: Code << getStore(rmwi, P, I->getType(), "(~(" + getJSName(I) + '&' + VS + "))", 0); break;
-      case AtomicRMWInst::Or:   Code << getStore(rmwi, P, I->getType(), "(" + getJSName(I) + '|' + VS + ")", 0); break;
-      case AtomicRMWInst::Xor:  Code << getStore(rmwi, P, I->getType(), "(" + getJSName(I) + '^' + VS + ")", 0); break;
-      case AtomicRMWInst::Max:
-      case AtomicRMWInst::Min:
-      case AtomicRMWInst::UMax:
-      case AtomicRMWInst::UMin:
-      case AtomicRMWInst::BAD_BINOP: llvm_unreachable("Bad atomic operation");
+
+    if (EnablePthreads) {
+      std::string Assign = getAssign(rmwi);
+      unsigned Bytes = DL->getTypeAllocSize(T);
+      std::string text;
+      const char *HeapName;
+      std::string Index = getHeapNameAndIndex(P, &HeapName);
+      const char *atomicFunc = 0;
+      switch (rmwi->getOperation()) {
+        case AtomicRMWInst::Xchg: atomicFunc = "exchange"; break;
+        case AtomicRMWInst::Add:  atomicFunc = "add"; break;
+        case AtomicRMWInst::Sub:  atomicFunc = "sub"; break;
+        case AtomicRMWInst::And:  atomicFunc = "and"; break;
+        case AtomicRMWInst::Or:   atomicFunc = "or"; break;
+        case AtomicRMWInst::Xor:  atomicFunc = "xor"; break;
+        case AtomicRMWInst::Nand: // TODO
+        case AtomicRMWInst::Max:
+        case AtomicRMWInst::Min:
+        case AtomicRMWInst::UMax:
+        case AtomicRMWInst::UMin:
+        case AtomicRMWInst::BAD_BINOP: llvm_unreachable("Bad atomic operation");
+      }
+      if (!strcmp(HeapName, "HEAPF32") || !strcmp(HeapName, "HEAPF64")) {
+        // TODO: If https://bugzilla.mozilla.org/show_bug.cgi?id=1131613 and https://bugzilla.mozilla.org/show_bug.cgi?id=1131624 are
+        // implemented, we could remove the emulation, but until then we must emulate manually.
+        bool fround = PreciseF32 && !strcmp(HeapName, "HEAPF32");
+        Code << Assign << (fround ? "Math_fround(" : "+") << "_emscripten_atomic_" << atomicFunc << "_" << heapNameToAtomicTypeName(HeapName) << "(" << getValueAsStr(P) << ", " << VS << (fround ? "))" : ")"); break;
+
+      // TODO: Remove the following two lines once https://bugzilla.mozilla.org/show_bug.cgi?id=1141986 is implemented!
+      } else if (rmwi->getOperation() == AtomicRMWInst::Xchg && !strcmp(HeapName, "HEAP32")) {
+        Code << Assign << "_emscripten_atomic_exchange_u32(" << getValueAsStr(P) << ", " << VS << ")|0"; break;
+
+      } else {
+        Code << Assign << "Atomics_" << atomicFunc << "(" << HeapName << ", " << Index << ", " << VS << ")"; break;
+      }
+    } else {
+      Code << getLoad(rmwi, P, I->getType(), 0) << ';';
+      // Most bitcasts are no-ops for us. However, the exception is int to float and float to int
+      switch (rmwi->getOperation()) {
+        case AtomicRMWInst::Xchg: Code << getStore(rmwi, P, I->getType(), VS, 0); break;
+        case AtomicRMWInst::Add:  Code << getStore(rmwi, P, I->getType(), "((" + getJSName(I) + '+' + VS + ")|0)", 0); break;
+        case AtomicRMWInst::Sub:  Code << getStore(rmwi, P, I->getType(), "((" + getJSName(I) + '-' + VS + ")|0)", 0); break;
+        case AtomicRMWInst::And:  Code << getStore(rmwi, P, I->getType(), "(" + getJSName(I) + '&' + VS + ")", 0); break;
+        case AtomicRMWInst::Nand: Code << getStore(rmwi, P, I->getType(), "(~(" + getJSName(I) + '&' + VS + "))", 0); break;
+        case AtomicRMWInst::Or:   Code << getStore(rmwi, P, I->getType(), "(" + getJSName(I) + '|' + VS + ")", 0); break;
+        case AtomicRMWInst::Xor:  Code << getStore(rmwi, P, I->getType(), "(" + getJSName(I) + '^' + VS + ")", 0); break;
+        case AtomicRMWInst::Max:
+        case AtomicRMWInst::Min:
+        case AtomicRMWInst::UMax:
+        case AtomicRMWInst::UMin:
+        case AtomicRMWInst::BAD_BINOP: llvm_unreachable("Bad atomic operation");
+      }
     }
     break;
   }
-  case Instruction::Fence: // no threads, so nothing to do here
-    Code << "/* fence */";
+  case Instruction::Fence:
+    if (EnablePthreads) {
+      Code << "Atomics_fence()";
+    } else {
+      Code << "/* fence */"; // no threads, so nothing to do here
+    }
     break;
   }
 
@@ -2776,8 +2941,11 @@ void JSWriter::printModuleBody() {
 
   assert(GlobalData64.size() == 0 && GlobalData8.size() == 0); // FIXME when we use optimal constant alignments
 
-  // TODO fix commas
+  if (EnablePthreads) {
+    Out << "if (!ENVIRONMENT_IS_PTHREAD) {\n";
+  }
   Out << "/* memory initializer */ allocate([";
+  // TODO fix commas
   printCommaSeparated(GlobalData64);
   if (GlobalData64.size() > 0 && GlobalData32.size() + GlobalData8.size() > 0) {
     Out << ",";
@@ -2787,7 +2955,10 @@ void JSWriter::printModuleBody() {
     Out << ",";
   }
   printCommaSeparated(GlobalData8);
-  Out << "], \"i8\", ALLOC_NONE, Runtime.GLOBAL_BASE);";
+  Out << "], \"i8\", ALLOC_NONE, Runtime.GLOBAL_BASE);\n";
+  if (EnablePthreads) {
+    Out << "}\n";
+  }
 
   // Emit metadata for emcc driver
   Out << "\n\n// EMSCRIPTEN_METADATA\n";
@@ -3214,7 +3385,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
 
         // Deconstruct getelementptrs.
         int64_t BaseOffset;
-        V = GetPointerBaseWithConstantOffset(V, BaseOffset, DL);
+        V = GetPointerBaseWithConstantOffset(V, BaseOffset, *DL);
         Data += (uint64_t)BaseOffset;
 
         Data += getConstAsOffset(V, getGlobalAddress(name));
@@ -3296,7 +3467,7 @@ void JSWriter::printModule(const std::string& fname,
 
 bool JSWriter::runOnModule(Module &M) {
   TheModule = &M;
-  DL = &getAnalysis<DataLayoutPass>().getDataLayout();
+  DL = &M.getDataLayout();
 
   // sanity checks on options
   assert(Relocatable ? GlobalBase == 0 : true);
@@ -3334,7 +3505,7 @@ Pass *createCheckTriplePass() {
 //===----------------------------------------------------------------------===//
 
 bool JSTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
-                                          formatted_raw_ostream &o,
+                                          raw_pwrite_stream &o,
                                           CodeGenFileType FileType,
                                           bool DisableVerify,
                                           AnalysisID StartAfter,

@@ -38,7 +38,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Pass.h"
-#include "llvm/Target/TargetLibraryInfo.h"
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Transforms/NaCl.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include <map>
@@ -104,6 +104,8 @@ namespace {
 
     Function *Add, *Sub, *Mul, *SDiv, *UDiv, *SRem, *URem, *LShr, *AShr, *Shl, *GetHigh, *SetHigh, *FtoILow, *FtoIHigh, *DtoILow, *DtoIHigh, *SItoF, *UItoF, *SItoD, *UItoD, *BItoD, *BDtoILow, *BDtoIHigh;
 
+    Function *AtomicAdd, *AtomicSub, *AtomicAnd, *AtomicOr, *AtomicXor;
+
     void ensureFuncs();
     unsigned getNumChunks(Type *T);
 
@@ -112,11 +114,10 @@ namespace {
     ExpandI64() : ModulePass(ID) {
       initializeExpandI64Pass(*PassRegistry::getPassRegistry());
 
-      Add = Sub = Mul = SDiv = UDiv = SRem = URem = LShr = AShr = Shl = GetHigh = SetHigh = NULL;
+      Add = Sub = Mul = SDiv = UDiv = SRem = URem = LShr = AShr = Shl = GetHigh = SetHigh = AtomicAdd = AtomicSub = AtomicAnd = AtomicOr = AtomicXor = NULL;
     }
 
     virtual bool runOnModule(Module &M);
-    virtual void getAnalysisUsage(AnalysisUsage &AU) const;
   };
 }
 
@@ -334,7 +335,7 @@ bool ExpandI64::splitInst(Instruction *I) {
           NewOps.push_back(Op);
         }
       }
-      Value *NewGEP = CopyDebug(GetElementPtrInst::Create(GEP->getPointerOperand(), NewOps, "", GEP), GEP);
+      Value *NewGEP = CopyDebug(GetElementPtrInst::Create(GEP->getSourceElementType(), GEP->getPointerOperand(), NewOps, "", GEP), GEP);
       Chunks.push_back(NewGEP);
       I->replaceAllUsesWith(NewGEP);
       break;
@@ -602,7 +603,7 @@ bool ExpandI64::splitInst(Instruction *I) {
           }
 
           // Or the parts together. Since we may have zero, try to fold it away.
-          if (Value *V = SimplifyBinOp(Instruction::Or, L, H, DL)) {
+          if (Value *V = SimplifyBinOp(Instruction::Or, L, H, *DL)) {
             Chunks.push_back(V);
           } else {
             Chunks.push_back(CopyDebug(BinaryOperator::Create(Instruction::Or, L, H, "", I), I));
@@ -725,7 +726,7 @@ bool ExpandI64::splitInst(Instruction *I) {
         // If there's a constant operand, it's likely enough that one of the
         // chunks will be a trivial operation, so it's worth calling
         // SimplifyBinOp here.
-        if (Value *V = SimplifyBinOp(BO->getOpcode(), LeftChunks[i], RightChunks[i], DL)) {
+        if (Value *V = SimplifyBinOp(BO->getOpcode(), LeftChunks[i], RightChunks[i], *DL)) {
           Chunks.push_back(V);
         } else {
           Chunks.push_back(CopyDebug(BinaryOperator::Create(BO->getOpcode(), LeftChunks[i], RightChunks[i], "", BO), BO));
@@ -930,6 +931,42 @@ bool ExpandI64::splitInst(Instruction *I) {
       }
       break;
     }
+    case Instruction::AtomicRMW: {
+      const AtomicRMWInst *rmwi = cast<AtomicRMWInst>(I);
+      ChunksVec Chunks32Bit = getChunks(I->getOperand(1));
+      unsigned Num = getNumChunks(I->getType());
+      assert(Num == 2 && "Only know how to handle 32-bit and 64-bit AtomicRMW instructions!");
+      ensureFuncs();
+      Value *Low = NULL, *High = NULL;
+      Function *F = NULL;
+      switch (rmwi->getOperation()) {
+        case AtomicRMWInst::Add: F = AtomicAdd; break;
+        case AtomicRMWInst::Sub: F = AtomicSub; break;
+        case AtomicRMWInst::And: F = AtomicAnd; break;
+        case AtomicRMWInst::Or: F = AtomicOr; break;
+        case AtomicRMWInst::Xor: F = AtomicXor; break;
+        case AtomicRMWInst::Xchg:
+        case AtomicRMWInst::Nand:
+        case AtomicRMWInst::Max:
+        case AtomicRMWInst::Min:
+        case AtomicRMWInst::UMax:
+        case AtomicRMWInst::UMin:
+        default: llvm_unreachable("Bad atomic operation");
+      }
+      SmallVector<Value *, 3> Args;
+      Args.push_back(new BitCastInst(I->getOperand(0), Type::getInt8PtrTy(TheModule->getContext()), "", I));
+      Args.push_back(Chunks32Bit[0]);
+      Args.push_back(Chunks32Bit[1]);
+      Low = CopyDebug(CallInst::Create(F, Args, "", I), I);
+      High = CopyDebug(CallInst::Create(GetHigh, "", I), I);
+      Chunks.push_back(Low);
+      Chunks.push_back(High);
+      break;
+    }
+    case Instruction::AtomicCmpXchg: {
+      assert(0 && "64-bit compare-and-exchange (__sync_bool_compare_and_swap & __sync_val_compare_and_swap) are not supported! Please directly call emscripten_atomic_cas_u64() instead in order to emulate!");
+      break;
+    }
     default: {
       I->dump();
       assert(0 && "some i64 thing we can't legalize yet");
@@ -955,7 +992,7 @@ ChunksVec ExpandI64::getChunks(Value *V, bool AllowUnreachable) {
       Constant *NewC = ConstantExpr::getTrunc(ConstantExpr::getLShr(C, Count), i32);
       TargetLibraryInfo *TLI = 0; // TODO
       if (ConstantExpr *NewCE = dyn_cast<ConstantExpr>(NewC)) {
-        if (Constant *FoldedC = ConstantFoldConstantExpression(NewCE, DL, TLI)) {
+        if (Constant *FoldedC = ConstantFoldConstantExpression(NewCE, *DL, TLI)) {
           NewC = FoldedC;
         }
       }
@@ -979,6 +1016,12 @@ void ExpandI64::ensureFuncs() {
   if (Add != NULL) return;
 
   Type *i32 = Type::getInt32Ty(TheModule->getContext());
+
+  AtomicAdd = TheModule->getFunction("_emscripten_atomic_fetch_and_add_u64");
+  AtomicSub = TheModule->getFunction("_emscripten_atomic_fetch_and_sub_u64");
+  AtomicAnd = TheModule->getFunction("_emscripten_atomic_fetch_and_and_u64");
+  AtomicOr = TheModule->getFunction("_emscripten_atomic_fetch_and_or_u64");
+  AtomicXor = TheModule->getFunction("_emscripten_atomic_fetch_and_xor_u64");
 
   SmallVector<Type*, 4> FourArgTypes;
   FourArgTypes.push_back(i32);
@@ -1069,7 +1112,7 @@ void ExpandI64::ensureFuncs() {
 
 bool ExpandI64::runOnModule(Module &M) {
   TheModule = &M;
-  DL = &getAnalysis<DataLayoutPass>().getDataLayout();
+  DL = &M.getDataLayout();
   Splits.clear();
   Changed = false;
 
@@ -1155,11 +1198,6 @@ bool ExpandI64::runOnModule(Module &M) {
   }
 
   return Changed;
-}
-
-void ExpandI64::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.addRequired<DataLayoutPass>();
-  ModulePass::getAnalysisUsage(AU);
 }
 
 ModulePass *llvm::createExpandI64Pass() {
