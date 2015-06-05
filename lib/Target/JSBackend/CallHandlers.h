@@ -100,7 +100,7 @@ DEF_CALL_HANDLER(__default__, {
     // TODO Fix
     unsigned addr = getFunctionIndex(F);
     FunctionTable &Table = FunctionTables[Sig];
-    while (Table.size() < addr) Table.push_back("0");
+    while (Table.size() <= addr) Table.push_back("0");
     Table[addr] = getJSName(F)+"_"+Sig;
   }
 
