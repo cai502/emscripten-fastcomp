@@ -2891,7 +2891,7 @@ static std::string escapeJSONString(llvm::StringRef str)
   for(llvm::StringRef::const_iterator itr = str.begin(); itr < str.end(); ++itr) {
     char ch = *itr;
     if(ch < 0x1f) {
-      char escaped[6];
+      char escaped[7];
       sprintf(escaped, "\\u%04d", ch);
       out.append(escaped);
     } else {
