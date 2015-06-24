@@ -88,7 +88,7 @@ DEF_CALL_HANDLER(__default__, {
     }
   }
 
-  bool ObjcMsgSendFuncs = Name.find("_objc_msg") != std::string::npos;
+  bool ObjcMsgSendFuncs = Name.find("_objc_msg") != std::string::npos || Name.find("_method_invoke") != std::string::npos;
   if(ObjcMsgSendFuncs) {
     Sig = getFunctionSignatureLetter(CI->getType());
     for (int i = 0; i < NumArgs; i++) {
