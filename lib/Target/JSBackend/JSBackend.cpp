@@ -219,7 +219,7 @@ namespace {
     void printCommaSeparated(const HeapData v);
 
     // parsing of constants has two phases: calculate, and then emit
-    void parseConstant(const std::string& name, const Constant* CV, bool calculate);
+    void parseConstant(const std::string& name, const Constant* CV, bool calculate, bool objcSection = false);
 
     #define MEM_ALIGN 8
     #define MEM_ALIGN_BITS 64
@@ -234,7 +234,7 @@ namespace {
     }
 
     HeapData *allocateAddress(const std::string& Name, unsigned Bits = MEM_ALIGN_BITS) {
-      assert(Bits == 64); // FIXME when we use optimal alignments
+      assert(Bits == 64 || Bits == 32); // FIXME when we use optimal alignments
       HeapData *GlobalData = NULL;
       switch (Bits) {
         case 8:  GlobalData = &GlobalData8;  break;
@@ -254,7 +254,7 @@ namespace {
         report_fatal_error("cannot find global address " + Twine(s));
       }
       Address a = I->second;
-      assert(a.second == 64); // FIXME when we use optimal alignments
+      assert(a.second == 64 || a.second == 32); // FIXME when we use optimal alignments
       unsigned Ret;
       switch (a.second) {
         case 64:
@@ -262,7 +262,7 @@ namespace {
           Ret = a.first + GlobalBase;
           break;
         case 32:
-          assert((a.first + GlobalBase)%4 == 0);
+          assert((a.first + GlobalBase + GlobalData64.size())%4 == 0);
           Ret = a.first + GlobalBase + GlobalData64.size();
           break;
         case 8:
@@ -2762,11 +2762,12 @@ void JSWriter::processConstants() {
       parseConstant(I->getName().str(), I->getInitializer(), true);
     }
   }
+  while (GlobalData64.size() % 8 != 0) GlobalData64.push_back(0);
   for (std::vector<std::string>::iterator i = objcSections.begin(), e = objcSections.end(); i != e; ++i) {
     for (Module::const_global_iterator I = TheModule->global_begin(),
            E = TheModule->global_end(); I != E; ++I) {
       if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
-        parseConstant(I->getName().str(), I->getInitializer(), true);
+        parseConstant(I->getName().str(), I->getInitializer(), true, true);
       }
     }
   }
@@ -2775,6 +2776,14 @@ void JSWriter::processConstants() {
          E = TheModule->global_end(); I != E; ++I) {
     if (I->hasInitializer() && !isObjCMetaVar(I->getSection())) {
       parseConstant(I->getName().str(), I->getInitializer(), false);
+    }
+  }
+  for (std::vector<std::string>::iterator i = objcSections.begin(), e = objcSections.end(); i != e; ++i) {
+    for (Module::const_global_iterator I = TheModule->global_begin(),
+           E = TheModule->global_end(); I != E; ++I) {
+      if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
+        parseConstant(I->getName().str(), I->getInitializer(), false, true);
+      }
     }
   }
   if (Relocatable) {
@@ -2788,14 +2797,6 @@ void JSWriter::processConstants() {
             NamedGlobals[Name] = getGlobalAddress(Name);
           }
         }
-      }
-    }
-  }
-  for (std::vector<std::string>::iterator i = objcSections.begin(), e = objcSections.end(); i != e; ++i) {
-    for (Module::const_global_iterator I = TheModule->global_begin(),
-           E = TheModule->global_end(); I != E; ++I) {
-      if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
-        parseConstant(I->getName().str(), I->getInitializer(), false);
       }
     }
   }
@@ -2939,7 +2940,9 @@ void JSWriter::printModuleBody() {
   PostSets = "";
   Out << "// EMSCRIPTEN_END_FUNCTIONS\n\n";
 
-  assert(GlobalData32.size() == 0 && GlobalData8.size() == 0); // FIXME when we use optimal constant alignments
+  assert(GlobalData8.size() == 0); // FIXME when we use optimal constant alignments
+  assert(GlobalData32.size() % 4 == 0); // FIXME when we use optimal constant alignments
+  assert(GlobalData64.size() % 8 == 0); // FIXME when we use optimal constant alignments
 
   if (EnablePthreads) {
     Out << "if (!ENVIRONMENT_IS_PTHREAD) {\n";
@@ -3191,7 +3194,8 @@ void JSWriter::printModuleBody() {
   Out << "\n}\n";
 }
 
-void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool calculate) {
+void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool calculate, bool objcSection) {
+  unsigned Bits = objcSection ? 32 : 64;
   if (isa<GlobalValue>(CV))
     return;
   //errs() << "parsing constant " << name << "\n";
@@ -3201,7 +3205,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
          dyn_cast<ConstantDataSequential>(CV)) {
     assert(CDS->isString());
     if (calculate) {
-      HeapData *GlobalData = allocateAddress(name);
+      HeapData *GlobalData = allocateAddress(name, Bits);
       StringRef Str = CDS->getAsString();
       for (unsigned int i = 0; i < Str.size(); i++) {
         GlobalData->push_back(Str.data()[i]);
@@ -3211,7 +3215,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
     APFloat APF = CFP->getValueAPF();
     if (CFP->getType() == Type::getFloatTy(CFP->getContext())) {
       if (calculate) {
-        HeapData *GlobalData = allocateAddress(name);
+        HeapData *GlobalData = allocateAddress(name, Bits);
         union flt { float f; unsigned char b[sizeof(float)]; } flt;
         flt.f = APF.convertToFloat();
         for (unsigned i = 0; i < sizeof(float); ++i) {
@@ -3220,7 +3224,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
       }
     } else if (CFP->getType() == Type::getDoubleTy(CFP->getContext())) {
       if (calculate) {
-        HeapData *GlobalData = allocateAddress(name);
+        HeapData *GlobalData = allocateAddress(name, Bits);
         union dbl { double d; unsigned char b[sizeof(double)]; } dbl;
         dbl.d = APF.convertToDouble();
         for (unsigned i = 0; i < sizeof(double); ++i) {
@@ -3236,7 +3240,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
       integer.i = *CI->getValue().getRawData();
       unsigned BitWidth = 64; // CI->getValue().getBitWidth();
       assert(BitWidth == 32 || BitWidth == 64);
-      HeapData *GlobalData = allocateAddress(name);
+      HeapData *GlobalData = allocateAddress(name, Bits);
       // assuming compiler is little endian
       for (unsigned i = 0; i < BitWidth / 8; ++i) {
         GlobalData->push_back(integer.b[i]);
@@ -3247,7 +3251,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
   } else if (isa<ConstantAggregateZero>(CV)) {
     if (calculate) {
       unsigned Bytes = DL->getTypeStoreSize(CV->getType());
-      HeapData *GlobalData = allocateAddress(name);
+      HeapData *GlobalData = allocateAddress(name, Bits);
       for (unsigned i = 0; i < Bytes; ++i) {
         GlobalData->push_back(0);
       }
@@ -3290,7 +3294,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
         }
       }
     } else if (calculate) {
-      HeapData *GlobalData = allocateAddress(name);
+      HeapData *GlobalData = allocateAddress(name, Bits);
       unsigned Bytes = DL->getTypeStoreSize(CV->getType());
       //errs() << "assigned: " << Bytes << "bytes\n";
       for (unsigned i = 0; i < Bytes; ++i) {
@@ -3332,16 +3336,18 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
           }
           union { unsigned i; unsigned char b[sizeof(unsigned)]; } integer;
           integer.i = Data;
-          assert(Offset+4 <= GlobalData64.size());
+          HeapData *GlobalData = objcSection ? &GlobalData32 : &GlobalData64;
+          assert(Offset+4 <= GlobalData->size());
           for (unsigned i = 0; i < 4; ++i) {
-            GlobalData64[Offset++] = integer.b[i];
+            (*GlobalData)[Offset++] = integer.b[i];
           }
         } else if (const ConstantDataSequential *CDS = dyn_cast<ConstantDataSequential>(C)) {
           assert(CDS->isString());
           StringRef Str = CDS->getAsString();
-          assert(Offset+Str.size() <= GlobalData64.size());
+          HeapData *GlobalData = objcSection ? &GlobalData32 : &GlobalData64;
+          assert(Offset+Str.size() <= GlobalData->size());
           for (unsigned int i = 0; i < Str.size(); i++) {
-            GlobalData64[Offset++] = Str.data()[i];
+            (*GlobalData)[Offset++] = Str.data()[i];
           }
         } else {
           C->dump();
@@ -3366,7 +3372,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
     } else {
       // a global equal to a ptrtoint of some function, so a 32-bit integer for us
       if (calculate) {
-        HeapData *GlobalData = allocateAddress(name);
+        HeapData *GlobalData = allocateAddress(name, Bits);
         for (unsigned i = 0; i < 4; ++i) {
           GlobalData->push_back(0);
         }
@@ -3392,9 +3398,10 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, bool c
         union { unsigned i; unsigned char b[sizeof(unsigned)]; } integer;
         integer.i = Data;
         unsigned Offset = getRelativeGlobalAddress(name);
-        assert(Offset+4 <= GlobalData64.size());
+        HeapData *GlobalData = objcSection ? &GlobalData32 : &GlobalData64;
+        assert(Offset+4 <= GlobalData->size());
         for (unsigned i = 0; i < 4; ++i) {
-          GlobalData64[Offset++] = integer.b[i];
+          (*GlobalData)[Offset++] = integer.b[i];
         }
       }
     }
