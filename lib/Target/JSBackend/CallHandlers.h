@@ -503,6 +503,10 @@ DEF_CALL_HANDLER(llvm_prefetch, {
   return "";
 })
 
+DEF_CALL_HANDLER(clang_arc_use, {
+  return "";
+})
+
 DEF_CALL_HANDLER(llvm_objectsize_i32_p0i8, {
   return  getAssign(CI) + ((cast<ConstantInt>(CI->getOperand(1)))->getZExtValue() == 0 ? "-1" : "0");
 })
@@ -862,6 +866,7 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(llvm_invariant_start);
   SETUP_CALL_HANDLER(llvm_invariant_end);
   SETUP_CALL_HANDLER(llvm_prefetch);
+  SETUP_CALL_HANDLER(clang_arc_use);
   SETUP_CALL_HANDLER(llvm_objectsize_i32_p0i8);
   SETUP_CALL_HANDLER(llvm_flt_rounds);
   SETUP_CALL_HANDLER(bitshift64Lshr);
@@ -1029,4 +1034,3 @@ std::string handleCall(const Instruction *CI) {
   }
   return (this->*(CH->second))(CI, Name, -1);
 }
-
