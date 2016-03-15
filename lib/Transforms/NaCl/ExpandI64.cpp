@@ -745,10 +745,15 @@ bool ExpandI64::splitInst(Instruction *I) {
       FunctionType *OFT = NULL;
       if (ConstantExpr *CE = dyn_cast<ConstantExpr>(CV)) {
         assert(CE);
-        assert(CE->getOpcode() == Instruction::BitCast);
         OFT = cast<FunctionType>(cast<PointerType>(CE->getType())->getElementType());
         Constant *C = CE->getOperand(0);
-        CV = ConstantExpr::getBitCast(C, getLegalizedFunctionType(OFT)->getPointerTo());
+        if (CE->getOpcode() == Instruction::BitCast) {
+          CV = ConstantExpr::getBitCast(C, getLegalizedFunctionType(OFT)->getPointerTo());
+        } else if (CE->getOpcode() == Instruction::IntToPtr) {
+          CV = ConstantExpr::getIntToPtr(C, getLegalizedFunctionType(OFT)->getPointerTo());
+        } else {
+          llvm_unreachable("Bad CE in i64 Call");
+        }
       } else {
         // this is a function pointer call
         OFT = cast<FunctionType>(cast<PointerType>(CV->getType())->getElementType());
@@ -817,18 +822,18 @@ bool ExpandI64::splitInst(Instruction *I) {
         Chunks.push_back(H);
         break;
       } else if (isa<VectorType>(I->getOperand(0)->getType()) && !isa<VectorType>(I->getType())) {
-          unsigned NumElts = getNumChunks(I->getType());
-          VectorType *IVTy = VectorType::get(i32, NumElts);
-          Instruction *B = CopyDebug(new BitCastInst(I->getOperand(0), IVTy, "", I), I);
-          for (unsigned i = 0; i < NumElts; ++i) {
-              Constant *Idx = ConstantInt::get(i32, i);
-              Instruction *Ext = CopyDebug(ExtractElementInst::Create(B, Idx, "", I), I);
-              Chunks.push_back(Ext);
-          }
-          break;
+        unsigned NumElts = getNumChunks(I->getType());
+        VectorType *IVTy = VectorType::get(i32, NumElts);
+        Instruction *B = CopyDebug(new BitCastInst(I->getOperand(0), IVTy, "", I), I);
+        for (unsigned i = 0; i < NumElts; ++i) {
+          Constant *Idx = ConstantInt::get(i32, i);
+          Instruction *Ext = CopyDebug(ExtractElementInst::Create(B, Idx, "", I), I);
+          Chunks.push_back(Ext);
+        }
+        break;
       } else {
         // no-op bitcast
-        assert(I->getType() == I->getOperand(0)->getType());
+        assert(I->getType() == I->getOperand(0)->getType() && "possible hint: optimize with -O0 or -O2+, and not -O1");
         Chunks = getChunks(I->getOperand(0));
         break;
       }
@@ -969,7 +974,7 @@ bool ExpandI64::splitInst(Instruction *I) {
     }
     default: {
       I->dump();
-      assert(0 && "some i64 thing we can't legalize yet");
+      assert(0 && "some i64 thing we can't legalize yet. possible hint: optimize with -O0 or -O2+, and not -O1");
     }
   }
 

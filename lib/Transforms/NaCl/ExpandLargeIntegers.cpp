@@ -432,6 +432,10 @@ public:
     RewrittenLegals[From] = To;
   }
 
+  void recordToErase(Instruction *TE) {
+    ToErase.push_back(TE);
+  }
+
   void patchForwardPHIs() {
     DEBUG(if (!ForwardPHIs.empty()) dbgs() << "Patching forward PHIs:\n");
     for (ForwardPHI &F : ForwardPHIs) {
@@ -570,6 +574,60 @@ static void convertInstruction(Instruction *Inst, ConversionState &State,
     Value *Lo = IRB.CreateSelect(Cond, True.Lo, False.Lo, Twine(Name, ".lo"));
     Value *Hi = IRB.CreateSelect(Cond, True.Hi, False.Hi, Twine(Name, ".hi"));
     State.recordConverted(Select, {Lo, Hi});
+
+  } else if (BitCastInst *BitCast = dyn_cast<BitCastInst>(Inst)) {
+    // XXX EMSCRIPTEN handle bitcast <4 x i32|float> or <2 x double> to i128
+    Value *Input = BitCast->getOperand(0);
+    if (!Input->getType()->isVectorTy()) {
+      return; // we can't do anything for it, but see below on trivial casts to i128 and back, it might get handled there
+    }
+    VectorType *VT = cast<VectorType>(Input->getType());
+    Type *ET = VT->getElementType();
+
+    // handle trivial casts to i128 and immediately back
+    if (BitCast->hasOneUse()) {
+      User* U = *BitCast->user_begin();
+      if (BitCastInst *UserBitCast = dyn_cast<BitCastInst>(U)) {
+        if (UserBitCast->getType()->isVectorTy()) {
+          Value* Direct = Input;
+          if (VT != UserBitCast->getType()) {
+            Direct = IRB.CreateBitCast(Direct, UserBitCast->getType(), Twine(Name, "dcast"));
+          }
+          State.recordToErase(BitCast);
+          State.recordConverted(UserBitCast, Direct);
+          return;
+        }
+      }
+    }
+
+    Type *I32 = Type::getInt32Ty(VT->getContext());
+
+    if (VT->getNumElements() == 4) {
+      assert(ET->isIntegerTy(32) || ET->isFloatTy());
+      if (ET->isFloatTy()) {
+        Input = IRB.CreateBitCast(Input, VectorType::get(I32, 4), Twine(Name, "toint"));
+      }
+    } else if (VT->getNumElements() == 2) {
+      assert(ET->isDoubleTy());
+      Input = IRB.CreateBitCast(Input, VectorType::get(I32, 4), Twine(Name, "toint"));
+    } else {
+      DIE_IF(true, Inst, "BitCast Instruction");
+    }
+
+    Value *P0 = IRB.CreateExtractElement(Input, ConstantInt::get(I32, 0), Twine(Name, ".p0"));
+    Value *P1 = IRB.CreateExtractElement(Input, ConstantInt::get(I32, 1), Twine(Name, ".p1"));
+    Value *P2 = IRB.CreateExtractElement(Input, ConstantInt::get(I32, 2), Twine(Name, ".p2"));
+    Value *P3 = IRB.CreateExtractElement(Input, ConstantInt::get(I32, 3), Twine(Name, ".p3"));
+
+    Type *I64 = Type::getInt64Ty(VT->getContext());
+    P0 = IRB.CreateZExt(P0, I64, Twine(Name, ".p0.64"));
+    P1 = IRB.CreateZExt(P1, I64, Twine(Name, ".p1.64"));
+    P2 = IRB.CreateZExt(P2, I64, Twine(Name, ".p2.64"));
+    P3 = IRB.CreateZExt(P3, I64, Twine(Name, ".p3.64"));
+
+    Value *Lo = IRB.CreateBinOp(Instruction::BinaryOps::Or, P0, IRB.CreateBinOp(Instruction::BinaryOps::Shl, P1, ConstantInt::get(I64, 32), Twine(Name, ".mid.lo")), Twine(Name, ".lo"));
+    Value *Hi = IRB.CreateBinOp(Instruction::BinaryOps::Or, P2, IRB.CreateBinOp(Instruction::BinaryOps::Shl, P3, ConstantInt::get(I64, 32), Twine(Name, ".mid.hi")), Twine(Name, ".hi"));
+    State.recordConverted(BitCast, {Lo, Hi});
 
   } else {
     DIE_IF(true, Inst, "Instruction");
