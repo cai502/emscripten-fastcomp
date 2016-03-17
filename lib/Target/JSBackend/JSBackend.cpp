@@ -3409,9 +3409,6 @@ void JSWriter::printModuleBody() {
   first = true;
   for (IntIntSetMap::const_iterator I = AsmConstArities.begin(), E = AsmConstArities.end();
        I != E; ++I) {
-    if (!first) {
-      Out << ", ";
-    }
     Out << "\"" << utostr(I->first) << "\": [";
     first = true;
     for (IntSet::const_iterator J = I->second.begin(), F = I->second.end();
@@ -3423,13 +3420,10 @@ void JSWriter::printModuleBody() {
       }
       Out << utostr(*J);
     }
-    first = false;
-    Out << "]";
+    Out << "], ";
   }
-  Out << ",";
 
   Out << "\"objc\": {";
-  first = true;
   Out << "\"__objc_selrefs\":[";
 	printAddressList(objcSelectorRefs);
   Out << "], \"__objc_msgrefs\":[";
