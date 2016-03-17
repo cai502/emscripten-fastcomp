@@ -2921,7 +2921,7 @@ void JSWriter::processConstants() {
   // Ensure a name for each global
   for (Module::global_iterator I = TheModule->global_begin(),
          E = TheModule->global_end(); I != E; ++I) {
-    if (I->hasInitializer() && !isObjCMetaVar(I->getSection())) {
+    if (I->hasInitializer()) {
       if (!I->hasName()) {
         // ensure a unique name
         static int id = 1;
@@ -2940,7 +2940,6 @@ void JSWriter::processConstants() {
   for (Module::const_global_iterator I = TheModule->global_begin(),
          E = TheModule->global_end(); I != E; ++I) {
     if (I->hasInitializer() && !isObjCMetaVar(I->getSection())) {
-        errs() << "info: alignment is " << I->getAlignment() << "\n";
       parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), true);
     }
   }
@@ -2949,7 +2948,6 @@ void JSWriter::processConstants() {
     for (Module::const_global_iterator I = TheModule->global_begin(),
            E = TheModule->global_end(); I != E; ++I) {
       if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
-        assert(I->getAlignment() == 32 / 8 && "objc alignment is not 32 / 8");
         parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), true);
       }
     }
@@ -2986,7 +2984,6 @@ void JSWriter::processConstants() {
     for (Module::const_global_iterator I = TheModule->global_begin(),
            E = TheModule->global_end(); I != E; ++I) {
       if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
-        assert(I->getAlignment() == 32 / 8 && "objc alignment is not 32 / 8");
         parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), false);
       }
     }
@@ -3045,7 +3042,7 @@ void JSWriter::processConstants() {
       } else if(section.find("__objc_protorefs") != std::string::npos) {
         objcProtocolRefs.push_back(addr);
       }
-	}
+    }
   }
 }
 
