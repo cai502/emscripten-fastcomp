@@ -2949,7 +2949,7 @@ void JSWriter::processConstants() {
            E = TheModule->global_end(); I != E; ++I) {
       if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
         assert(I->getAlignment() == 32 && "objc alignment is 32");
-        parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment, true, true);
+        parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), true, true);
       }
     }
   }
