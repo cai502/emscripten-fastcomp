@@ -232,7 +232,7 @@ namespace {
     void printCommaSeparated(const HeapData v);
 
     // parsing of constants has two phases: calculate, and then emit
-    void parseConstant(const std::string& name, const Constant* CV, int Alignment, bool calculate, bool objcSection = false);
+    void parseConstant(const std::string& name, const Constant* CV, int Alignment, bool calculate);
 
     #define DEFAULT_MEM_ALIGN 8
 
@@ -2940,6 +2940,7 @@ void JSWriter::processConstants() {
   for (Module::const_global_iterator I = TheModule->global_begin(),
          E = TheModule->global_end(); I != E; ++I) {
     if (I->hasInitializer() && !isObjCMetaVar(I->getSection())) {
+        errs() << "info: alignment is " << I->getAlignment() << "\n";
       parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), true);
     }
   }
@@ -2948,8 +2949,8 @@ void JSWriter::processConstants() {
     for (Module::const_global_iterator I = TheModule->global_begin(),
            E = TheModule->global_end(); I != E; ++I) {
       if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
-        assert(I->getAlignment() == 32 && "objc alignment is 32");
-        parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), true, true);
+        assert(I->getAlignment() == 32 / 8 && "objc alignment is not 32 / 8");
+        parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), true);
       }
     }
   }
@@ -2985,7 +2986,8 @@ void JSWriter::processConstants() {
     for (Module::const_global_iterator I = TheModule->global_begin(),
            E = TheModule->global_end(); I != E; ++I) {
       if (I->hasInitializer() && std::string(I->getSection()).find(*i, 0) != std::string::npos) {
-        parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), false, true);
+        assert(I->getAlignment() == 32 / 8 && "objc alignment is not 32 / 8");
+        parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), false);
       }
     }
   }
@@ -3409,6 +3411,9 @@ void JSWriter::printModuleBody() {
   first = true;
   for (IntIntSetMap::const_iterator I = AsmConstArities.begin(), E = AsmConstArities.end();
        I != E; ++I) {
+    if (!first) {
+      Out << ", ";
+    }
     Out << "\"" << utostr(I->first) << "\": [";
     first = true;
     for (IntSet::const_iterator J = I->second.begin(), F = I->second.end();
@@ -3420,8 +3425,10 @@ void JSWriter::printModuleBody() {
       }
       Out << utostr(*J);
     }
-    Out << "], ";
+    first = false;
+    Out << "]";
   }
+  Out << "}, ";
 
   Out << "\"objc\": {";
   Out << "\"__objc_selrefs\":[";
@@ -3450,9 +3457,7 @@ void JSWriter::printModuleBody() {
   Out << "\n}\n";
 }
 
-void JSWriter::parseConstant(const std::string& name, const Constant* CV, int Alignment, bool calculate, bool objcSection) {
-  if (objcSection)
-    Alignment = 32;
+void JSWriter::parseConstant(const std::string& name, const Constant* CV, int Alignment, bool calculate) {
   if (isa<GlobalValue>(CV))
     return;
   if (Alignment == 0) Alignment = DEFAULT_MEM_ALIGN;
