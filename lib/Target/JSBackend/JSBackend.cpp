@@ -3300,7 +3300,7 @@ void JSWriter::printModuleBody() {
       }
       std::string name = I->getName();
       sanitizeGlobal(name);
-      Out << "\"_" << escapeJSONString(name) << '"';
+      Out << '"' << escapeJSONString(name) << '"';
     }
   }
   Out << "],";
