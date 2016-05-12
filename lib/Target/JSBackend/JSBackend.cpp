@@ -2995,8 +2995,8 @@ void JSWriter::processConstants() {
         std::string Name = I->getName().str();
         if (GlobalAddresses.find(Name) != GlobalAddresses.end()) {
           std::string JSName = getJSName(I).substr(1);
-          if (Name == JSName) { // don't export things that have weird internal names, that C can't dlsym anyhow
-            NamedGlobals[Name] = getGlobalAddress(Name);
+          if (Name == JSName || JSName.compare(0, 5, "OBJC_")==0 || JSName.compare(0, 8, "_l_OBJC_")==0) { // don't export things that have weird internal names, that C can't dlsym anyhow
+            NamedGlobals[JSName] = getGlobalAddress(Name);
           }
         }
       }
