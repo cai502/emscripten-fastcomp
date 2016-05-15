@@ -410,10 +410,12 @@ namespace {
             std::string Name = getOpName(V);
             Externals.insert(Name);
             if (Relocatable) {
-              PostSets.push_back("\n temp = g$" + Name + "() | 0;"); // we access linked externs through calls, and must do so to a temp for heap growth validation
+              std::string line = "\n temp = g$" + Name + "() | 0;"; // we access linked externs through calls, and must do so to a temp for heap growth validation
               // see later down about adding to an offset
               std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
-              PostSets.push_back("\n " + access + " = (" + access + " | 0) + temp;");
+              line += "\n " + access + " = (" + access + " | 0) + temp;";
+              errs() << line << "\n";
+              PostSets.push_back(line);
             } else {
               PostSets.push_back("\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + Name + ';');
             }
