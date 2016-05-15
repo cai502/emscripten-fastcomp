@@ -414,7 +414,6 @@ namespace {
               // see later down about adding to an offset
               std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
               line += "\n " + access + " = (" + access + " | 0) + temp;";
-              errs() << line << "\n";
               PostSets.push_back(line);
             } else {
               PostSets.push_back("\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + Name + ';');
