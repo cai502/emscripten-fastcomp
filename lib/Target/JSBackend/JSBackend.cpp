@@ -2996,7 +2996,20 @@ void JSWriter::processConstants() {
         std::string Name = I->getName().str();
         if (GlobalAddresses.find(Name) != GlobalAddresses.end()) {
           std::string JSName = getJSName(I).substr(1);
-          if (Name == JSName || JSName.compare(0, 5, "OBJC_")==0 || JSName.compare(0, 8, "_l_OBJC_")==0) { // don't export things that have weird internal names, that C can't dlsym anyhow
+          if (
+            (Name == JSName // don't export things that have weird internal names, that C can't dlsym anyhow
+            || JSName.compare(0, 10, "OBJC_CLASS") == 0 // pass ObjC metadata global names
+            || JSName.compare(0, 14, "OBJC_METACLASS") == 0
+            || JSName.compare(0, 9, "OBJC_IVAR") == 0)
+            && JSName.compare(0, 15, "OBJC_CLASS_NAME") != 0 // don't pass ObjC internal global names, which are not referenced
+            && JSName.compare(0, 25, "OBJC_CLASSLIST_REFERENCES") != 0
+            && JSName.compare(0, 23, "OBJC_CLASSLIST_SUP_REFS") != 0
+            && JSName.compare(0, 18, "OBJC_METH_VAR_NAME") != 0
+            && JSName.compare(0, 18, "OBJC_METH_VAR_TYPE") != 0
+            && JSName.compare(0, 24, "OBJC_SELECTOR_REFERENCES") != 0
+            && JSName.compare(0, 19, "OBJC_PROP_NAME_ATTR") != 0
+            && JSName.compare(0, 18, "OBJC_METH_VAR_NAME") != 0
+            && JSName.compare(0, 17, "_unnamed_cfstring") != 0) {
             NamedGlobals[JSName] = getGlobalAddress(Name);
           }
         }
