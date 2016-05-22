@@ -3191,13 +3191,15 @@ void JSWriter::printModuleBody() {
       }
       prev = target;
     }
-    Out << "," << utostr(addresses.size());
-    totalSize++;
-    for(std::list<unsigned>::iterator AI = addresses.begin(), AE = addresses.end(); AI != AE; ++AI) {
-        Out << "," << utostr(*AI);
+    if(!First) {
+        Out << "," << utostr(addresses.size());
         totalSize++;
+        for(std::list<unsigned>::iterator AI = addresses.begin(), AE = addresses.end(); AI != AE; ++AI) {
+            Out << "," << utostr(*AI);
+            totalSize++;
+        }
+        addresses.clear();
     }
-    addresses.clear();
     Out << "];\n";
     RelocationTable.clear();
 
