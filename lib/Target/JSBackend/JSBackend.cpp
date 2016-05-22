@@ -3165,18 +3165,19 @@ void JSWriter::printModuleBody() {
       unsigned target = I->first;
       unsigned address = I->second;
       
-      if(target - prev <= 4*10) {
-        for(int i = 0; i < (target-prev)/4-1; i++) {
-          addresses.push_back(0);
-        }
-        addresses.push_back(address);
+      if(First) {
+        First = false;
+        Out << "\n  " << utostr(target);
+        totalSize++;
       } else {
-        // break
-        if(First) {
-          First = false;
-          Out << "\n  " << utostr(target);
-          totalSize++;
+        assert(target > prev);
+        
+        if(target - prev <= 4*10) {
+          for(int i = 0; i < (target-prev)/4-1; i++) {
+            addresses.push_back(0);
+          }
         } else {
+          // break
           Out << "," << utostr(addresses.size());
           totalSize++;
           for(std::list<unsigned>::iterator AI = addresses.begin(), AE = addresses.end(); AI != AE; ++AI) {
@@ -3187,8 +3188,8 @@ void JSWriter::printModuleBody() {
           Out << ",\n  " << utostr(target);
           totalSize++;
         }
-        addresses.push_back(address);
       }
+      addresses.push_back(address);
       prev = target;
     }
     if(!First) {
