@@ -3218,7 +3218,7 @@ void JSWriter::printModuleBody() {
     Out << "      address = addressMap[i+2+j]|0;\n";
     Out << "      if(address == 0) {\n";
     Out << "        // skip\n";
-    Out << "      } else if(address & 1 == 0) {\n";
+    Out << "      } else if((address & 1) == 0) {\n";
     Out << "        HEAP32[(gb + target) >> 2] = fb + (address >> 1);\n";
     Out << "      } else {\n";
     Out << "        HEAP32[(gb + target) >> 2] = (HEAP32[(gb + target) >> 2]|0) + gb + (address >> 1);\n";
