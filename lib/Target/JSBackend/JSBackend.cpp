@@ -399,7 +399,8 @@ namespace {
       if (const Function *F = dyn_cast<const Function>(V)) {
         if (Relocatable) {
           //PostSets.push_back("\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + relocateFunctionPointer(utostr(getFunctionIndex(F))) + ';');
-          RelocationTable[AbsoluteTarget] = getFunctionIndex(F) * 2 + 1;
+          RelocationTable[AbsoluteTarget] = getFunctionIndex(F) * 2;
+          assert(getFunctionIndex(F));
           return 0; // emit zero in there for now, until the postSet
         }
         return getFunctionIndex(F);
@@ -427,7 +428,7 @@ namespace {
             // an added offset, which we read at postSet time; in other words, we just add to that offset
             //std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
             //PostSets.push_back("\n " + access + " = (" + access + " | 0) + " + relocateGlobal(utostr(getGlobalAddress(V->getName().str()))) + ';');
-            RelocationTable[AbsoluteTarget] = getGlobalAddress(V->getName().str()) * 2;
+            RelocationTable[AbsoluteTarget] = getGlobalAddress(V->getName().str()) * 2 + 1;
             return 0; // emit zero in there for now, until the postSet
           }
         }
@@ -3217,7 +3218,7 @@ void JSWriter::printModuleBody() {
     Out << "      address = addressMap[i+2+j]|0;\n";
     Out << "      if(address == 0) {\n";
     Out << "        // skip\n";
-    Out << "      } else if(address & 1 == 1) {\n";
+    Out << "      } else if(address & 1 == 0) {\n";
     Out << "        HEAP32[(gb + target) >> 2] = fb + (address >> 1);\n";
     Out << "      } else {\n";
     Out << "        HEAP32[(gb + target) >> 2] = (HEAP32[(gb + target) >> 2]|0) + gb + (address >> 1);\n";
