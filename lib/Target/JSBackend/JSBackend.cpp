@@ -3005,6 +3005,7 @@ void JSWriter::processConstants() {
             (Name == JSName // don't export things that have weird internal names, that C can't dlsym anyhow
             || JSName.compare(0, 10, "OBJC_CLASS") == 0 // pass ObjC metadata global names
             || JSName.compare(0, 14, "OBJC_METACLASS") == 0
+            || JSName.compare(0, 11, "OBJC_EHTYPE") == 0
             || JSName.compare(0, 9, "OBJC_IVAR") == 0)
             && JSName.compare(0, 15, "OBJC_CLASS_NAME") != 0 // don't pass ObjC internal global names, which are not referenced
             && JSName.compare(0, 25, "OBJC_CLASSLIST_REFERENCES") != 0
