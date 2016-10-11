@@ -1,10 +1,10 @@
 ;; A very basic test to make sure that splitting the backedge keeps working
-;; RUN: opt -place-safepoints -spp-split-backedge=1 -S %s | FileCheck %s
+;; RUN: opt < %s -place-safepoints -spp-split-backedge=1 -S | FileCheck %s
 
 define void @test(i32, i1 %cond) gc "statepoint-example" {
 ; CHECK-LABEL: @test
 ; CHECK-LABEL: loop.loop_crit_edge
-; CHECK: gc.statepoint
+; CHECK: call void @do_safepoint
 ; CHECK-NEXT: br label %loop
 entry:
   br label %loop
@@ -22,12 +22,12 @@ exit:
 ; to be sure this keeps working.
 define void @test2(i32, i1 %cond) gc "statepoint-example" {
 ; CHECK-LABEL: @test2
-; CHECK-LABE: loop.loopexit.split
-; CHECK: gc.statepoint
-; CHECK-NEXT: br label %loop
-; CHECK-LABEL: loop2.loop2_crit_edge
-; CHECK: gc.statepoint
+; CHECK-LABEL: loop2.loop2_crit_edge:
+; CHECK: call void @do_safepoint
 ; CHECK-NEXT: br label %loop2
+; CHECK-LABEL: loop2.loop_crit_edge:
+; CHECK: call void @do_safepoint
+; CHECK-NEXT: br label %loop
 entry:
   br label %loop
 

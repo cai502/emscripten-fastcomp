@@ -32,7 +32,11 @@ public:
 
   bool hasFP(const MachineFunction &MF) const override;
 
-  void
+  bool hasBP(const MachineFunction &MF) const;
+
+  bool isFPCloseToIncomingSP() const override { return false; }
+
+  MachineBasicBlock::iterator
   eliminateCallFramePseudoInstr(MachineFunction &MF,
                                 MachineBasicBlock &MBB,
                                 MachineBasicBlock::iterator I) const override;

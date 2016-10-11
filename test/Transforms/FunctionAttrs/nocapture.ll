@@ -47,13 +47,13 @@ define i1 @c5(i32* %q, i32 %bitno) {
 declare void @throw_if_bit_set(i8*, i8) readonly
 
 ; CHECK: define i1 @c6(i8* readonly %q, i8 %bit)
-define i1 @c6(i8* %q, i8 %bit) {
+define i1 @c6(i8* %q, i8 %bit) personality i32 (...)* @__gxx_personality_v0 {
 	invoke void @throw_if_bit_set(i8* %q, i8 %bit)
 		to label %ret0 unwind label %ret1
 ret0:
 	ret i1 0
 ret1:
-        %exn = landingpad {i8*, i32} personality i32 (...)* @__gxx_personality_v0
+        %exn = landingpad {i8*, i32}
                  cleanup
 	ret i1 1
 }
@@ -193,3 +193,28 @@ define void @test6_2(i8* %x6_2, i8* %y6_2, i8* %z6_2) {
   ret void
 }
 
+; CHECK: define void @test_cmpxchg(i32* nocapture %p)
+define void @test_cmpxchg(i32* %p) {
+  cmpxchg i32* %p, i32 0, i32 1 acquire monotonic
+  ret void
+}
+
+; CHECK: define void @test_cmpxchg_ptr(i32** nocapture %p, i32* %q)
+define void @test_cmpxchg_ptr(i32** %p, i32* %q) {
+  cmpxchg i32** %p, i32* null, i32* %q acquire monotonic
+  ret void
+}
+
+; CHECK: define void @test_atomicrmw(i32* nocapture %p)
+define void @test_atomicrmw(i32* %p) {
+  atomicrmw add i32* %p, i32 1 seq_cst
+  ret void
+}
+
+; CHECK: define void @test_volatile(i32* %x)
+define void @test_volatile(i32* %x) {
+entry:
+  %gep = getelementptr i32, i32* %x, i64 1
+  store volatile i32 0, i32* %gep, align 4
+  ret void
+}

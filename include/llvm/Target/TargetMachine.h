@@ -15,6 +15,7 @@
 #define LLVM_TARGET_TARGETMACHINE_H
 
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/Pass.h"
 #include "llvm/Support/CodeGen.h"
@@ -27,15 +28,15 @@ namespace llvm {
 class InstrItineraryData;
 class GlobalValue;
 class Mangler;
+class MachineFunctionInitializer;
+class MachineModuleInfo;
 class MCAsmInfo;
-class MCCodeGenInfo;
 class MCContext;
 class MCInstrInfo;
 class MCRegisterInfo;
 class MCSubtargetInfo;
 class MCSymbol;
 class Target;
-class DataLayout;
 class TargetLibraryInfo;
 class TargetFrameLowering;
 class TargetIRAnalysis;
@@ -43,7 +44,6 @@ class TargetIntrinsicInfo;
 class TargetLowering;
 class TargetPassConfig;
 class TargetRegisterInfo;
-class TargetSelectionDAGInfo;
 class TargetSubtargetInfo;
 class TargetTransformInfo;
 class formatted_raw_ostream;
@@ -68,24 +68,29 @@ class TargetMachine {
   void operator=(const TargetMachine &) = delete;
 protected: // Can only create subclasses.
   TargetMachine(const Target &T, StringRef DataLayoutString,
-                StringRef TargetTriple, StringRef CPU, StringRef FS,
+                const Triple &TargetTriple, StringRef CPU, StringRef FS,
                 const TargetOptions &Options);
 
   /// The Target that this machine was created for.
   const Target &TheTarget;
 
-  /// For ABI type size and alignment.
+  /// DataLayout for the target: keep ABI type size and alignment.
+  ///
+  /// The DataLayout is created based on the string representation provided
+  /// during construction. It is kept here only to avoid reparsing the string
+  /// but should not really be used during compilation, because it has an
+  /// internal cache that is context specific.
   const DataLayout DL;
 
   /// Triple string, CPU name, and target feature strings the TargetMachine
   /// instance is created with.
-  std::string TargetTriple;
+  Triple TargetTriple;
   std::string TargetCPU;
   std::string TargetFS;
 
-  /// Low level target information such as relocation model. Non-const to
-  /// allow resetting optimization level per-function.
-  MCCodeGenInfo *CodeGenInfo;
+  Reloc::Model RM = Reloc::Static;
+  CodeModel::Model CMModel = CodeModel::Default;
+  CodeGenOpt::Level OptLevel = CodeGenOpt::Default;
 
   /// Contains target specific asm information.
   const MCAsmInfo *AsmInfo;
@@ -95,6 +100,7 @@ protected: // Can only create subclasses.
   const MCSubtargetInfo *STI;
 
   unsigned RequireStructuredCFG : 1;
+  unsigned O0WantsFastISel : 1;
 
 public:
   mutable TargetOptions Options;
@@ -103,7 +109,7 @@ public:
 
   const Target &getTarget() const { return TheTarget; }
 
-  StringRef getTargetTriple() const { return TargetTriple; }
+  const Triple &getTargetTriple() const { return TargetTriple; }
   StringRef getTargetCPU() const { return TargetCPU; }
   StringRef getTargetFeatureString() const { return TargetFS; }
 
@@ -123,9 +129,22 @@ public:
     return *static_cast<const STC*>(getSubtargetImpl(F));
   }
 
-  /// This method returns a pointer to the DataLayout for the target. It should
-  /// be unchanging for every subtarget.
-  const DataLayout *getDataLayout() const { return &DL; }
+  /// Create a DataLayout.
+  const DataLayout createDataLayout() const { return DL; }
+
+  /// Test if a DataLayout if compatible with the CodeGen for this target.
+  ///
+  /// The LLVM Module owns a DataLayout that is used for the target independent
+  /// optimizations and code generation. This hook provides a target specific
+  /// check on the validity of this DataLayout.
+  bool isCompatibleDataLayout(const DataLayout &Candidate) const {
+    return DL == Candidate;
+  }
+
+  /// Get the pointer size for this target.
+  ///
+  /// This is the only time the DataLayout in the TargetMachine is used.
+  unsigned getPointerSize() const { return DL.getPointerSize(); }
 
   /// \brief Reset the target options based on the function's attributes.
   // FIXME: Remove TargetOptions that affect per-function code generation
@@ -155,6 +174,10 @@ public:
   /// target default.
   CodeModel::Model getCodeModel() const;
 
+  bool isPositionIndependent() const;
+
+  bool shouldAssumeDSOLocal(const Module &M, const GlobalValue *GV) const;
+
   /// Returns the TLS model which should be used for the given global variable.
   TLSModel::Model getTLSModel(const GlobalValue *GV) const;
 
@@ -162,9 +185,11 @@ public:
   CodeGenOpt::Level getOptLevel() const;
 
   /// \brief Overrides the optimization level.
-  void setOptLevel(CodeGenOpt::Level Level) const;
+  void setOptLevel(CodeGenOpt::Level Level);
 
   void setFastISel(bool Enable) { Options.EnableFastISel = Enable; }
+  bool getO0WantsFastISel() { return O0WantsFastISel; }
+  void setO0WantsFastISel(bool Enable) { O0WantsFastISel = Enable; }
 
   bool shouldPrintMachineCode() const { return Options.PrintMachineCode; }
 
@@ -195,6 +220,11 @@ public:
   /// uses this to answer queries about the IR.
   virtual TargetIRAnalysis getTargetIRAnalysis();
 
+  /// Add target-specific function passes that should be run as early as
+  /// possible in the optimization pipeline.  Most TargetMachines have no such
+  /// passes.
+  virtual void addEarlyAsPossiblePasses(PassManagerBase &) {}
+
   /// These enums are meant to be passed into addPassesToEmitFile to indicate
   /// what type of file to emit, and returned by it to indicate what type of
   /// file could actually be made.
@@ -208,11 +238,11 @@ public:
   /// emitted.  Typically this will involve several steps of code generation.
   /// This method should return true if emission of this file type is not
   /// supported, or false on success.
-  virtual bool addPassesToEmitFile(PassManagerBase &, raw_pwrite_stream &,
-                                   CodeGenFileType,
-                                   bool /*DisableVerify*/ = true,
-                                   AnalysisID /*StartAfter*/ = nullptr,
-                                   AnalysisID /*StopAfter*/ = nullptr) {
+  virtual bool addPassesToEmitFile(
+      PassManagerBase &, raw_pwrite_stream &, CodeGenFileType,
+      bool /*DisableVerify*/ = true, AnalysisID /*StartBefore*/ = nullptr,
+      AnalysisID /*StartAfter*/ = nullptr, AnalysisID /*StopAfter*/ = nullptr,
+      MachineFunctionInitializer * /*MFInitializer*/ = nullptr) {
     return true;
   }
 
@@ -227,9 +257,22 @@ public:
     return true;
   }
 
+  /// True if subtarget inserts the final scheduling pass on its own.
+  ///
+  /// Branch relaxation, which must happen after block placement, can
+  /// on some targets (e.g. SystemZ) expose additional post-RA
+  /// scheduling opportunities.
+  virtual bool targetSchedulesPostRAScheduling() const { return false; };
+
   void getNameWithPrefix(SmallVectorImpl<char> &Name, const GlobalValue *GV,
                          Mangler &Mang, bool MayAlwaysUsePrivate = false) const;
   MCSymbol *getSymbol(const GlobalValue *GV, Mangler &Mang) const;
+
+  /// True if the target uses physical regs at Prolog/Epilog insertion
+  /// time. If true (most machines), all vregs must be allocated before
+  /// PEI. If false (virtual-register machines), then callee-save register
+  /// spilling and scavenging are not needed or used.
+  virtual bool usesPhysRegsForPEI() const { return true; }
 };
 
 /// This class describes a target machine that is implemented with the LLVM
@@ -238,7 +281,7 @@ public:
 class LLVMTargetMachine : public TargetMachine {
 protected: // Can only create subclasses.
   LLVMTargetMachine(const Target &T, StringRef DataLayoutString,
-                    StringRef TargetTriple, StringRef CPU, StringRef FS,
+                    const Triple &TargetTriple, StringRef CPU, StringRef FS,
                     TargetOptions Options, Reloc::Model RM, CodeModel::Model CM,
                     CodeGenOpt::Level OL);
 
@@ -256,10 +299,11 @@ public:
 
   /// Add passes to the specified pass manager to get the specified file
   /// emitted.  Typically this will involve several steps of code generation.
-  bool addPassesToEmitFile(PassManagerBase &PM, raw_pwrite_stream &Out,
-                           CodeGenFileType FileType, bool DisableVerify = true,
-                           AnalysisID StartAfter = nullptr,
-                           AnalysisID StopAfter = nullptr) override;
+  bool addPassesToEmitFile(
+      PassManagerBase &PM, raw_pwrite_stream &Out, CodeGenFileType FileType,
+      bool DisableVerify = true, AnalysisID StartBefore = nullptr,
+      AnalysisID StartAfter = nullptr, AnalysisID StopAfter = nullptr,
+      MachineFunctionInitializer *MFInitializer = nullptr) override;
 
   /// Add passes to the specified pass manager to get machine code emitted with
   /// the MCJIT. This method returns true if machine code is not supported. It
@@ -268,6 +312,13 @@ public:
   bool addPassesToEmitMC(PassManagerBase &PM, MCContext *&Ctx,
                          raw_pwrite_stream &OS,
                          bool DisableVerify = true) override;
+
+  /// Add MachineModuleInfo pass to pass manager.
+  MachineModuleInfo &addMachineModuleInfo(PassManagerBase &PM) const;
+
+  /// Add MachineFunctionAnalysis pass to pass manager.
+  void addMachineFunctionAnalysis(PassManagerBase &PM,
+      MachineFunctionInitializer *MFInitializer) const;
 };
 
 } // End llvm namespace

@@ -11,7 +11,9 @@ add_llvm_library(LLVMTransformUtils
   CodeExtractor.cpp
   CtorUtils.cpp
   DemoteRegToStack.cpp
+  Evaluator.cpp
   FlattenCFG.cpp
+  FunctionImportUtils.cpp
   GlobalStatus.cpp
   InlineFunction.cpp
   InstructionNamer.cpp
@@ -22,17 +24,22 @@ add_llvm_library(LLVMTransformUtils
   LoopUnroll.cpp
   LoopUnrollRuntime.cpp
   LoopUtils.cpp
+  LoopVersioning.cpp
   LowerInvoke.cpp
   LowerSwitch.cpp
   Mem2Reg.cpp
+  MemorySSA.cpp
   MetaRenamer.cpp
   ModuleUtils.cpp
+  NameAnonFunctions.cpp
   PromoteMemoryToRegister.cpp
   SSAUpdater.cpp
+  SanitizerStats.cpp
   SimplifyCFG.cpp
   SimplifyIndVar.cpp
   SimplifyInstructions.cpp
   SimplifyLibCalls.cpp
+  SplitModule.cpp
   SymbolRewriter.cpp
   UnifyFunctionExitNodes.cpp
   Utils.cpp

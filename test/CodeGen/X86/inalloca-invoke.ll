@@ -4,13 +4,14 @@
 
 %frame.reverse = type { %Iter, %Iter }
 
+declare i32 @pers(...)
 declare void @llvm.stackrestore(i8*)
 declare i8* @llvm.stacksave()
 declare void @begin(%Iter* sret)
 declare void @plus(%Iter* sret, %Iter*, i32)
 declare void @reverse(%frame.reverse* inalloca align 4)
 
-define i32 @main() {
+define i32 @main() personality i32 (...)* @pers {
   %temp.lvalue = alloca %Iter
   br label %blah
 
@@ -20,9 +21,10 @@ blah:
   %beg = getelementptr %frame.reverse, %frame.reverse* %rev_args, i32 0, i32 0
   %end = getelementptr %frame.reverse, %frame.reverse* %rev_args, i32 0, i32 1
 
-; CHECK:  calll   __chkstk
-; CHECK:  movl    %[[beg:[^,]*]], %esp
-; CHECK:  leal    12(%[[beg]]), %[[end:[^ ]*]]
+; CHECK:  pushl   %eax
+; CHECK:  subl    $20, %esp
+; CHECK:  movl %esp, %[[beg:[^ ]*]]
+; CHECK:  leal 12(%[[beg]]), %[[end:[^ ]*]]
 
   call void @begin(%Iter* sret %temp.lvalue)
 ; CHECK:  calll _begin
@@ -48,7 +50,7 @@ invoke.cont5:                                     ; preds = %invoke.cont
   ret i32 0
 
 lpad:                                             ; preds = %invoke.cont, %entry
-  %lp = landingpad { i8*, i32 } personality i8* null
+  %lp = landingpad { i8*, i32 }
           cleanup
   unreachable
 }

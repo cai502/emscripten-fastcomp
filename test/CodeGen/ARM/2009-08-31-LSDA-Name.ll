@@ -1,13 +1,15 @@
 ; RUN: llc < %s -mtriple=arm-apple-darwin9 -march=arm | FileCheck %s
 
-; CHECK: .cfi_lsda 16, [[LABEL:.*]]
-; CHECK: .long  [[LABEL]]-
-; CHECK: [[LABEL]]:
+; CHECK: ldr r0, [[CPI_PERSONALITY:[A-Za-z0-9_]+]]
+; CHECK: ldr r0, [[CPI_LSDA:[A-Za-z0-9_]+]]
+; CHECK: [[CPI_LSDA]]:
+; CHECK: .long  [[LSDA_LABEL:[A-Za-z0-9_]+]]-
+; CHECK: [[LSDA_LABEL]]:
 ; CHECK: .byte   255                     @ @LPStart Encoding = omit
 
 %struct.A = type { i32* }
 
-define void @"\01-[MyFunction Name:]"() {
+define void @"\01-[MyFunction Name:]"() personality i8* bitcast (i32 (...)* @__gxx_personality_sj0 to i8*) {
 entry:
   %save_filt.1 = alloca i32
   %save_eptr.0 = alloca i8*
@@ -39,7 +41,7 @@ return:                                           ; preds = %invcont
   ret void
 
 lpad:                                             ; preds = %entry
-  %exn = landingpad {i8*, i32} personality i8* bitcast (i32 (...)* @__gxx_personality_sj0 to i8*)
+  %exn = landingpad {i8*, i32}
            cleanup
   %eh_ptr = extractvalue {i8*, i32} %exn, 0
   store i8* %eh_ptr, i8** %eh_exception

@@ -57,10 +57,9 @@
 //   SLSR.
 #include <vector>
 
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/FoldingSet.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
@@ -68,11 +67,14 @@
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Utils/Local.h"
 
 using namespace llvm;
 using namespace PatternMatch;
 
 namespace {
+
+static const unsigned UnknownAddressSpace = ~0u;
 
 class StraightLineStrengthReduce : public FunctionPass {
 public:
@@ -129,7 +131,7 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequired<DominatorTreeWrapperPass>();
-    AU.addRequired<ScalarEvolution>();
+    AU.addRequired<ScalarEvolutionWrapperPass>();
     AU.addRequired<TargetTransformInfoWrapperPass>();
     // We do not modify the shape of the CFG.
     AU.setPreservesCFG();
@@ -210,7 +212,7 @@ char StraightLineStrengthReduce::ID = 0;
 INITIALIZE_PASS_BEGIN(StraightLineStrengthReduce, "slsr",
                       "Straight line strength reduction", false, false)
 INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(ScalarEvolution)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(TargetTransformInfoWrapperPass)
 INITIALIZE_PASS_END(StraightLineStrengthReduce, "slsr",
                     "Straight line strength reduction", false, false)
@@ -222,56 +224,32 @@ FunctionPass *llvm::createStraightLineStrengthReducePass() {
 bool StraightLineStrengthReduce::isBasisFor(const Candidate &Basis,
                                             const Candidate &C) {
   return (Basis.Ins != C.Ins && // skip the same instruction
+          // They must have the same type too. Basis.Base == C.Base doesn't
+          // guarantee their types are the same (PR23975).
+          Basis.Ins->getType() == C.Ins->getType() &&
           // Basis must dominate C in order to rewrite C with respect to Basis.
           DT->dominates(Basis.Ins->getParent(), C.Ins->getParent()) &&
           // They share the same base, stride, and candidate kind.
-          Basis.Base == C.Base &&
-          Basis.Stride == C.Stride &&
+          Basis.Base == C.Base && Basis.Stride == C.Stride &&
           Basis.CandidateKind == C.CandidateKind);
 }
 
 static bool isGEPFoldable(GetElementPtrInst *GEP,
-                          const TargetTransformInfo *TTI,
-                          const DataLayout *DL) {
-  GlobalVariable *BaseGV = nullptr;
-  int64_t BaseOffset = 0;
-  bool HasBaseReg = false;
-  int64_t Scale = 0;
-
-  if (GlobalVariable *GV = dyn_cast<GlobalVariable>(GEP->getPointerOperand()))
-    BaseGV = GV;
-  else
-    HasBaseReg = true;
-
-  gep_type_iterator GTI = gep_type_begin(GEP);
-  for (auto I = GEP->idx_begin(); I != GEP->idx_end(); ++I, ++GTI) {
-    if (isa<SequentialType>(*GTI)) {
-      int64_t ElementSize = DL->getTypeAllocSize(GTI.getIndexedType());
-      if (ConstantInt *ConstIdx = dyn_cast<ConstantInt>(*I)) {
-        BaseOffset += ConstIdx->getSExtValue() * ElementSize;
-      } else {
-        // Needs scale register.
-        if (Scale != 0) {
-          // No addressing mode takes two scale registers.
-          return false;
-        }
-        Scale = ElementSize;
-      }
-    } else {
-      StructType *STy = cast<StructType>(*GTI);
-      uint64_t Field = cast<ConstantInt>(*I)->getZExtValue();
-      BaseOffset += DL->getStructLayout(STy)->getElementOffset(Field);
-    }
-  }
-  return TTI->isLegalAddressingMode(GEP->getType()->getElementType(), BaseGV,
-                                    BaseOffset, HasBaseReg, Scale);
+                          const TargetTransformInfo *TTI) {
+  SmallVector<const Value*, 4> Indices;
+  for (auto I = GEP->idx_begin(); I != GEP->idx_end(); ++I)
+    Indices.push_back(*I);
+  return TTI->getGEPCost(GEP->getSourceElementType(), GEP->getPointerOperand(),
+                         Indices) == TargetTransformInfo::TCC_Free;
 }
 
 // Returns whether (Base + Index * Stride) can be folded to an addressing mode.
 static bool isAddFoldable(const SCEV *Base, ConstantInt *Index, Value *Stride,
                           TargetTransformInfo *TTI) {
-  return TTI->isLegalAddressingMode(Base->getType(), nullptr, 0, true,
-                                    Index->getSExtValue());
+  // Index->getSExtValue() may crash if Index is wider than 64-bit.
+  return Index->getBitWidth() <= 64 &&
+         TTI->isLegalAddressingMode(Base->getType(), nullptr, 0, true,
+                                    Index->getSExtValue(), UnknownAddressSpace);
 }
 
 bool StraightLineStrengthReduce::isFoldable(const Candidate &C,
@@ -280,7 +258,7 @@ bool StraightLineStrengthReduce::isFoldable(const Candidate &C,
   if (C.CandidateKind == Candidate::Add)
     return isAddFoldable(C.Base, C.Index, C.Stride, TTI);
   if (C.CandidateKind == Candidate::GEP)
-    return isGEPFoldable(cast<GetElementPtrInst>(C.Ins), TTI, DL);
+    return isGEPFoldable(cast<GetElementPtrInst>(C.Ins), TTI);
   return false;
 }
 
@@ -403,20 +381,37 @@ void StraightLineStrengthReduce::allocateCandidatesAndFindBasisForAdd(
   }
 }
 
+// Returns true if A matches B + C where C is constant.
+static bool matchesAdd(Value *A, Value *&B, ConstantInt *&C) {
+  return (match(A, m_Add(m_Value(B), m_ConstantInt(C))) ||
+          match(A, m_Add(m_ConstantInt(C), m_Value(B))));
+}
+
+// Returns true if A matches B | C where C is constant.
+static bool matchesOr(Value *A, Value *&B, ConstantInt *&C) {
+  return (match(A, m_Or(m_Value(B), m_ConstantInt(C))) ||
+          match(A, m_Or(m_ConstantInt(C), m_Value(B))));
+}
+
 void StraightLineStrengthReduce::allocateCandidatesAndFindBasisForMul(
     Value *LHS, Value *RHS, Instruction *I) {
   Value *B = nullptr;
   ConstantInt *Idx = nullptr;
-  // Only handle the canonical operand ordering.
-  if (match(LHS, m_Add(m_Value(B), m_ConstantInt(Idx)))) {
+  if (matchesAdd(LHS, B, Idx)) {
     // If LHS is in the form of "Base + Index", then I is in the form of
     // "(Base + Index) * RHS".
+    allocateCandidatesAndFindBasis(Candidate::Mul, SE->getSCEV(B), Idx, RHS, I);
+  } else if (matchesOr(LHS, B, Idx) && haveNoCommonBitsSet(B, Idx, *DL)) {
+    // If LHS is in the form of "Base | Index" and Base and Index have no common
+    // bits set, then
+    //   Base | Index = Base + Index
+    // and I is thus in the form of "(Base + Index) * RHS".
     allocateCandidatesAndFindBasis(Candidate::Mul, SE->getSCEV(B), Idx, RHS, I);
   } else {
     // Otherwise, at least try the form (LHS + 0) * RHS.
     ConstantInt *Zero = ConstantInt::get(cast<IntegerType>(I->getType()), 0);
     allocateCandidatesAndFindBasis(Candidate::Mul, SE->getSCEV(LHS), Zero, RHS,
-                                  I);
+                                   I);
   }
 }
 
@@ -490,31 +485,44 @@ void StraightLineStrengthReduce::allocateCandidatesAndFindBasisForGEP(
   if (GEP->getType()->isVectorTy())
     return;
 
-  const SCEV *GEPExpr = SE->getSCEV(GEP);
-  Type *IntPtrTy = DL->getIntPtrType(GEP->getType());
+  SmallVector<const SCEV *, 4> IndexExprs;
+  for (auto I = GEP->idx_begin(); I != GEP->idx_end(); ++I)
+    IndexExprs.push_back(SE->getSCEV(*I));
 
   gep_type_iterator GTI = gep_type_begin(GEP);
-  for (auto I = GEP->idx_begin(); I != GEP->idx_end(); ++I) {
+  for (unsigned I = 1, E = GEP->getNumOperands(); I != E; ++I) {
     if (!isa<SequentialType>(*GTI++))
       continue;
-    Value *ArrayIdx = *I;
-    // Compute the byte offset of this index.
+
+    const SCEV *OrigIndexExpr = IndexExprs[I - 1];
+    IndexExprs[I - 1] = SE->getZero(OrigIndexExpr->getType());
+
+    // The base of this candidate is GEP's base plus the offsets of all
+    // indices except this current one.
+    const SCEV *BaseExpr = SE->getGEPExpr(GEP->getSourceElementType(),
+                                          SE->getSCEV(GEP->getPointerOperand()),
+                                          IndexExprs, GEP->isInBounds());
+    Value *ArrayIdx = GEP->getOperand(I);
     uint64_t ElementSize = DL->getTypeAllocSize(*GTI);
-    const SCEV *ElementSizeExpr = SE->getSizeOfExpr(IntPtrTy, *GTI);
-    const SCEV *ArrayIdxExpr = SE->getSCEV(ArrayIdx);
-    ArrayIdxExpr = SE->getTruncateOrSignExtend(ArrayIdxExpr, IntPtrTy);
-    const SCEV *LocalOffset =
-        SE->getMulExpr(ArrayIdxExpr, ElementSizeExpr, SCEV::FlagNSW);
-    // The base of this candidate equals GEPExpr less the byte offset of this
-    // index.
-    const SCEV *Base = SE->getMinusSCEV(GEPExpr, LocalOffset);
-    factorArrayIndex(ArrayIdx, Base, ElementSize, GEP);
+    if (ArrayIdx->getType()->getIntegerBitWidth() <=
+        DL->getPointerSizeInBits(GEP->getAddressSpace())) {
+      // Skip factoring if ArrayIdx is wider than the pointer size, because
+      // ArrayIdx is implicitly truncated to the pointer size.
+      factorArrayIndex(ArrayIdx, BaseExpr, ElementSize, GEP);
+    }
     // When ArrayIdx is the sext of a value, we try to factor that value as
     // well.  Handling this case is important because array indices are
     // typically sign-extended to the pointer size.
     Value *TruncatedArrayIdx = nullptr;
-    if (match(ArrayIdx, m_SExt(m_Value(TruncatedArrayIdx))))
-      factorArrayIndex(TruncatedArrayIdx, Base, ElementSize, GEP);
+    if (match(ArrayIdx, m_SExt(m_Value(TruncatedArrayIdx))) &&
+        TruncatedArrayIdx->getType()->getIntegerBitWidth() <=
+            DL->getPointerSizeInBits(GEP->getAddressSpace())) {
+      // Skip factoring if TruncatedArrayIdx is wider than the pointer size,
+      // because TruncatedArrayIdx is implicitly truncated to the pointer size.
+      factorArrayIndex(TruncatedArrayIdx, BaseExpr, ElementSize, GEP);
+    }
+
+    IndexExprs[I - 1] = OrigIndexExpr;
   }
 }
 
@@ -540,10 +548,10 @@ Value *StraightLineStrengthReduce::emitBump(const Candidate &Basis,
     APInt ElementSize(
         IndexOffset.getBitWidth(),
         DL->getTypeAllocSize(
-            cast<GetElementPtrInst>(Basis.Ins)->getType()->getElementType()));
+            cast<GetElementPtrInst>(Basis.Ins)->getResultElementType()));
     APInt Q, R;
     APInt::sdivrem(IndexOffset, ElementSize, Q, R);
-    if (R.getSExtValue() == 0)
+    if (R == 0)
       IndexOffset = Q;
     else
       BumpWithUglyGEP = true;
@@ -551,10 +559,10 @@ Value *StraightLineStrengthReduce::emitBump(const Candidate &Basis,
 
   // Compute Bump = C - Basis = (i' - i) * S.
   // Common case 1: if (i' - i) is 1, Bump = S.
-  if (IndexOffset.getSExtValue() == 1)
+  if (IndexOffset == 1)
     return C.Stride;
   // Common case 2: if (i' - i) is -1, Bump = -S.
-  if (IndexOffset.getSExtValue() == -1)
+  if (IndexOffset.isAllOnesValue())
     return Builder.CreateNeg(C.Stride);
 
   // Otherwise, Bump = (i' - i) * sext/trunc(S). Note that (i' - i) and S may
@@ -599,10 +607,24 @@ void StraightLineStrengthReduce::rewriteCandidateWithBasis(
   switch (C.CandidateKind) {
   case Candidate::Add:
   case Candidate::Mul:
+    // C = Basis + Bump
     if (BinaryOperator::isNeg(Bump)) {
+      // If Bump is a neg instruction, emit C = Basis - (-Bump).
       Reduced =
           Builder.CreateSub(Basis.Ins, BinaryOperator::getNegArgument(Bump));
+      // We only use the negative argument of Bump, and Bump itself may be
+      // trivially dead.
+      RecursivelyDeleteTriviallyDeadInstructions(Bump);
     } else {
+      // It's tempting to preserve nsw on Bump and/or Reduced. However, it's
+      // usually unsound, e.g.,
+      //
+      // X = (-2 +nsw 1) *nsw INT_MAX
+      // Y = (-2 +nsw 3) *nsw INT_MAX
+      //   =>
+      // Y = X + 2 * INT_MAX
+      //
+      // Neither + and * in the resultant expression are nsw.
       Reduced = Builder.CreateAdd(Basis.Ins, Bump);
     }
     break;
@@ -637,7 +659,6 @@ void StraightLineStrengthReduce::rewriteCandidateWithBasis(
   };
   Reduced->takeName(C.Ins);
   C.Ins->replaceAllUsesWith(Reduced);
-  C.Ins->dropAllReferences();
   // Unlink C.Ins so that we can skip other candidates also corresponding to
   // C.Ins. The actual deletion is postponed to the end of runOnFunction.
   C.Ins->removeFromParent();
@@ -645,12 +666,12 @@ void StraightLineStrengthReduce::rewriteCandidateWithBasis(
 }
 
 bool StraightLineStrengthReduce::runOnFunction(Function &F) {
-  if (skipOptnoneFunction(F))
+  if (skipFunction(F))
     return false;
 
   TTI = &getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
   DT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-  SE = &getAnalysis<ScalarEvolution>();
+  SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   // Traverse the dominator tree in the depth-first order. This order makes sure
   // all bases of a candidate are in Candidates when we process it.
   for (auto node = GraphTraits<DominatorTree *>::nodes_begin(DT);
@@ -670,8 +691,13 @@ bool StraightLineStrengthReduce::runOnFunction(Function &F) {
   }
 
   // Delete all unlink instructions.
-  for (auto I : UnlinkedInstructions) {
-    delete I;
+  for (auto *UnlinkedInst : UnlinkedInstructions) {
+    for (unsigned I = 0, E = UnlinkedInst->getNumOperands(); I != E; ++I) {
+      Value *Op = UnlinkedInst->getOperand(I);
+      UnlinkedInst->setOperand(I, nullptr);
+      RecursivelyDeleteTriviallyDeadInstructions(Op);
+    }
+    delete UnlinkedInst;
   }
   bool Ret = !UnlinkedInstructions.empty();
   UnlinkedInstructions.clear();

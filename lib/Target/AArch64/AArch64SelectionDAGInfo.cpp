@@ -16,13 +16,8 @@ using namespace llvm;
 
 #define DEBUG_TYPE "aarch64-selectiondag-info"
 
-AArch64SelectionDAGInfo::AArch64SelectionDAGInfo(const DataLayout *DL)
-    : TargetSelectionDAGInfo(DL) {}
-
-AArch64SelectionDAGInfo::~AArch64SelectionDAGInfo() {}
-
 SDValue AArch64SelectionDAGInfo::EmitTargetCodeForMemset(
-    SelectionDAG &DAG, SDLoc dl, SDValue Chain, SDValue Dst, SDValue Src,
+    SelectionDAG &DAG, const SDLoc &dl, SDValue Chain, SDValue Dst, SDValue Src,
     SDValue Size, unsigned Align, bool isVolatile,
     MachinePointerInfo DstPtrInfo) const {
   // Check to see if there is a specialized entry-point for memory zeroing.
@@ -37,8 +32,8 @@ SDValue AArch64SelectionDAGInfo::EmitTargetCodeForMemset(
   if (bzeroEntry && (!SizeValue || SizeValue->getZExtValue() > 256)) {
     const AArch64TargetLowering &TLI = *STI.getTargetLowering();
 
-    EVT IntPtr = TLI.getPointerTy();
-    Type *IntPtrTy = getDataLayout()->getIntPtrType(*DAG.getContext());
+    EVT IntPtr = TLI.getPointerTy(DAG.getDataLayout());
+    Type *IntPtrTy = DAG.getDataLayout().getIntPtrType(*DAG.getContext());
     TargetLowering::ArgListTy Args;
     TargetLowering::ArgListEntry Entry;
     Entry.Node = Dst;
@@ -49,10 +44,16 @@ SDValue AArch64SelectionDAGInfo::EmitTargetCodeForMemset(
     TargetLowering::CallLoweringInfo CLI(DAG);
     CLI.setDebugLoc(dl).setChain(Chain)
       .setCallee(CallingConv::C, Type::getVoidTy(*DAG.getContext()),
-                 DAG.getExternalSymbol(bzeroEntry, IntPtr), std::move(Args), 0)
+                 DAG.getExternalSymbol(bzeroEntry, IntPtr), std::move(Args))
       .setDiscardResult();
     std::pair<SDValue, SDValue> CallResult = TLI.LowerCallTo(CLI);
     return CallResult.second;
   }
   return SDValue();
+}
+bool AArch64SelectionDAGInfo::generateFMAsInMachineCombiner(
+    CodeGenOpt::Level OptLevel) const {
+  if (OptLevel >= CodeGenOpt::Aggressive)
+    return true;
+  return false;
 }

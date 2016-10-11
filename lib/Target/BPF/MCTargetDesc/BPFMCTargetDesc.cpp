@@ -15,7 +15,6 @@
 #include "BPFMCTargetDesc.h"
 #include "BPFMCAsmInfo.h"
 #include "InstPrinter/BPFInstPrinter.h"
-#include "llvm/MC/MCCodeGenInfo.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCStreamer.h"
@@ -40,25 +39,15 @@ static MCInstrInfo *createBPFMCInstrInfo() {
   return X;
 }
 
-static MCRegisterInfo *createBPFMCRegisterInfo(StringRef TT) {
+static MCRegisterInfo *createBPFMCRegisterInfo(const Triple &TT) {
   MCRegisterInfo *X = new MCRegisterInfo();
   InitBPFMCRegisterInfo(X, BPF::R11 /* RAReg doesn't exist */);
   return X;
 }
 
-static MCSubtargetInfo *createBPFMCSubtargetInfo(StringRef TT, StringRef CPU,
-                                                 StringRef FS) {
-  MCSubtargetInfo *X = new MCSubtargetInfo();
-  InitBPFMCSubtargetInfo(X, TT, CPU, FS);
-  return X;
-}
-
-static MCCodeGenInfo *createBPFMCCodeGenInfo(StringRef TT, Reloc::Model RM,
-                                             CodeModel::Model CM,
-                                             CodeGenOpt::Level OL) {
-  MCCodeGenInfo *X = new MCCodeGenInfo();
-  X->InitMCCodeGenInfo(RM, CM, OL);
-  return X;
+static MCSubtargetInfo *createBPFMCSubtargetInfo(const Triple &TT,
+                                                 StringRef CPU, StringRef FS) {
+  return createBPFMCSubtargetInfoImpl(TT, CPU, FS);
 }
 
 static MCStreamer *createBPFMCStreamer(const Triple &T,
@@ -79,32 +68,40 @@ static MCInstPrinter *createBPFMCInstPrinter(const Triple &T,
 }
 
 extern "C" void LLVMInitializeBPFTargetMC() {
-  // Register the MC asm info.
-  RegisterMCAsmInfo<BPFMCAsmInfo> X(TheBPFTarget);
+  for (Target *T : {&TheBPFleTarget, &TheBPFbeTarget, &TheBPFTarget}) {
+    // Register the MC asm info.
+    RegisterMCAsmInfo<BPFMCAsmInfo> X(*T);
 
-  // Register the MC codegen info.
-  TargetRegistry::RegisterMCCodeGenInfo(TheBPFTarget, createBPFMCCodeGenInfo);
+    // Register the MC instruction info.
+    TargetRegistry::RegisterMCInstrInfo(*T, createBPFMCInstrInfo);
 
-  // Register the MC instruction info.
-  TargetRegistry::RegisterMCInstrInfo(TheBPFTarget, createBPFMCInstrInfo);
+    // Register the MC register info.
+    TargetRegistry::RegisterMCRegInfo(*T, createBPFMCRegisterInfo);
 
-  // Register the MC register info.
-  TargetRegistry::RegisterMCRegInfo(TheBPFTarget, createBPFMCRegisterInfo);
+    // Register the MC subtarget info.
+    TargetRegistry::RegisterMCSubtargetInfo(*T,
+                                            createBPFMCSubtargetInfo);
 
-  // Register the MC subtarget info.
-  TargetRegistry::RegisterMCSubtargetInfo(TheBPFTarget,
-                                          createBPFMCSubtargetInfo);
+    // Register the object streamer
+    TargetRegistry::RegisterELFStreamer(*T, createBPFMCStreamer);
+
+    // Register the MCInstPrinter.
+    TargetRegistry::RegisterMCInstPrinter(*T, createBPFMCInstPrinter);
+  }
 
   // Register the MC code emitter
-  TargetRegistry::RegisterMCCodeEmitter(TheBPFTarget,
-                                        llvm::createBPFMCCodeEmitter);
+  TargetRegistry::RegisterMCCodeEmitter(TheBPFleTarget, createBPFMCCodeEmitter);
+  TargetRegistry::RegisterMCCodeEmitter(TheBPFbeTarget, createBPFbeMCCodeEmitter);
 
   // Register the ASM Backend
-  TargetRegistry::RegisterMCAsmBackend(TheBPFTarget, createBPFAsmBackend);
+  TargetRegistry::RegisterMCAsmBackend(TheBPFleTarget, createBPFAsmBackend);
+  TargetRegistry::RegisterMCAsmBackend(TheBPFbeTarget, createBPFbeAsmBackend);
 
-  // Register the object streamer
-  TargetRegistry::RegisterELFStreamer(TheBPFTarget, createBPFMCStreamer);
-
-  // Register the MCInstPrinter.
-  TargetRegistry::RegisterMCInstPrinter(TheBPFTarget, createBPFMCInstPrinter);
+  if (sys::IsLittleEndianHost) {
+    TargetRegistry::RegisterMCCodeEmitter(TheBPFTarget, createBPFMCCodeEmitter);
+    TargetRegistry::RegisterMCAsmBackend(TheBPFTarget, createBPFAsmBackend);
+  } else {
+    TargetRegistry::RegisterMCCodeEmitter(TheBPFTarget, createBPFbeMCCodeEmitter);
+    TargetRegistry::RegisterMCAsmBackend(TheBPFTarget, createBPFbeAsmBackend);
+  }
 }

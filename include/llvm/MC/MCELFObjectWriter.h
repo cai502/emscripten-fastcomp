@@ -11,30 +11,43 @@
 #define LLVM_MC_MCELFOBJECTWRITER_H
 
 #include "llvm/ADT/Triple.h"
+#include "llvm/MC/MCValue.h"
 #include "llvm/Support/DataTypes.h"
 #include "llvm/Support/ELF.h"
+#include "llvm/Support/raw_ostream.h"
 #include <vector>
 
 namespace llvm {
 class MCAssembler;
+class MCContext;
 class MCFixup;
 class MCFragment;
 class MCObjectWriter;
-class MCSectionData;
 class MCSymbol;
-class MCSymbolData;
+class MCSymbolELF;
 class MCValue;
 class raw_pwrite_stream;
 
 struct ELFRelocationEntry {
   uint64_t Offset; // Where is the relocation.
-  const MCSymbol *Symbol;       // The symbol to relocate with.
+  const MCSymbolELF *Symbol; // The symbol to relocate with.
   unsigned Type;   // The type of the relocation.
   uint64_t Addend; // The addend to use.
+  const MCSymbolELF *OriginalSymbol; // The original value of Symbol if we changed it.
+  uint64_t OriginalAddend; // The original value of addend.
 
-  ELFRelocationEntry(uint64_t Offset, const MCSymbol *Symbol, unsigned Type,
-                     uint64_t Addend)
-      : Offset(Offset), Symbol(Symbol), Type(Type), Addend(Addend) {}
+  ELFRelocationEntry(uint64_t Offset, const MCSymbolELF *Symbol, unsigned Type,
+                     uint64_t Addend, const MCSymbolELF *OriginalSymbol,
+                     uint64_t OriginalAddend)
+      : Offset(Offset), Symbol(Symbol), Type(Type), Addend(Addend),
+        OriginalSymbol(OriginalSymbol), OriginalAddend(OriginalAddend) {}
+
+  void print(raw_ostream &Out) const {
+    Out << "Off=" << Offset << ", Sym=" << Symbol << ", Type=" << Type
+        << ", Addend=" << Addend << ", OriginalSymbol=" << OriginalSymbol
+        << ", OriginalAddend=" << OriginalAddend;
+  }
+  void dump() const { print(errs()); }
 };
 
 class MCELFObjectTargetWriter {
@@ -58,8 +71,6 @@ public:
       case Triple::PS4:
       case Triple::FreeBSD:
         return ELF::ELFOSABI_FREEBSD;
-      case Triple::Linux:
-        return ELF::ELFOSABI_LINUX;
       default:
         return ELF::ELFOSABI_NONE;
     }
@@ -67,16 +78,16 @@ public:
 
   virtual ~MCELFObjectTargetWriter() {}
 
-  virtual unsigned GetRelocType(const MCValue &Target, const MCFixup &Fixup,
-                                bool IsPCRel) const = 0;
+  virtual unsigned getRelocType(MCContext &Ctx, const MCValue &Target,
+                                const MCFixup &Fixup, bool IsPCRel) const = 0;
 
-  virtual bool needsRelocateWithSymbol(const MCSymbolData &SD,
+  virtual bool needsRelocateWithSymbol(const MCSymbol &Sym,
                                        unsigned Type) const;
 
   virtual void sortRelocs(const MCAssembler &Asm,
                           std::vector<ELFRelocationEntry> &Relocs);
 
-  /// @name Accessors
+  /// \name Accessors
   /// @{
   uint8_t getOSABI() const { return OSABI; }
   uint16_t getEMachine() const { return EMachine; }

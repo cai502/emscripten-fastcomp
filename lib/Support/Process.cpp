@@ -29,6 +29,7 @@ using namespace sys;
 Optional<std::string> Process::FindInEnvPath(const std::string& EnvName,
                                              const std::string& FileName)
 {
+  assert(!path::is_absolute(FileName));
   Optional<std::string> FoundPath;
   Optional<std::string> OptPath = Process::GetEnv(EnvName);
   if (!OptPath.hasValue())
@@ -71,6 +72,13 @@ static const char colorcodes[2][2][8][10] = {
  { ALLCOLORS("3",""), ALLCOLORS("3","1;") },
  { ALLCOLORS("4",""), ALLCOLORS("4","1;") }
 };
+
+// This is set to true when Process::PreventCoreFiles() is called.
+static bool coreFilesPrevented = false;
+
+bool Process::AreCoreFilesPrevented() {
+  return coreFilesPrevented;
+}
 
 // Include the platform-specific parts of this class.
 #ifdef LLVM_ON_UNIX

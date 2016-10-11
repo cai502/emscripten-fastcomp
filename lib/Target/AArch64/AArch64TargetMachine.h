@@ -27,9 +27,9 @@ protected:
   mutable StringMap<std::unique_ptr<AArch64Subtarget>> SubtargetMap;
 
 public:
-  AArch64TargetMachine(const Target &T, StringRef TT, StringRef CPU,
+  AArch64TargetMachine(const Target &T, const Triple &TT, StringRef CPU,
                        StringRef FS, const TargetOptions &Options,
-                       Reloc::Model RM, CodeModel::Model CM,
+                       Optional<Reloc::Model> RM, CodeModel::Model CM,
                        CodeGenOpt::Level OL, bool IsLittleEndian);
 
   ~AArch64TargetMachine() override;
@@ -46,28 +46,28 @@ public:
   }
 
 private:
-  bool isLittle;
+  AArch64Subtarget Subtarget;
 };
 
-// AArch64leTargetMachine - AArch64 little endian target machine.
+// AArch64 little endian target machine.
 //
 class AArch64leTargetMachine : public AArch64TargetMachine {
   virtual void anchor();
 public:
-  AArch64leTargetMachine(const Target &T, StringRef TT, StringRef CPU,
+  AArch64leTargetMachine(const Target &T, const Triple &TT, StringRef CPU,
                          StringRef FS, const TargetOptions &Options,
-                         Reloc::Model RM, CodeModel::Model CM,
+                         Optional<Reloc::Model> RM, CodeModel::Model CM,
                          CodeGenOpt::Level OL);
 };
 
-// AArch64beTargetMachine - AArch64 big endian target machine.
+// AArch64 big endian target machine.
 //
 class AArch64beTargetMachine : public AArch64TargetMachine {
   virtual void anchor();
 public:
-  AArch64beTargetMachine(const Target &T, StringRef TT, StringRef CPU,
+  AArch64beTargetMachine(const Target &T, const Triple &TT, StringRef CPU,
                          StringRef FS, const TargetOptions &Options,
-                         Reloc::Model RM, CodeModel::Model CM,
+                         Optional<Reloc::Model> RM, CodeModel::Model CM,
                          CodeGenOpt::Level OL);
 };
 

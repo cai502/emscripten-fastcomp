@@ -21,10 +21,10 @@
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/FormattedStream.h"
-#include <map>
 using namespace llvm;
 
 #define DEBUG_TYPE "asm-printer"
@@ -48,7 +48,7 @@ void X86ATTInstPrinter::printInst(const MCInst *MI, raw_ostream &OS,
         EmitAnyX86InstComments(MI, *CommentStream, getRegisterName);
 
   if (TSFlags & X86II::LOCK)
-    OS << "\tlock\n";
+    OS << "\tlock\t";
 
   // Output CALLpcrel32 as "callq" in 64-bit mode.
   // In Intel annotation it's always emitted as "call".
@@ -57,7 +57,7 @@ void X86ATTInstPrinter::printInst(const MCInst *MI, raw_ostream &OS,
   // InstrInfo.td as soon as Requires clause is supported properly
   // for InstAlias.
   if (MI->getOpcode() == X86::CALLpcrel32 &&
-      (STI.getFeatureBits() & X86::Mode64Bit) != 0) {
+      (STI.getFeatureBits()[X86::Mode64Bit])) {
     OS << "\tcallq\t";
     printPCRelImm(MI, 0, OS);
   }
@@ -150,11 +150,11 @@ void X86ATTInstPrinter::printPCRelImm(const MCInst *MI, unsigned OpNo,
     // that address in hex.
     const MCConstantExpr *BranchTarget = dyn_cast<MCConstantExpr>(Op.getExpr());
     int64_t Address;
-    if (BranchTarget && BranchTarget->EvaluateAsAbsolute(Address)) {
+    if (BranchTarget && BranchTarget->evaluateAsAbsolute(Address)) {
       O << formatHex((uint64_t)Address);
     } else {
       // Otherwise, just print the expression.
-      O << *Op.getExpr();
+      Op.getExpr()->print(O, &MAI);
     }
   }
 }
@@ -165,20 +165,30 @@ void X86ATTInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
   if (Op.isReg()) {
     printRegName(O, Op.getReg());
   } else if (Op.isImm()) {
-    // Print X86 immediates as signed values.
-    O << markup("<imm:") << '$' << formatImm((int64_t)Op.getImm())
-      << markup(">");
+    // Print immediates as signed values.
+    int64_t Imm = Op.getImm();
+    O << markup("<imm:") << '$' << formatImm(Imm) << markup(">");
+
+    // TODO: This should be in a helper function in the base class, so it can
+    // be used by other printers.
 
     // If there are no instruction-specific comments, add a comment clarifying
     // the hex value of the immediate operand when it isn't in the range
     // [-256,255].
-    if (CommentStream && !HasCustomInstComment &&
-        (Op.getImm() > 255 || Op.getImm() < -256))
-      *CommentStream << format("imm = 0x%" PRIX64 "\n", (uint64_t)Op.getImm());
-
+    if (CommentStream && !HasCustomInstComment && (Imm > 255 || Imm < -256)) {
+      // Don't print unnecessary hex sign bits. 
+      if (Imm == (int16_t)(Imm))
+        *CommentStream << format("imm = 0x%" PRIX16 "\n", (uint16_t)Imm);
+      else if (Imm == (int32_t)(Imm))
+        *CommentStream << format("imm = 0x%" PRIX32 "\n", (uint32_t)Imm);
+      else
+        *CommentStream << format("imm = 0x%" PRIX64 "\n", (uint64_t)Imm);
+    }
   } else {
     assert(Op.isExpr() && "unknown operand kind in printOperand");
-    O << markup("<imm:") << '$' << *Op.getExpr() << markup(">");
+    O << markup("<imm:") << '$';
+    Op.getExpr()->print(O, &MAI);
+    O << markup(">");
   }
 }
 
@@ -203,7 +213,7 @@ void X86ATTInstPrinter::printMemReference(const MCInst *MI, unsigned Op,
       O << formatImm(DispVal);
   } else {
     assert(DispSpec.isExpr() && "non-immediate displacement for LEA?");
-    O << *DispSpec.getExpr();
+    DispSpec.getExpr()->print(O, &MAI);
   }
 
   if (IndexReg.getReg() || BaseReg.getReg()) {
@@ -273,7 +283,7 @@ void X86ATTInstPrinter::printMemOffset(const MCInst *MI, unsigned Op,
     O << formatImm(DispSpec.getImm());
   } else {
     assert(DispSpec.isExpr() && "non-immediate displacement?");
-    O << *DispSpec.getExpr();
+    DispSpec.getExpr()->print(O, &MAI);
   }
 
   O << markup(">");

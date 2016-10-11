@@ -201,6 +201,10 @@ let Namespace = "Mips" in {
   foreach I = 0-7 in
   def FCC#I : MipsReg<#I, "fcc"#I>;
 
+  // COP0 registers.
+  foreach I = 0-31 in
+  def COP0#I : MipsReg<#I, ""#I>;
+
   // COP2 registers.
   foreach I = 0-31 in
   def COP2#I : MipsReg<#I, ""#I>;
@@ -326,6 +330,12 @@ def GPR64 : RegisterClass<"Mips", [i64], 64, (add
   // Reserved
   K0_64, K1_64, GP_64, SP_64, FP_64, RA_64)>;
 
+def GPRMM16_64 : RegisterClass<"Mips", [i64], 64, (add
+  // Callee save
+  S0_64, S1_64,
+  // Return Values and Arguments
+  V0_64, V1_64, A0_64, A1_64, A2_64, A3_64)>;
+
 def CPU16Regs : RegisterClass<"Mips", [i32], 32, (add
   // Return Values and Arguments
   V0, V1, A0, A1, A2, A3,
@@ -431,6 +441,10 @@ def ACC64DSP : RegisterClass<"Mips", [untyped], 64, (sequence "AC%u", 0, 3)> {
 
 def DSPCC : RegisterClass<"Mips", [v4i8, v2i16], 32, (add DSPCCond)>;
 
+// Coprocessor 0 registers.
+def COP0 : RegisterClass<"Mips", [i32], 32, (sequence "COP0%u", 0, 31)>,
+           Unallocatable;
+
 // Coprocessor 2 registers.
 def COP2 : RegisterClass<"Mips", [i32], 32, (sequence "COP2%u", 0, 31)>,
            Unallocatable;
@@ -438,6 +452,13 @@ def COP2 : RegisterClass<"Mips", [i32], 32, (sequence "COP2%u", 0, 31)>,
 // Coprocessor 3 registers.
 def COP3 : RegisterClass<"Mips", [i32], 32, (sequence "COP3%u", 0, 31)>,
            Unallocatable;
+
+// Stack pointer and global pointer classes for instructions that are limited
+// to a single register such as lwgp/lwsp in microMIPS.
+def SP32 : RegisterClass<"Mips", [i32], 32, (add SP)>, Unallocatable;
+def SP64 : RegisterClass<"Mips", [i64], 64, (add SP_64)>, Unallocatable;
+def GP32 : RegisterClass<"Mips", [i32], 32, (add GP)>, Unallocatable;
+def GP64 : RegisterClass<"Mips", [i64], 64, (add GP_64)>, Unallocatable;
 
 // Octeon multiplier and product registers
 def OCTEON_MPL : RegisterClass<"Mips", [i64], 64, (add MPL0, MPL1, MPL2)>,
@@ -559,6 +580,10 @@ def HWRegsAsmOperand : MipsAsmRegOperand {
   let Name = "HWRegsAsmReg";
 }
 
+def COP0AsmOperand : MipsAsmRegOperand {
+  let Name = "COP0AsmReg";
+}
+
 def COP2AsmOperand : MipsAsmRegOperand {
   let Name = "COP2AsmReg";
 }
@@ -607,6 +632,10 @@ def HI32DSPOpnd : RegisterOperand<HI32DSP> {
 
 def ACC64DSPOpnd : RegisterOperand<ACC64DSP> {
   let ParserMatchClass = ACC64DSPAsmOperand;
+}
+
+def COP0Opnd : RegisterOperand<COP0> {
+  let ParserMatchClass = COP0AsmOperand;
 }
 
 def COP2Opnd : RegisterOperand<COP2> {

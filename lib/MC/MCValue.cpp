@@ -26,11 +26,11 @@ void MCValue::print(raw_ostream &OS) const {
   if (getRefKind())
     OS << ':' << getRefKind() <<  ':';
 
-  getSymA()->print(OS);
+  OS << *getSymA();
 
   if (getSymB()) {
     OS << " - ";
-    getSymB()->print(OS);
+    OS << *getSymB();
   }
 
   if (getConstant())
@@ -38,7 +38,7 @@ void MCValue::print(raw_ostream &OS) const {
 }
 
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
-void MCValue::dump() const {
+LLVM_DUMP_METHOD void MCValue::dump() const {
   print(dbgs());
 }
 #endif

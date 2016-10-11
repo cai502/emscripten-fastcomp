@@ -119,8 +119,7 @@ void Twine::printOneChildRepr(raw_ostream &OS, Child Ptr,
        << Ptr.stringRef << "\"";
     break;
   case Twine::SmallStringKind:
-    OS << "smallstring:\""
-       << *Ptr.smallString << "\"";
+    OS << "smallstring:\"" << *Ptr.smallString << "\"";
     break;
   case Twine::CharKind:
     OS << "char:\"" << Ptr.character << "\"";
@@ -162,7 +161,7 @@ void Twine::printRepr(raw_ostream &OS) const {
   OS << ")";
 }
 
-void Twine::dump() const {
+LLVM_DUMP_METHOD void Twine::dump() const {
   print(dbgs());
 }
 

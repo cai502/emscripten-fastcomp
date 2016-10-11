@@ -13,23 +13,12 @@
 
 #include "ARMMCAsmInfo.h"
 #include "llvm/ADT/Triple.h"
-#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
 
-// @LOCALMOD-BEGIN
-namespace llvm {
-cl::opt<bool>
-EnableARMDwarfEH("arm-enable-dwarf-eh",
-                 cl::desc("Use DWARF EH instead of EABI EH on ARM"),
-                 cl::init(false));
-}
-// @LOCALMOD-END
-
 void ARMMCAsmInfoDarwin::anchor() { }
 
-ARMMCAsmInfoDarwin::ARMMCAsmInfoDarwin(StringRef TT) {
-  Triple TheTriple(TT);
+ARMMCAsmInfoDarwin::ARMMCAsmInfoDarwin(const Triple &TheTriple) {
   if ((TheTriple.getArch() == Triple::armeb) ||
       (TheTriple.getArch() == Triple::thumbeb))
     IsLittleEndian = false;
@@ -43,15 +32,16 @@ ARMMCAsmInfoDarwin::ARMMCAsmInfoDarwin(StringRef TT) {
   SupportsDebugInformation = true;
 
   // Exceptions handling
-  ExceptionsType = ExceptionHandling::SjLj;
+  ExceptionsType = (TheTriple.isOSDarwin() && !TheTriple.isWatchABI())
+                       ? ExceptionHandling::SjLj
+                       : ExceptionHandling::DwarfCFI;
 
   UseIntegratedAssembler = true;
 }
 
 void ARMELFMCAsmInfo::anchor() { }
 
-ARMELFMCAsmInfo::ARMELFMCAsmInfo(StringRef TT) {
-  Triple TheTriple(TT);
+ARMELFMCAsmInfo::ARMELFMCAsmInfo(const Triple &TheTriple) {
   if ((TheTriple.getArch() == Triple::armeb) ||
       (TheTriple.getArch() == Triple::thumbeb))
     IsLittleEndian = false;
@@ -70,16 +60,12 @@ ARMELFMCAsmInfo::ARMELFMCAsmInfo(StringRef TT) {
   switch (TheTriple.getOS()) {
   case Triple::Bitrig:
   case Triple::NetBSD:
-  case Triple::NaCl: // @LOCALMOD: NaCl uses DWARF EH
     ExceptionsType = ExceptionHandling::DwarfCFI;
     break;
   default:
     ExceptionsType = ExceptionHandling::ARM;
     break;
   }
-  // @LOCALMOD: NonSFI mode uses DWARF EH
-  if (EnableARMDwarfEH)
-    ExceptionsType = ExceptionHandling::DwarfCFI;
 
   // foo(plt) instead of foo@plt
   UseParensForSymbolVariant = true;
@@ -125,3 +111,4 @@ ARMCOFFMCAsmInfoGNU::ARMCOFFMCAsmInfoGNU() {
   UseIntegratedAssembler = false;
   DwarfRegNumForCFI = true;
 }
+

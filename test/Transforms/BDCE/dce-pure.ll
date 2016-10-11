@@ -1,4 +1,5 @@
 ; RUN: opt -bdce -S < %s | FileCheck %s
+; RUN: opt -passes=bdce -S < %s | FileCheck %s
 
 declare i32 @strlen(i8*) readonly nounwind
 
@@ -11,7 +12,7 @@ define void @test1() {
 ; CHECK: ret void
 }
 
-define i32 @test2() {
+define i32 @test2() personality i32 (...)* @__gxx_personality_v0 {
   ; invoke of pure function should not be deleted!
   invoke i32 @strlen( i8* null ) readnone
                   to label %Cont unwind label %Other
@@ -20,7 +21,7 @@ Cont:           ; preds = %0
   ret i32 0
 
 Other:          ; preds = %0
-   %exn = landingpad {i8*, i32} personality i32 (...)* @__gxx_personality_v0
+   %exn = landingpad {i8*, i32}
             cleanup
   ret i32 1
 

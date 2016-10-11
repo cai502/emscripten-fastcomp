@@ -58,7 +58,8 @@ public:
                             const MCAsmLayout &Layout) const override {
     return false;
   }
-  void relaxInstruction(const MCInst &Inst, MCInst &Res) const override {
+  void relaxInstruction(const MCInst &Inst, const MCSubtargetInfo &STI,
+                        MCInst &Res) const override {
     llvm_unreachable("SystemZ does do not have assembler relaxation");
   }
   bool writeNopData(uint64_t Count, MCObjectWriter *OW) const override;
@@ -105,13 +106,13 @@ void SystemZMCAsmBackend::applyFixup(const MCFixup &Fixup, char *Data,
 bool SystemZMCAsmBackend::writeNopData(uint64_t Count,
                                        MCObjectWriter *OW) const {
   for (uint64_t I = 0; I != Count; ++I)
-    OW->Write8(7);
+    OW->write8(7);
   return true;
 }
 
 MCAsmBackend *llvm::createSystemZMCAsmBackend(const Target &T,
                                               const MCRegisterInfo &MRI,
-                                              StringRef TT, StringRef CPU) {
-  uint8_t OSABI = MCELFObjectTargetWriter::getOSABI(Triple(TT).getOS());
+                                              const Triple &TT, StringRef CPU) {
+  uint8_t OSABI = MCELFObjectTargetWriter::getOSABI(TT.getOS());
   return new SystemZMCAsmBackend(OSABI);
 }

@@ -15,7 +15,6 @@
 #include "AArch64ELFStreamer.h"
 #include "AArch64MCAsmInfo.h"
 #include "InstPrinter/AArch64InstPrinter.h"
-#include "llvm/MC/MCCodeGenInfo.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCStreamer.h"
@@ -41,32 +40,27 @@ static MCInstrInfo *createAArch64MCInstrInfo() {
 }
 
 static MCSubtargetInfo *
-createAArch64MCSubtargetInfo(StringRef TT, StringRef CPU, StringRef FS) {
-  MCSubtargetInfo *X = new MCSubtargetInfo();
-
+createAArch64MCSubtargetInfo(const Triple &TT, StringRef CPU, StringRef FS) {
   if (CPU.empty())
     CPU = "generic";
 
-  InitAArch64MCSubtargetInfo(X, TT, CPU, FS);
-  return X;
+  return createAArch64MCSubtargetInfoImpl(TT, CPU, FS);
 }
 
-static MCRegisterInfo *createAArch64MCRegisterInfo(StringRef Triple) {
+static MCRegisterInfo *createAArch64MCRegisterInfo(const Triple &Triple) {
   MCRegisterInfo *X = new MCRegisterInfo();
   InitAArch64MCRegisterInfo(X, AArch64::LR);
   return X;
 }
 
 static MCAsmInfo *createAArch64MCAsmInfo(const MCRegisterInfo &MRI,
-                                         StringRef TT) {
-  Triple TheTriple(TT);
-
+                                         const Triple &TheTriple) {
   MCAsmInfo *MAI;
-  if (TheTriple.isOSDarwin())
+  if (TheTriple.isOSBinFormatMachO())
     MAI = new AArch64MCAsmInfoDarwin();
   else {
     assert(TheTriple.isOSBinFormatELF() && "Only expect Darwin or ELF");
-    MAI = new AArch64MCAsmInfoELF(TT);
+    MAI = new AArch64MCAsmInfoELF(TheTriple);
   }
 
   // Initial state of the frame pointer is SP.
@@ -77,11 +71,9 @@ static MCAsmInfo *createAArch64MCAsmInfo(const MCRegisterInfo &MRI,
   return MAI;
 }
 
-static MCCodeGenInfo *createAArch64MCCodeGenInfo(StringRef TT, Reloc::Model RM,
-                                                 CodeModel::Model CM,
-                                                 CodeGenOpt::Level OL) {
-  Triple TheTriple(TT);
-  assert((TheTriple.isOSBinFormatELF() || TheTriple.isOSBinFormatMachO()) &&
+static void adjustCodeGenOpts(const Triple &TT, Reloc::Model RM,
+                              CodeModel::Model &CM) {
+  assert((TT.isOSBinFormatELF() || TT.isOSBinFormatMachO()) &&
          "Only expect Darwin and ELF targets");
 
   if (CM == CodeModel::Default)
@@ -94,19 +86,6 @@ static MCCodeGenInfo *createAArch64MCCodeGenInfo(StringRef TT, Reloc::Model RM,
   else if (CM != CodeModel::Small && CM != CodeModel::Large)
     report_fatal_error(
         "Only small and large code models are allowed on AArch64");
-
-  // AArch64 Darwin is always PIC.
-  if (TheTriple.isOSDarwin())
-    RM = Reloc::PIC_;
-  // On ELF platforms the default static relocation model has a smart enough
-  // linker to cope with referencing external symbols defined in a shared
-  // library. Hence DynamicNoPIC doesn't need to be promoted to PIC.
-  else if (RM == Reloc::Default || RM == Reloc::DynamicNoPIC)
-    RM = Reloc::Static;
-
-  MCCodeGenInfo *X = new MCCodeGenInfo();
-  X->InitMCCodeGenInfo(RM, CM, OL);
-  return X;
 }
 
 static MCInstPrinter *createAArch64MCInstPrinter(const Triple &T,
@@ -145,7 +124,7 @@ extern "C" void LLVMInitializeAArch64TargetMC() {
     RegisterMCAsmInfoFn X(*T, createAArch64MCAsmInfo);
 
     // Register the MC codegen info.
-    TargetRegistry::RegisterMCCodeGenInfo(*T, createAArch64MCCodeGenInfo);
+    TargetRegistry::registerMCAdjustCodeGenOpts(*T, adjustCodeGenOpts);
 
     // Register the MC instruction info.
     TargetRegistry::RegisterMCInstrInfo(*T, createAArch64MCInstrInfo);

@@ -15,7 +15,6 @@
 #define LLVM_LIB_TARGET_AARCH64_MCTARGETDESC_AARCH64MCTARGETDESC_H
 
 #include "llvm/Support/DataTypes.h"
-#include <string>
 
 namespace llvm {
 class formatted_raw_ostream;
@@ -43,11 +42,11 @@ MCCodeEmitter *createAArch64MCCodeEmitter(const MCInstrInfo &MCII,
                                           const MCRegisterInfo &MRI,
                                           MCContext &Ctx);
 MCAsmBackend *createAArch64leAsmBackend(const Target &T,
-                                        const MCRegisterInfo &MRI, StringRef TT,
-                                        StringRef CPU);
+                                        const MCRegisterInfo &MRI,
+                                        const Triple &TT, StringRef CPU);
 MCAsmBackend *createAArch64beAsmBackend(const Target &T,
-                                        const MCRegisterInfo &MRI, StringRef TT,
-                                        StringRef CPU);
+                                        const MCRegisterInfo &MRI,
+                                        const Triple &TT, StringRef CPU);
 
 MCObjectWriter *createAArch64ELFObjectWriter(raw_pwrite_stream &OS,
                                              uint8_t OSABI,

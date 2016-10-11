@@ -1,4 +1,5 @@
 ; RUN: opt < %s -reassociate -gvn -instcombine -S | FileCheck %s
+; RUN: opt < %s -passes='reassociate,gvn,instcombine' -S | FileCheck %s
 
 define i32 @test1(i32 %arg) {
   %tmp1 = sub i32 -12, %arg
@@ -169,7 +170,11 @@ define i32 @test11(i32 %W) {
 ; CHECK-NEXT: ret i32
 }
 
+declare void @mumble(i32)
+
 define i32 @test12(i32 %X) {
+  %X.neg = sub nsw nuw i32 0, %X
+  call void @mumble(i32 %X.neg)
   %A = sub i32 1, %X
   %B = sub i32 2, %X
   %C = sub i32 3, %X
@@ -177,8 +182,8 @@ define i32 @test12(i32 %X) {
   %Z = add i32 %Y, %C
   ret i32 %Z
 ; CHECK-LABEL: @test12
-; CHECK-NEXT: mul i32 %X, -3
-; CHECK-NEXT: add i32{{.*}}, 6
+; CHECK: %[[mul:.*]] = mul i32 %X, -3
+; CHECK-NEXT: add i32 %[[mul]], 6
 ; CHECK-NEXT: ret i32
 }
 
@@ -202,8 +207,8 @@ define i32 @test14(i32 %X1, i32 %X2) {
   ret i32 %D
 
 ; CHECK-LABEL: @test14
-; CHECK-NEXT: sub i32 %X1, %X2
-; CHECK-NEXT: mul i32 %B2, 47
+; CHECK-NEXT: %[[SUB:.*]] = sub i32 %X1, %X2
+; CHECK-NEXT: mul i32 %[[SUB]], 47
 ; CHECK-NEXT: ret i32
 }
 

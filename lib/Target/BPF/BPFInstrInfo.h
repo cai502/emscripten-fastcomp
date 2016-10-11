@@ -31,7 +31,7 @@ public:
   const BPFRegisterInfo &getRegisterInfo() const { return RI; }
 
   void copyPhysReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
-                   DebugLoc DL, unsigned DestReg, unsigned SrcReg,
+                   const DebugLoc &DL, unsigned DestReg, unsigned SrcReg,
                    bool KillSrc) const override;
 
   void storeRegToStackSlot(MachineBasicBlock &MBB,
@@ -44,16 +44,15 @@ public:
                             MachineBasicBlock::iterator MBBI, unsigned DestReg,
                             int FrameIndex, const TargetRegisterClass *RC,
                             const TargetRegisterInfo *TRI) const override;
-  bool AnalyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
+  bool analyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
                      MachineBasicBlock *&FBB,
                      SmallVectorImpl<MachineOperand> &Cond,
                      bool AllowModify) const override;
 
   unsigned RemoveBranch(MachineBasicBlock &MBB) const override;
   unsigned InsertBranch(MachineBasicBlock &MBB, MachineBasicBlock *TBB,
-                        MachineBasicBlock *FBB,
-                        const SmallVectorImpl<MachineOperand> &Cond,
-                        DebugLoc DL) const override;
+                        MachineBasicBlock *FBB, ArrayRef<MachineOperand> Cond,
+                        const DebugLoc &DL) const override;
 };
 }
 

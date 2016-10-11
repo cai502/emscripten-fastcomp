@@ -28,9 +28,9 @@ class MSP430TargetMachine : public LLVMTargetMachine {
   MSP430Subtarget        Subtarget;
 
 public:
-  MSP430TargetMachine(const Target &T, StringRef TT,
-                      StringRef CPU, StringRef FS, const TargetOptions &Options,
-                      Reloc::Model RM, CodeModel::Model CM,
+  MSP430TargetMachine(const Target &T, const Triple &TT, StringRef CPU,
+                      StringRef FS, const TargetOptions &Options,
+                      Optional<Reloc::Model> RM, CodeModel::Model CM,
                       CodeGenOpt::Level OL);
   ~MSP430TargetMachine() override;
 

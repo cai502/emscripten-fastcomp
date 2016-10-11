@@ -41,7 +41,6 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/SMLoc.h"
-#include <limits>
 #include <map>
 #include <utility>
 
@@ -76,9 +75,9 @@ std::string escape(StringRef Input);
 class Stream {
 public:
   /// \brief This keeps a reference to the string referenced by \p Input.
-  Stream(StringRef Input, SourceMgr &);
+  Stream(StringRef Input, SourceMgr &, bool ShowColors = true);
 
-  Stream(MemoryBufferRef InputBuffer, SourceMgr &);
+  Stream(MemoryBufferRef InputBuffer, SourceMgr &, bool ShowColors = true);
   ~Stream();
 
   document_iterator begin();
@@ -107,6 +106,7 @@ public:
   enum NodeKind {
     NK_Null,
     NK_Scalar,
+    NK_BlockScalar,
     NK_KeyValue,
     NK_Mapping,
     NK_Sequence,
@@ -144,11 +144,12 @@ public:
   unsigned int getType() const { return TypeID; }
 
   void *operator new(size_t Size, BumpPtrAllocator &Alloc,
-                     size_t Alignment = 16) throw() {
+                     size_t Alignment = 16) LLVM_NOEXCEPT {
     return Alloc.Allocate(Size, Alignment);
   }
 
-  void operator delete(void *Ptr, BumpPtrAllocator &Alloc, size_t Size) throw() {
+  void operator delete(void *Ptr, BumpPtrAllocator &Alloc,
+                       size_t Size) LLVM_NOEXCEPT {
     Alloc.Deallocate(Ptr, Size);
   }
 
@@ -156,9 +157,9 @@ protected:
   std::unique_ptr<Document> &Doc;
   SMRange SourceRange;
 
-  void operator delete(void *) throw() {}
+  void operator delete(void *) LLVM_NOEXCEPT = delete;
 
-  virtual ~Node() {}
+  ~Node() = default;
 
 private:
   unsigned int TypeID;
@@ -171,7 +172,7 @@ private:
 ///
 /// Example:
 ///   !!null null
-class NullNode : public Node {
+class NullNode final : public Node {
   void anchor() override;
 
 public:
@@ -186,7 +187,7 @@ public:
 ///
 /// Example:
 ///   Adena
-class ScalarNode : public Node {
+class ScalarNode final : public Node {
   void anchor() override;
 
 public:
@@ -222,6 +223,36 @@ private:
                                  SmallVectorImpl<char> &Storage) const;
 };
 
+/// \brief A block scalar node is an opaque datum that can be presented as a
+///        series of zero or more Unicode scalar values.
+///
+/// Example:
+///   |
+///     Hello
+///     World
+class BlockScalarNode final : public Node {
+  void anchor() override;
+
+public:
+  BlockScalarNode(std::unique_ptr<Document> &D, StringRef Anchor, StringRef Tag,
+                  StringRef Value, StringRef RawVal)
+      : Node(NK_BlockScalar, D, Anchor, Tag), Value(Value) {
+    SMLoc Start = SMLoc::getFromPointer(RawVal.begin());
+    SMLoc End = SMLoc::getFromPointer(RawVal.end());
+    SourceRange = SMRange(Start, End);
+  }
+
+  /// \brief Gets the value of this node as a StringRef.
+  StringRef getValue() const { return Value; }
+
+  static inline bool classof(const Node *N) {
+    return N->getType() == NK_BlockScalar;
+  }
+
+private:
+  StringRef Value;
+};
+
 /// \brief A key and value pair. While not technically a Node under the YAML
 ///        representation graph, it is easier to treat them this way.
 ///
@@ -229,7 +260,7 @@ private:
 ///
 /// Example:
 ///   Section: .text
-class KeyValueNode : public Node {
+class KeyValueNode final : public Node {
   void anchor() override;
 
 public:
@@ -253,7 +284,8 @@ public:
 
   void skip() override {
     getKey()->skip();
-    getValue()->skip();
+    if (Node *Val = getValue())
+      Val->skip();
   }
 
   static inline bool classof(const Node *N) {
@@ -272,7 +304,7 @@ private:
 /// increment() which must set CurrentEntry to 0 to create an end iterator.
 template <class BaseT, class ValueT>
 class basic_collection_iterator
-    : public std::iterator<std::forward_iterator_tag, ValueT> {
+    : public std::iterator<std::input_iterator_tag, ValueT> {
 public:
   basic_collection_iterator() : Base(nullptr) {}
   basic_collection_iterator(BaseT *B) : Base(B) {}
@@ -293,11 +325,24 @@ public:
     return Base->CurrentEntry;
   }
 
+  /// Note on EqualityComparable:
+  ///
+  /// The iterator is not re-entrant,
+  /// it is meant to be used for parsing YAML on-demand
+  /// Once iteration started - it can point only to one entry at a time
+  /// hence Base.CurrentEntry and Other.Base.CurrentEntry are equal
+  /// iff Base and Other.Base are equal.
+  bool operator==(const basic_collection_iterator &Other) const {
+    if (Base && (Base == Other.Base)) {
+      assert((Base->CurrentEntry == Other.Base->CurrentEntry)
+             && "Equal Bases expected to point to equal Entries");
+    }
+
+    return Base == Other.Base;
+  }
+
   bool operator!=(const basic_collection_iterator &Other) const {
-    if (Base != Other.Base)
-      return true;
-    return (Base && Other.Base) &&
-           Base->CurrentEntry != Other.Base->CurrentEntry;
+    return !(Base == Other.Base);
   }
 
   basic_collection_iterator &operator++() {
@@ -339,7 +384,7 @@ template <class CollectionType> void skip(CollectionType &C) {
 /// Example:
 ///   Name: _main
 ///   Scope: Global
-class MappingNode : public Node {
+class MappingNode final : public Node {
   void anchor() override;
 
 public:
@@ -386,7 +431,7 @@ private:
 /// Example:
 ///   - Hello
 ///   - World
-class SequenceNode : public Node {
+class SequenceNode final : public Node {
   void anchor() override;
 
 public:
@@ -439,7 +484,7 @@ private:
 ///
 /// Example:
 ///   *AnchorName
-class AliasNode : public Node {
+class AliasNode final : public Node {
   void anchor() override;
 
 public:

@@ -4,16 +4,10 @@ set(LLVM_LINK_COMPONENTS
   BitWriter
   CodeGen
   Core
-  IPA
   IPO
   IRReader
   Linker
   # @LOCALMOD-BEGIN
-  NaClAnalysis
-  NaClBitWriter
-  NaClBitReader
-  NaClTransforms
-  MinSFITransforms
   JSBackend
   # @LOCALMOD-END
   InstCombine

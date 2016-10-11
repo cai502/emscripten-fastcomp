@@ -11,6 +11,7 @@
 #define LLVM_MC_MCASMBACKEND_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/Optional.h"
 #include "llvm/MC/MCDirectives.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/MC/MCFixup.h"
@@ -27,9 +28,8 @@ class MCInst;
 class MCRelaxableFragment;
 class MCObjectWriter;
 class MCSection;
-class MCStreamer;
 class MCValue;
-class raw_ostream;
+class raw_pwrite_stream;
 
 /// Generic interface to target specific assembler backends.
 class MCAsmBackend {
@@ -38,8 +38,6 @@ class MCAsmBackend {
 
 protected: // Can only create subclasses.
   MCAsmBackend();
-
-  unsigned HasDataInCodeSupport : 1;
 
 public:
   virtual ~MCAsmBackend();
@@ -51,22 +49,14 @@ public:
   /// emit the final object file.
   virtual MCObjectWriter *createObjectWriter(raw_pwrite_stream &OS) const = 0;
 
-  /// Create a new ELFObjectTargetWriter to enable non-standard
-  /// ELFObjectWriters.
-  virtual MCELFObjectTargetWriter *createELFObjectTargetWriter() const {
-    llvm_unreachable("createELFObjectTargetWriter is not supported by asm "
-                     "backend");
-  }
-
-  /// Check whether this target implements data-in-code markers. If not, data
-  /// region directives will be ignored.
-  bool hasDataInCodeSupport() const { return HasDataInCodeSupport; }
-
-  /// @name Target Fixup Interfaces
+  /// \name Target Fixup Interfaces
   /// @{
 
   /// Get the number of target specific fixup kinds.
   virtual unsigned getNumFixupKinds() const = 0;
+
+  /// Map a relocation name used in .reloc to a fixup kind.
+  virtual Optional<MCFixupKind> getFixupKind(StringRef Name) const;
 
   /// Get information on a fixup kind.
   virtual const MCFixupKindInfo &getFixupKindInfo(MCFixupKind Kind) const;
@@ -88,7 +78,7 @@ public:
 
   /// @}
 
-  /// @name Target Relaxation Interfaces
+  /// \name Target Relaxation Interfaces
   /// @{
 
   /// Check whether the given instruction may need relaxation.
@@ -98,6 +88,12 @@ public:
 
   /// Target specific predicate for whether a given fixup requires the
   /// associated instruction to be relaxed.
+  virtual bool fixupNeedsRelaxationAdvanced(const MCFixup &Fixup, bool Resolved,
+                                            uint64_t Value,
+                                            const MCRelaxableFragment *DF,
+                                            const MCAsmLayout &Layout) const;
+
+  /// Simple predicate for targets where !Resolved implies requiring relaxation
   virtual bool fixupNeedsRelaxation(const MCFixup &Fixup, uint64_t Value,
                                     const MCRelaxableFragment *DF,
                                     const MCAsmLayout &Layout) const = 0;
@@ -106,8 +102,10 @@ public:
   ///
   /// \param Inst The instruction to relax, which may be the same as the
   /// output.
+  /// \param STI the subtarget information for the associated instruction.
   /// \param [out] Res On return, the relaxed instruction.
-  virtual void relaxInstruction(const MCInst &Inst, MCInst &Res) const = 0;
+  virtual void relaxInstruction(const MCInst &Inst, const MCSubtargetInfo &STI,
+                                MCInst &Res) const = 0;
 
   /// @}
 
@@ -123,6 +121,10 @@ public:
   /// \return - True on success.
   virtual bool writeNopData(uint64_t Count, MCObjectWriter *OW) const = 0;
 
+  /// Give backend an opportunity to finish layout after relaxation
+  virtual void finishLayout(MCAssembler const &Asm,
+                            MCAsmLayout &Layout) const {}
+
   /// Handle any target-specific assembler flags. By default, do nothing.
   virtual void handleAssemblerFlag(MCAssemblerFlag Flag) {}
 
@@ -131,16 +133,6 @@ public:
       generateCompactUnwindEncoding(ArrayRef<MCCFIInstruction>) const {
     return 0;
   }
-  
-  // @LOCALMOD-BEGIN
-  /// CustomExpandInst -
-  ///   If the MCInst instruction has a custom expansion, write it to the
-  /// MCStreamer 'Out'. This can be used to perform "last minute" rewrites of
-  /// MCInst instructions for emission.
-  virtual bool CustomExpandInst(const MCInst &Inst, MCStreamer &Out) {
-    return false;
-  }
-  // @LOCALMOD-END
 };
 
 } // End llvm namespace

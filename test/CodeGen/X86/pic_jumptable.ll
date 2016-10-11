@@ -3,7 +3,7 @@
 ; RUN: llc < %s -relocation-model=pic -mark-data-regions -mtriple=i686-apple-darwin -asm-verbose=false \
 ; RUN:   | FileCheck %s --check-prefix=CHECK-DATA
 ; RUN: llc < %s -relocation-model=pic -mtriple=i686-apple-darwin -asm-verbose=false \
-; RUN:   | FileCheck %s
+; RUN:   | FileCheck %s --check-prefix=CHECK-DATA
 ; RUN: llc < %s                       -mtriple=x86_64-apple-darwin | not grep 'lJTI'
 ; rdar://6971437
 ; rdar://7738756
@@ -55,13 +55,15 @@ entry:
 	]
 
 bb:		; preds = %entry, %entry, %entry, %entry, %entry, %entry, %entry, %entry, %entry, %entry
+	call void @_Z3bari( i32 0 )
 	br label %bb1
 
 bb1:		; preds = %bb, %entry
+	call void @_Z3bari( i32 1 )
 	br label %bb2
 
 bb2:		; preds = %bb1, %entry
-	call void @_Z3bari( i32 1 )
+	call void @_Z3bari( i32 2 )
 	br label %bb11
 
 bb3:		; preds = %entry

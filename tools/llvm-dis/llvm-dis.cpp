@@ -18,7 +18,6 @@
 
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Bitcode/ReaderWriter.h"
-#include "llvm/Bitcode/NaCl/NaClReaderWriter.h"  // @LOCALMOD
 #include "llvm/IR/AssemblyAnnotationWriter.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -26,16 +25,15 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
-#include "llvm/IRReader/IRReader.h"  // @LOCALMOD
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/DataStream.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/Signals.h"
-#include "llvm/Support/StreamingMemoryObject.h" // @LOCALMOD
 #include "llvm/Support/ToolOutputFile.h"
 #include <system_error>
 using namespace llvm;
@@ -62,23 +60,16 @@ static cl::opt<bool> PreserveAssemblyUseListOrder(
     cl::desc("Preserve use-list order when writing LLVM assembly."),
     cl::init(false), cl::Hidden);
 
-// @LOCALMOD-BEGIN
-static cl::opt<NaClFileFormat>
-InputFileFormat(
-    "bitcode-format",
-    cl::desc("Define format of input bitcode file:"),
-    cl::values(
-        clEnumValN(LLVMFormat, "llvm", "LLVM bitcode file (default)"),
-        clEnumValN(PNaClFormat, "pnacl", "PNaCl bitcode file"),
-        clEnumValEnd),
-    cl::init(LLVMFormat));
-// @LOCALMOD-END
+static cl::opt<bool>
+    MaterializeMetadata("materialize-metadata",
+                        cl::desc("Load module without materializing metadata, "
+                                 "then materialize only the metadata"));
 
 namespace {
 
 static void printDebugLoc(const DebugLoc &DL, formatted_raw_ostream &OS) {
   OS << DL.getLine() << ":" << DL.getCol();
-  if (MDLocation *IDL = DL.getInlinedAt()) {
+  if (DILocation *IDL = DL.getInlinedAt()) {
     OS << "@";
     printDebugLoc(IDL, OS);
   }
@@ -95,7 +86,8 @@ public:
     if (!V.getType()->isVoidTy()) {
       OS.PadToColumn(50);
       Padded = true;
-      OS << "; [#uses=" << V.getNumUses() << " type=" << *V.getType() << "]";  // Output # uses and type
+      // Output # uses and type
+      OS << "; [#uses=" << V.getNumUses() << " type=" << *V.getType() << "]";
     }
     if (const Instruction *I = dyn_cast<Instruction>(&V)) {
       if (const DebugLoc &DL = I->getDebugLoc()) {
@@ -109,20 +101,18 @@ public:
         OS << "]";
       }
       if (const DbgDeclareInst *DDI = dyn_cast<DbgDeclareInst>(I)) {
-        DIVariable Var(DDI->getVariable());
         if (!Padded) {
           OS.PadToColumn(50);
           OS << ";";
         }
-        OS << " [debug variable = " << Var->getName() << "]";
+        OS << " [debug variable = " << DDI->getVariable()->getName() << "]";
       }
       else if (const DbgValueInst *DVI = dyn_cast<DbgValueInst>(I)) {
-        DIVariable Var(DVI->getVariable());
         if (!Padded) {
           OS.PadToColumn(50);
           OS << ";";
         }
-        OS << " [debug variable = " << Var->getName() << "]";
+        OS << " [debug variable = " << DVI->getVariable()->getName() << "]";
       }
     }
   }
@@ -148,68 +138,59 @@ static void diagnosticHandler(const DiagnosticInfo &DI, void *Context) {
     exit(1);
 }
 
+static Expected<std::unique_ptr<Module>> openInputFile(LLVMContext &Context) {
+  if (MaterializeMetadata) {
+    ErrorOr<std::unique_ptr<MemoryBuffer>> MBOrErr =
+        MemoryBuffer::getFileOrSTDIN(InputFilename);
+    if (!MBOrErr)
+      return errorCodeToError(MBOrErr.getError());
+    ErrorOr<std::unique_ptr<Module>> MOrErr =
+        getLazyBitcodeModule(std::move(*MBOrErr), Context,
+                             /*ShouldLazyLoadMetadata=*/true);
+    if (!MOrErr)
+      return errorCodeToError(MOrErr.getError());
+    (*MOrErr)->materializeMetadata();
+    return std::move(*MOrErr);
+  } else {
+    std::string ErrorMessage;
+    std::unique_ptr<DataStreamer> Streamer =
+        getDataFileStreamer(InputFilename, &ErrorMessage);
+    if (!Streamer)
+      return make_error<StringError>(ErrorMessage, inconvertibleErrorCode());
+    std::string DisplayFilename;
+    if (InputFilename == "-")
+      DisplayFilename = "<stdin>";
+    else
+      DisplayFilename = InputFilename;
+    ErrorOr<std::unique_ptr<Module>> MOrErr =
+        getStreamedBitcodeModule(DisplayFilename, std::move(Streamer), Context);
+    (*MOrErr)->materializeAll();
+    return std::move(*MOrErr);
+  }
+}
+
 int main(int argc, char **argv) {
   // Print a stack trace if we signal out.
-  sys::PrintStackTraceOnErrorSignal();
+  sys::PrintStackTraceOnErrorSignal(argv[0]);
   PrettyStackTraceProgram X(argc, argv);
 
-  LLVMContext &Context = getGlobalContext();
+  LLVMContext Context;
   llvm_shutdown_obj Y;  // Call llvm_shutdown() on exit.
 
   Context.setDiagnosticHandler(diagnosticHandler, argv[0]);
 
   cl::ParseCommandLineOptions(argc, argv, "llvm .bc -> .ll disassembler\n");
 
-  std::string ErrorMessage;
-  std::unique_ptr<Module> M;
-
-  // Use the bitcode streaming interface
-  DataStreamer *Streamer = getDataFileStreamer(InputFilename, &ErrorMessage);
-  if (Streamer) {
-    std::unique_ptr<StreamingMemoryObject> Buffer(
-        new StreamingMemoryObjectImpl(Streamer));  // @LOCALMOD
-    std::string DisplayFilename;
-    if (InputFilename == "-")
-      DisplayFilename = "<stdin>";
-    else
-      DisplayFilename = InputFilename;
-
-    // @LOCALMOD-BEGIN
-    switch (InputFileFormat) {
-      case LLVMFormat: {
-        // The Module's BitcodeReader's BitstreamReader takes ownership
-        // of the StreamingMemoryObject.
-        ErrorOr<std::unique_ptr<Module>> MOrErr =
-            getStreamedBitcodeModule(DisplayFilename, Buffer.release(), Context);
-        M = std::move(*MOrErr);
-        M->materializeAllPermanently();
-        break;
-      }
-      case PNaClFormat: {
-        M.reset(getNaClStreamedBitcodeModule(
-            DisplayFilename, Buffer.release(), Context, nullptr,
-            &ErrorMessage));
-        if(M.get()) {
-          if (std::error_code EC = M->materializeAllPermanently()) {
-            ErrorMessage = EC.message();
-            M.reset();
-          }
-        } else {
-          errs() << argv[0] << ": ";
-          if (ErrorMessage.size())
-            errs() << ErrorMessage << "\n";
-          else
-            errs() << "bitcode didn't read correctly.\n";
-          return 1;
-        }
-        break;
-      }
-      case AutodetectFileFormat:
-        report_fatal_error("Command can't autodetect file format!");
-    }
-    // @LOCALMOD-END
-
+  Expected<std::unique_ptr<Module>> MOrErr = openInputFile(Context);
+  if (!MOrErr) {
+    handleAllErrors(MOrErr.takeError(), [&](ErrorInfoBase &EIB) {
+      errs() << argv[0] << ": ";
+      EIB.log(errs());
+      errs() << '\n';
+    });
+    return 1;
   }
+  std::unique_ptr<Module> M = std::move(*MOrErr);
 
   // Just use stdout.  We won't actually print anything on it.
   if (DontPrint)
@@ -219,13 +200,9 @@ int main(int argc, char **argv) {
     if (InputFilename == "-") {
       OutputFilename = "-";
     } else {
-      const std::string &IFN = InputFilename;
-      int Len = IFN.length();
-      // If the source ends in .bc, strip it off.
-      if (IFN[Len-3] == '.' && IFN[Len-2] == 'b' && IFN[Len-1] == 'c')
-        OutputFilename = std::string(IFN.begin(), IFN.end()-3)+".ll";
-      else
-        OutputFilename = IFN+".ll";
+      StringRef IFN = InputFilename;
+      OutputFilename = (IFN.endswith(".bc") ? IFN.drop_back(3) : IFN).str();
+      OutputFilename += ".ll";
     }
   }
 

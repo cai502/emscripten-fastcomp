@@ -16,12 +16,13 @@
 
 #include "EHStreamer.h"
 #include "llvm/CodeGen/AsmPrinter.h"
+#include "llvm/MC/MCDwarf.h"
 
 namespace llvm {
 class MachineFunction;
 class ARMTargetStreamer;
 
-class DwarfCFIExceptionBase : public EHStreamer {
+class LLVM_LIBRARY_VISIBILITY DwarfCFIExceptionBase : public EHStreamer {
 protected:
   DwarfCFIExceptionBase(AsmPrinter *A);
 
@@ -29,11 +30,15 @@ protected:
   bool shouldEmitCFI;
 
   void markFunctionEnd() override;
+  void endFragment() override;
 };
 
-class DwarfCFIException : public DwarfCFIExceptionBase {
+class LLVM_LIBRARY_VISIBILITY DwarfCFIException : public DwarfCFIExceptionBase {
   /// Per-function flag to indicate if .cfi_personality should be emitted.
   bool shouldEmitPersonality;
+
+  /// Per-function flag to indicate if .cfi_personality must be emitted.
+  bool forceEmitPersonality;
 
   /// Per-function flag to indicate if .cfi_lsda should be emitted.
   bool shouldEmitLSDA;
@@ -59,9 +64,12 @@ public:
 
   /// Gather and emit post-function exception information.
   void endFunction(const MachineFunction *) override;
+
+  void beginFragment(const MachineBasicBlock *MBB,
+                     ExceptionSymbolProvider ESP) override;
 };
 
-class ARMException : public DwarfCFIExceptionBase {
+class LLVM_LIBRARY_VISIBILITY ARMException : public DwarfCFIExceptionBase {
   void emitTypeInfos(unsigned TTypeEncoding) override;
   ARMTargetStreamer &getTargetStreamer();
 

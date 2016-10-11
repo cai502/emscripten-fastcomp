@@ -4,9 +4,10 @@
 ; LSR should properly handle the post-inc offset when folding the
 ; non-IV operand of an icmp into the IV.
 
-; CHECK:   [[r1:%[a-z0-9]+]] = sub i64 %sub.ptr.lhs.cast, %sub.ptr.rhs.cast
-; CHECK:   [[r2:%[a-z0-9]+]] = lshr i64 [[r1]], 1
-; CHECK:   [[r3:%[a-z0-9]+]] = mul i64 [[r2]], 2
+; CHECK:   [[r1:%[a-z0-9\.]+]] = sub i64 %sub.ptr.lhs.cast, %sub.ptr.rhs.cast
+; CHECK:   [[r2:%[a-z0-9\.]+]] = lshr exact i64 [[r1]], 1
+; CHECK: for.body.lr.ph:
+; CHECK:   [[r3:%[a-z0-9]+]] = shl i64 [[r2]], 1
 ; CHECK:   br label %for.body
 ; CHECK: for.body:
 ; CHECK:   %lsr.iv2 = phi i64 [ %lsr.iv.next, %for.body ], [ [[r3]], %for.body.lr.ph ]

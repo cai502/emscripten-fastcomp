@@ -23,6 +23,9 @@ class CCIfNotSubtarget<string F, CCAction A>
                        "(State.getMachineFunction().getSubtarget()).",
                      F),
           A>;
+class CCIfOrigArgWasNotPPCF128<CCAction A>
+    : CCIf<"!static_cast<PPCCCState *>(&State)->WasOriginalArgPPCF128(ValNo)",
+           A>;
 
 //===----------------------------------------------------------------------===//
 // Return Value Calling Convention
@@ -62,7 +65,8 @@ def RetCC_PPC : CallingConv<[
  
   // Vector types returned as "direct" go into V2 .. V9; note that only the
   // ELFv2 ABI fully utilizes all these registers.
-  CCIfType<[v16i8, v8i16, v4i32, v4f32], CCIfSubtarget<"hasAltivec()",
+  CCIfType<[v16i8, v8i16, v4i32, v2i64, v1i128, v4f32], 
+           CCIfSubtarget<"hasAltivec()",
            CCAssignToReg<[V2, V3, V4, V5, V6, V7, V8, V9]>>>,
   CCIfType<[v2f64, v2i64], CCIfSubtarget<"hasVSX()",
            CCAssignToReg<[VSH2, VSH3, VSH4, VSH5, VSH6, VSH7, VSH8, VSH9]>>>
@@ -108,13 +112,14 @@ def RetCC_PPC64_ELF_FIS : CallingConv<[
   CCIfType<[i8],   CCPromoteToType<i64>>,
   CCIfType<[i16],  CCPromoteToType<i64>>,
   CCIfType<[i32],  CCPromoteToType<i64>>,
-  CCIfType<[i64],  CCAssignToReg<[X3, X4]>>,
+  CCIfType<[i64],  CCAssignToReg<[X3, X4, X5, X6]>>,
   CCIfType<[i128], CCAssignToReg<[X3, X4, X5, X6]>>,
   CCIfType<[f32],  CCAssignToReg<[F1, F2, F3, F4, F5, F6, F7, F8]>>,
   CCIfType<[f64],  CCAssignToReg<[F1, F2, F3, F4, F5, F6, F7, F8]>>,
   CCIfType<[v4f64, v4f32, v4i1],
            CCIfSubtarget<"hasQPX()", CCAssignToReg<[QF1, QF2]>>>,
-  CCIfType<[v16i8, v8i16, v4i32, v4f32], CCIfSubtarget<"hasAltivec()",
+  CCIfType<[v16i8, v8i16, v4i32, v2i64, v1i128, v4f32], 
+           CCIfSubtarget<"hasAltivec()",
            CCAssignToReg<[V2, V3, V4, V5, V6, V7, V8, V9]>>>,
   CCIfType<[v2f64, v2i64], CCIfSubtarget<"hasVSX()",
            CCAssignToReg<[VSH2, VSH3, VSH4, VSH5, VSH6, VSH7, VSH8, VSH9]>>>
@@ -129,7 +134,17 @@ def CC_PPC32_SVR4_Common : CallingConv<[
 
   // The ABI requires i64 to be passed in two adjacent registers with the first
   // register having an odd register number.
-  CCIfType<[i32], CCIfSplit<CCCustom<"CC_PPC32_SVR4_Custom_AlignArgRegs">>>,
+  CCIfType<[i32],
+  CCIfSplit<CCIfSubtarget<"useSoftFloat()", 
+            CCIfOrigArgWasNotPPCF128<
+            CCCustom<"CC_PPC32_SVR4_Custom_AlignArgRegs">>>>>,
+  
+  CCIfType<[i32],
+  CCIfSplit<CCIfNotSubtarget<"useSoftFloat()", 
+                            CCCustom<"CC_PPC32_SVR4_Custom_AlignArgRegs">>>>,
+
+  // The 'nest' parameter, if any, is passed in R11.
+  CCIfNest<CCAssignToReg<[R11]>>,
 
   // The first 8 integer arguments are passed in integer registers.
   CCIfType<[i32], CCAssignToReg<[R3, R4, R5, R6, R7, R8, R9, R10]>>,
@@ -172,9 +187,9 @@ def CC_PPC32_SVR4 : CallingConv<[
     CCAssignToReg<[QF1, QF2, QF3, QF4, QF5, QF6, QF7, QF8]>>>,
 
   // The first 12 Vector arguments are passed in AltiVec registers.
-  CCIfType<[v16i8, v8i16, v4i32, v4f32], CCIfSubtarget<"hasAltivec()",
-           CCAssignToReg<[V2, V3, V4, V5, V6, V7, V8, V9,
-                          V10, V11, V12, V13]>>>,
+  CCIfType<[v16i8, v8i16, v4i32, v2i64, v1i128, v4f32], 
+           CCIfSubtarget<"hasAltivec()", CCAssignToReg<[V2, V3, V4, V5, V6, V7,
+                          V8, V9, V10, V11, V12, V13]>>>,
   CCIfType<[v2f64, v2i64], CCIfSubtarget<"hasVSX()",
            CCAssignToReg<[VSH2, VSH3, VSH4, VSH5, VSH6, VSH7, VSH8, VSH9,
                           VSH10, VSH11, VSH12, VSH13]>>>,
@@ -238,11 +253,22 @@ def CSR_SVR464   : CalleeSavedRegs<(add X14, X15, X16, X17, X18, X19, X20,
                                         F27, F28, F29, F30, F31, CR2, CR3, CR4
                                    )>;
 
+// CSRs that are handled by prologue, epilogue.
+def CSR_SRV464_TLS_PE : CalleeSavedRegs<(add)>;
+
+def CSR_SVR464_ViaCopy : CalleeSavedRegs<(add CSR_SVR464)>;
+
 def CSR_SVR464_Altivec : CalleeSavedRegs<(add CSR_SVR464, CSR_Altivec)>;
+
+def CSR_SVR464_Altivec_ViaCopy : CalleeSavedRegs<(add CSR_SVR464_Altivec)>;
 
 def CSR_SVR464_R2 : CalleeSavedRegs<(add CSR_SVR464, X2)>;
 
+def CSR_SVR464_R2_ViaCopy : CalleeSavedRegs<(add CSR_SVR464_R2)>;
+
 def CSR_SVR464_R2_Altivec : CalleeSavedRegs<(add CSR_SVR464_Altivec, X2)>;
+
+def CSR_SVR464_R2_Altivec_ViaCopy : CalleeSavedRegs<(add CSR_SVR464_R2_Altivec)>;
 
 def CSR_NoRegs : CalleeSavedRegs<(add)>;
 

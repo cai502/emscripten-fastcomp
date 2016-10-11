@@ -23,10 +23,10 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCAsmInfo.h"
+#include "llvm/MC/MCParser/MCTargetAsmParser.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/MCSymbol.h"
-#include "llvm/MC/MCTargetAsmParser.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
@@ -74,13 +74,9 @@ static void srcMgrDiagHandler(const SMDiagnostic &Diag, void *diagInfo) {
 
 /// EmitInlineAsm - Emit a blob of inline asm to the output streamer.
 void AsmPrinter::EmitInlineAsm(StringRef Str, const MCSubtargetInfo &STI,
+                               const MCTargetOptions &MCOptions,
                                const MDNode *LocMDNode,
                                InlineAsm::AsmDialect Dialect) const {
-#if defined(__native_client__)
-  // Prune the generic AsmParser bits from the in-browser translator.
-  // This is normally used to parse inline asm (see createMCAsmParser below).
-  return;
-#else
   assert(!Str.empty() && "Can't emit empty inline asm block");
 
   // Remember if the buffer is nul terminated or not so we can avoid a copy.
@@ -96,9 +92,9 @@ void AsmPrinter::EmitInlineAsm(StringRef Str, const MCSubtargetInfo &STI,
   const MCAsmInfo *MCAI = TM.getMCAsmInfo();
   assert(MCAI && "No MCAsmInfo");
   if (!MCAI->useIntegratedAssembler() &&
-      !OutStreamer.isIntegratedAssemblerRequired()) {
+      !OutStreamer->isIntegratedAssemblerRequired()) {
     emitInlineAsmStart();
-    OutStreamer.EmitRawText(Str);
+    OutStreamer->EmitRawText(Str);
     emitInlineAsmEnd(STI, nullptr);
     return;
   }
@@ -129,13 +125,7 @@ void AsmPrinter::EmitInlineAsm(StringRef Str, const MCSubtargetInfo &STI,
   SrcMgr.AddNewSourceBuffer(std::move(Buffer), SMLoc());
 
   std::unique_ptr<MCAsmParser> Parser(
-      createMCAsmParser(SrcMgr, OutContext, OutStreamer, *MAI));
-
-  // Create a temporary copy of the original STI because the parser may modify
-  // it. For example, when switching between arm and thumb mode. If the target
-  // needs to emit code to return to the original state it can do so in
-  // emitInlineAsmEnd().
-  MCSubtargetInfo TmpSTI = STI;
+      createMCAsmParser(SrcMgr, OutContext, *OutStreamer, *MAI));
 
   // We create a new MCInstrInfo here since we might be at the module level
   // and not have a MachineFunction to initialize the TargetInstrInfo from and
@@ -143,7 +133,7 @@ void AsmPrinter::EmitInlineAsm(StringRef Str, const MCSubtargetInfo &STI,
   // because it's not subtarget dependent.
   std::unique_ptr<MCInstrInfo> MII(TM.getTarget().createMCInstrInfo());
   std::unique_ptr<MCTargetAsmParser> TAP(TM.getTarget().createMCAsmParser(
-      TmpSTI, *Parser, *MII, TM.Options.MCOptions));
+      STI, *Parser, *MII, MCOptions));
   if (!TAP)
     report_fatal_error("Inline asm not supported by this streamer because"
                        " we don't have an asm parser for this target\n");
@@ -158,10 +148,9 @@ void AsmPrinter::EmitInlineAsm(StringRef Str, const MCSubtargetInfo &STI,
   // Don't implicitly switch to the text section before the asm.
   int Res = Parser->Run(/*NoInitialTextSection*/ true,
                         /*NoFinalize*/ true);
-  emitInlineAsmEnd(STI, &TmpSTI);
+  emitInlineAsmEnd(STI, &TAP->getSTI());
   if (Res && !HasDiagHandler)
     report_fatal_error("Error parsing inline asm\n");
-#endif  // defined(__native_client__)
 }
 
 static void EmitMSInlineAsmStr(const char *AsmStr, const MachineInstr *MI,
@@ -407,10 +396,11 @@ static void EmitGCCInlineAsmStr(const char *AsmStr, const MachineInstr *MI,
           unsigned OpFlags = MI->getOperand(OpNo).getImm();
           ++OpNo;  // Skip over the ID number.
 
-          if (Modifier[0] == 'l')  // labels are target independent
+          if (Modifier[0] == 'l') { // Labels are target independent.
             // FIXME: What if the operand isn't an MBB, report error?
-            OS << *MI->getOperand(OpNo).getMBB()->getSymbol();
-          else {
+            const MCSymbol *Sym = MI->getOperand(OpNo).getMBB()->getSymbol();
+            Sym->print(OS, AP->MAI);
+          } else {
             if (InlineAsm::isMemKind(OpFlags)) {
               Error = AP->PrintAsmMemoryOperand(MI, OpNo, InlineAsmVariant,
                                                 Modifier[0] ? Modifier : nullptr,
@@ -438,10 +428,6 @@ static void EmitGCCInlineAsmStr(const char *AsmStr, const MachineInstr *MI,
 /// EmitInlineAsm - This method formats and emits the specified machine
 /// instruction that is an inline asm.
 void AsmPrinter::EmitInlineAsm(const MachineInstr *MI) const {
-#if defined(__native__client__)
-  // See above LOCALMOD for pruning generic AsmParsing.
-  return;
-#else
   assert(MI->isInlineAsm() && "printInlineAsm only works on inline asms");
 
   // Count the number of register definitions to find the asm string.
@@ -458,14 +444,14 @@ void AsmPrinter::EmitInlineAsm(const MachineInstr *MI) const {
   // If this asmstr is empty, just print the #APP/#NOAPP markers.
   // These are useful to see where empty asm's wound up.
   if (AsmStr[0] == 0) {
-    OutStreamer.emitRawComment(MAI->getInlineAsmStart());
-    OutStreamer.emitRawComment(MAI->getInlineAsmEnd());
+    OutStreamer->emitRawComment(MAI->getInlineAsmStart());
+    OutStreamer->emitRawComment(MAI->getInlineAsmEnd());
     return;
   }
 
   // Emit the #APP start marker.  This has to happen even if verbose-asm isn't
   // enabled, so we use emitRawComment.
-  OutStreamer.emitRawComment(MAI->getInlineAsmStart());
+  OutStreamer->emitRawComment(MAI->getInlineAsmStart());
 
   // Get the !srcloc metadata node if we have it, and decode the loc cookie from
   // it.
@@ -498,12 +484,17 @@ void AsmPrinter::EmitInlineAsm(const MachineInstr *MI) const {
   else
     EmitMSInlineAsmStr(AsmStr, MI, MMI, InlineAsmVariant, AP, LocCookie, OS);
 
-  EmitInlineAsm(OS.str(), getSubtargetInfo(), LocMD, MI->getInlineAsmDialect());
+  // Reset SanitizeAddress based on the function's attribute.
+  MCTargetOptions MCOptions = TM.Options.MCOptions;
+  MCOptions.SanitizeAddress =
+      MF->getFunction()->hasFnAttribute(Attribute::SanitizeAddress);
+
+  EmitInlineAsm(OS.str(), getSubtargetInfo(), MCOptions, LocMD,
+                MI->getInlineAsmDialect());
 
   // Emit the #NOAPP end marker.  This has to happen even if verbose-asm isn't
   // enabled, so we use emitRawComment.
-  OutStreamer.emitRawComment(MAI->getInlineAsmEnd());
-#endif  // __native_client__
+  OutStreamer->emitRawComment(MAI->getInlineAsmEnd());
 }
 
 
@@ -515,9 +506,9 @@ void AsmPrinter::EmitInlineAsm(const MachineInstr *MI) const {
 /// for their own strange codes.
 void AsmPrinter::PrintSpecial(const MachineInstr *MI, raw_ostream &OS,
                               const char *Code) const {
-  const DataLayout *DL = TM.getDataLayout();
   if (!strcmp(Code, "private")) {
-    OS << DL->getPrivateGlobalPrefix();
+    const DataLayout &DL = MF->getDataLayout();
+    OS << DL.getPrivateGlobalPrefix();
   } else if (!strcmp(Code, "comment")) {
     OS << MAI->getCommentString();
   } else if (!strcmp(Code, "uid")) {
@@ -563,6 +554,11 @@ bool AsmPrinter::PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
       if (MO.getType() != MachineOperand::MO_Immediate)
         return true;
       O << -MO.getImm();
+      return false;
+    case 's':  // The GCC deprecated s modifier
+      if (MO.getType() != MachineOperand::MO_Immediate)
+        return true;
+      O << ((32 - MO.getImm()) & 31);
       return false;
     }
   }

@@ -15,12 +15,23 @@
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
 
+// Always verify dominfo if expensive checking is enabled.
+#ifdef EXPENSIVE_CHECKS
+static bool VerifyMachineDomInfo = true;
+#else
+static bool VerifyMachineDomInfo = false;
+#endif
+static cl::opt<bool, true> VerifyMachineDomInfoX(
+    "verify-machine-dom-info", cl::location(VerifyMachineDomInfo),
+    cl::desc("Verify machine dominator info (time consuming)"));
+
 namespace llvm {
-TEMPLATE_INSTANTIATION(class DomTreeNodeBase<MachineBasicBlock>);
-TEMPLATE_INSTANTIATION(class DominatorTreeBase<MachineBasicBlock>);
+template class DomTreeNodeBase<MachineBasicBlock>;
+template class DominatorTreeBase<MachineBasicBlock>;
 }
 
 char MachineDominatorTree::ID = 0;
@@ -55,6 +66,11 @@ MachineDominatorTree::~MachineDominatorTree() {
 
 void MachineDominatorTree::releaseMemory() {
   DT->releaseMemory();
+}
+
+void MachineDominatorTree::verifyAnalysis() const {
+  if (VerifyMachineDomInfo)
+    verifyDomTree();
 }
 
 void MachineDominatorTree::print(raw_ostream &OS, const Module*) const {
@@ -124,4 +140,18 @@ void MachineDominatorTree::applySplitCriticalEdges() const {
   }
   NewBBs.clear();
   CriticalEdgesToSplit.clear();
+}
+
+void MachineDominatorTree::verifyDomTree() const {
+  MachineFunction &F = *getRoot()->getParent();
+
+  MachineDominatorTree OtherDT;
+  OtherDT.DT->recalculate(F);
+  if (compare(OtherDT)) {
+    errs() << "MachineDominatorTree is not up to date!\nComputed:\n";
+    print(errs(), nullptr);
+    errs() << "\nActual:\n";
+    OtherDT.print(errs(), nullptr);
+    abort();
+  }
 }

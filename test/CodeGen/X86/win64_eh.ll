@@ -47,7 +47,6 @@ entry:
 ; WIN64: .seh_endproc
 
 
-; Checks stack push
 define i32 @foo3(i32 %f_arg, i32 %e_arg, i32 %d_arg, i32 %c_arg, i32 %b_arg, i32 %a_arg) uwtable {
 entry:
   %a = alloca i32
@@ -83,14 +82,11 @@ entry:
 }
 ; WIN64-LABEL: foo3:
 ; WIN64: .seh_proc foo3
-; WIN64: pushq %rsi
-; WIN64: .seh_pushreg 6
 ; NORM:  subq $24, %rsp
 ; ATOM:  leaq -24(%rsp), %rsp
 ; WIN64: .seh_stackalloc 24
 ; WIN64: .seh_endprologue
 ; WIN64: addq $24, %rsp
-; WIN64: popq %rsi
 ; WIN64: ret
 ; WIN64: .seh_endproc
 
@@ -101,7 +97,7 @@ declare void @_d_eh_resume_unwind(i8*)
 
 declare i32 @bar()
 
-define i32 @foo4() #0 {
+define i32 @foo4() #0 personality i32 (i32, i32, i64, i8*, i8*)* @_d_eh_personality {
 entry:
   %step = alloca i32, align 4
   store i32 0, i32* %step
@@ -115,7 +111,7 @@ finally:
   br label %endtryfinally
 
 landingpad:
-  %landing_pad = landingpad { i8*, i32 } personality i32 (i32, i32, i64, i8*, i8*)* @_d_eh_personality
+  %landing_pad = landingpad { i8*, i32 }
           cleanup
   %tmp3 = extractvalue { i8*, i32 } %landing_pad, 0
   store i32 2, i32* %step

@@ -20,6 +20,7 @@
 #include "ARMConstantPoolValue.h"
 #include "ARMMachineFunctionInfo.h"
 #include "MCTargetDesc/ARMAddressingModes.h"
+#include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
@@ -28,7 +29,6 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h" // FIXME: for debug only. remove!
 #include "llvm/Target/TargetFrameLowering.h"
-#include "llvm/Target/TargetOptions.h" // @LOCALMOD for llvm::TLSUseCall
 #include "llvm/Target/TargetRegisterInfo.h"
 using namespace llvm;
 
@@ -48,9 +48,13 @@ namespace {
     const TargetRegisterInfo *TRI;
     const ARMSubtarget *STI;
     ARMFunctionInfo *AFI;
-    bool IsRelocPIC; // @LOCALMOD
 
     bool runOnMachineFunction(MachineFunction &Fn) override;
+
+    MachineFunctionProperties getRequiredProperties() const override {
+      return MachineFunctionProperties().set(
+          MachineFunctionProperties::Property::AllVRegsAllocated);
+    }
 
     const char *getPassName() const override {
       return "ARM pseudo instruction expansion pass";
@@ -60,7 +64,8 @@ namespace {
     void TransferImpOps(MachineInstr &OldMI,
                         MachineInstrBuilder &UseMI, MachineInstrBuilder &DefMI);
     bool ExpandMI(MachineBasicBlock &MBB,
-                  MachineBasicBlock::iterator MBBI);
+                  MachineBasicBlock::iterator MBBI,
+                  MachineBasicBlock::iterator &NextMBBI);
     bool ExpandMBB(MachineBasicBlock &MBB);
     void ExpandVLD(MachineBasicBlock::iterator &MBBI);
     void ExpandVST(MachineBasicBlock::iterator &MBBI);
@@ -69,16 +74,14 @@ namespace {
                     unsigned Opc, bool IsExt);
     void ExpandMOV32BitImm(MachineBasicBlock &MBB,
                            MachineBasicBlock::iterator &MBBI);
-    // @LOCALMOD-BEGIN
-    void AddPICADD_MOVi16_PICID(MachineInstr &MI,
-                                MachineBasicBlock &MBB,
-                                MachineBasicBlock::iterator &MBBI,
-                                bool NotThumb,
-                                unsigned PredReg, ARMCC::CondCodes Pred,
-                                unsigned DstReg, bool DstIsDead,
-                                MachineInstrBuilder &LO16,
-                                MachineInstrBuilder &HI16);
-    // @LOCALMOD-END
+    bool ExpandCMP_SWAP(MachineBasicBlock &MBB,
+                        MachineBasicBlock::iterator MBBI, unsigned LdrexOp,
+                        unsigned StrexOp, unsigned UxtOp,
+                        MachineBasicBlock::iterator &NextMBBI);
+
+    bool ExpandCMP_SWAP_64(MachineBasicBlock &MBB,
+                           MachineBasicBlock::iterator MBBI,
+                           MachineBasicBlock::iterator &NextMBBI);
   };
   char ARMExpandPseudo::ID = 0;
 }
@@ -342,22 +345,19 @@ static const NEONLdStTableEntry NEONLdStTable[] = {
 /// LookupNEONLdSt - Search the NEONLdStTable for information about a NEON
 /// load or store pseudo instruction.
 static const NEONLdStTableEntry *LookupNEONLdSt(unsigned Opcode) {
-  const unsigned NumEntries = array_lengthof(NEONLdStTable);
-
 #ifndef NDEBUG
   // Make sure the table is sorted.
   static bool TableChecked = false;
   if (!TableChecked) {
-    for (unsigned i = 0; i != NumEntries-1; ++i)
-      assert(NEONLdStTable[i] < NEONLdStTable[i+1] &&
-             "NEONLdStTable is not sorted!");
+    assert(std::is_sorted(std::begin(NEONLdStTable), std::end(NEONLdStTable)) &&
+           "NEONLdStTable is not sorted!");
     TableChecked = true;
   }
 #endif
 
-  const NEONLdStTableEntry *I =
-    std::lower_bound(NEONLdStTable, NEONLdStTable + NumEntries, Opcode);
-  if (I != NEONLdStTable + NumEntries && I->PseudoOpc == Opcode)
+  auto I = std::lower_bound(std::begin(NEONLdStTable),
+                            std::end(NEONLdStTable), Opcode);
+  if (I != std::end(NEONLdStTable) && I->PseudoOpc == Opcode)
     return I;
   return nullptr;
 }
@@ -504,41 +504,6 @@ void ARMExpandPseudo::ExpandVST(MachineBasicBlock::iterator &MBBI) {
 
   MI.eraseFromParent();
 }
-
-// @LOCALMOD-BEGIN
-// AddPICADD_MOVi16_PICID - Inserts a PICADD into the given basic block,
-// and adds the PC label ID (of the PICADD) as an operand of the LO16 / HI16
-// MOVs. The ID operand will follow the "Immediate" operand (assumes that
-// operand is already added).
-void ARMExpandPseudo::AddPICADD_MOVi16_PICID(MachineInstr &MI,
-                                       MachineBasicBlock &MBB,
-                                       MachineBasicBlock::iterator &MBBI,
-                                       bool NotThumb,
-                                       unsigned PredReg, ARMCC::CondCodes Pred,
-                                       unsigned DstReg, bool DstIsDead,
-                                       MachineInstrBuilder &LO16,
-                                       MachineInstrBuilder &HI16) {
-  // Throw in a PICADD, and tack on the PC label ID to the MOVT/MOVWs
-  MachineFunction &MF = *MI.getParent()->getParent();
-  ARMFunctionInfo *AFI = MF.getInfo<ARMFunctionInfo>();
-
-  // Make a unique ID for this PC by pulling from pool of constPoolIDs
-  unsigned PC_ID = AFI->createPICLabelUId();
-  MachineInstrBuilder PicADD =
-      BuildMI(MBB, MBBI, MI.getDebugLoc(),
-              TII->get(NotThumb ? ARM::PICADD : ARM::tPICADD))
-      .addReg(DstReg, RegState::Define | getDeadRegState(DstIsDead))
-      .addReg(DstReg)
-      .addImm(PC_ID)
-      .addImm(Pred)
-      .addReg(PredReg);
-  (void)PicADD; // squelch unused warning.
-
-  // Add the PC label ID after what would have been an absolute address.
-  LO16 = LO16.addImm(PC_ID);
-  HI16 = HI16.addImm(PC_ID);
-}
-// @LOCALMOD-END
 
 /// ExpandLaneOp - Translate VLD*LN and VST*LN instructions with Q, QQ or QQQQ
 /// register operands to real instructions with D register operands.
@@ -701,7 +666,7 @@ void ARMExpandPseudo::ExpandMOV32BitImm(MachineBasicBlock &MBB,
   MachineInstr &MI = *MBBI;
   unsigned Opcode = MI.getOpcode();
   unsigned PredReg = 0;
-  ARMCC::CondCodes Pred = getInstrPredicate(&MI, PredReg);
+  ARMCC::CondCodes Pred = getInstrPredicate(MI, PredReg);
   unsigned DstReg = MI.getOperand(0).getReg();
   bool DstIsDead = MI.getOperand(0).isDead();
   bool isCC = Opcode == ARM::MOVCCi32imm || Opcode == ARM::t2MOVCCi32imm;
@@ -737,9 +702,7 @@ void ARMExpandPseudo::ExpandMOV32BitImm(MachineBasicBlock &MBB,
 
   unsigned LO16Opc = 0;
   unsigned HI16Opc = 0;
-  // @LOCALMOD
-  bool isThumb2 = (Opcode == ARM::t2MOVi32imm || Opcode == ARM::t2MOVCCi32imm);
-  if (isThumb2) {
+  if (Opcode == ARM::t2MOVi32imm || Opcode == ARM::t2MOVCCi32imm) {
     LO16Opc = ARM::t2MOVi16;
     HI16Opc = ARM::t2MOVTi16;
   } else {
@@ -747,28 +710,10 @@ void ARMExpandPseudo::ExpandMOV32BitImm(MachineBasicBlock &MBB,
     HI16Opc = ARM::MOVTi16;
   }
 
-  // @LOCALMOD-BEGIN
-  // If constant pools are "disabled" (actually, moved to rodata), then
-  // many addresses (e.g., the addresses of what used to be the "pools")
-  // may not be materialized in a pc-relative manner, because MOVT / MOVW
-  // are used to materialize the addresses.
-  // We need to know if it matters that references are pc-relative
-  // (e.g., to be PIC).
-  // See the comments on MOVi16PIC / MOVTi16PIC for more details.
-  const bool ShouldUseMOV16PIC = !STI->useConstIslands() && IsRelocPIC &&
-      (MO.isCPI() || MO.isJTI() || MO.isGlobal()); // TODO check this list.
-  if (ShouldUseMOV16PIC) {
-    if (isThumb2)
-      llvm_unreachable("FIXME: add PIC versions of t2MOVi16");
-    LO16Opc = ARM::MOVi16PIC;
-    HI16Opc = ARM::MOVTi16PIC;
-  }
-  // @LOCALMOD-END
-
   LO16 = BuildMI(MBB, MBBI, MI.getDebugLoc(), TII->get(LO16Opc), DstReg);
   HI16 = BuildMI(MBB, MBBI, MI.getDebugLoc(), TII->get(HI16Opc))
     .addReg(DstReg, RegState::Define | getDeadRegState(DstIsDead))
-    .addReg(DstReg, RegState::Kill); // @LOCALMOD
+    .addReg(DstReg);
 
   switch (MO.getType()) {
   case MachineOperand::MO_Immediate: {
@@ -787,54 +732,316 @@ void ARMExpandPseudo::ExpandMOV32BitImm(MachineBasicBlock &MBB,
     break;
   }
   default: {
-  if (MO.isGlobal()) { // @LOCALMOD
     const GlobalValue *GV = MO.getGlobal();
     unsigned TF = MO.getTargetFlags();
     LO16 = LO16.addGlobalAddress(GV, MO.getOffset(), TF | ARMII::MO_LO16);
     HI16 = HI16.addGlobalAddress(GV, MO.getOffset(), TF | ARMII::MO_HI16);
-  // @LOCALMOD-START - support for jumptable addresses and CPI
-  } else if (MO.isCPI()) {
-    int i = MO.getIndex();
-    unsigned TF = MO.getTargetFlags();
-    LO16 = LO16.addConstantPoolIndex(i, MO.getOffset(), TF|ARMII::MO_LO16);
-    HI16 = HI16.addConstantPoolIndex(i, MO.getOffset(), TF|ARMII::MO_HI16);
-  } else if (MO.isJTI()){
-    unsigned TF = MO.getTargetFlags();
-    LO16 = LO16.addJumpTableIndex(MO.getIndex(), TF | ARMII::MO_LO16);
-    HI16 = HI16.addJumpTableIndex(MO.getIndex(), TF | ARMII::MO_HI16);
-  } else {
-    assert (0 && "unexpected operand");
-  }
-  // @LOCALMOD-END
     break;
   }
   }
 
-  // @LOCALMOD-BEGIN
-  if (ShouldUseMOV16PIC) {
-    AddPICADD_MOVi16_PICID(MI, MBB, MBBI, !isThumb2,
-                           PredReg, Pred, DstReg, DstIsDead, LO16, HI16);
-  }
-  // @LOCALMOD-END
   LO16->setMemRefs(MI.memoperands_begin(), MI.memoperands_end());
   HI16->setMemRefs(MI.memoperands_begin(), MI.memoperands_end());
   LO16.addImm(Pred).addReg(PredReg);
   HI16.addImm(Pred).addReg(PredReg);
 
   if (RequiresBundling)
-    finalizeBundle(MBB, &*LO16, &*MBBI);
+    finalizeBundle(MBB, LO16->getIterator(), MBBI->getIterator());
 
   TransferImpOps(MI, LO16, HI16);
   MI.eraseFromParent();
 }
 
+static void addPostLoopLiveIns(MachineBasicBlock *MBB, LivePhysRegs &LiveRegs) {
+  for (auto I = LiveRegs.begin(); I != LiveRegs.end(); ++I)
+    MBB->addLiveIn(*I);
+}
+
+/// Expand a CMP_SWAP pseudo-inst to an ldrex/strex loop as simply as
+/// possible. This only gets used at -O0 so we don't care about efficiency of the
+/// generated code.
+bool ARMExpandPseudo::ExpandCMP_SWAP(MachineBasicBlock &MBB,
+                                     MachineBasicBlock::iterator MBBI,
+                                     unsigned LdrexOp, unsigned StrexOp,
+                                     unsigned UxtOp,
+                                     MachineBasicBlock::iterator &NextMBBI) {
+  bool IsThumb = STI->isThumb();
+  MachineInstr &MI = *MBBI;
+  DebugLoc DL = MI.getDebugLoc();
+  MachineOperand &Dest = MI.getOperand(0);
+  unsigned StatusReg = MI.getOperand(1).getReg();
+  MachineOperand &Addr = MI.getOperand(2);
+  MachineOperand &Desired = MI.getOperand(3);
+  MachineOperand &New = MI.getOperand(4);
+
+  LivePhysRegs LiveRegs(&TII->getRegisterInfo());
+  LiveRegs.addLiveOuts(MBB);
+  for (auto I = std::prev(MBB.end()); I != MBBI; --I)
+    LiveRegs.stepBackward(*I);
+
+  MachineFunction *MF = MBB.getParent();
+  auto LoadCmpBB = MF->CreateMachineBasicBlock(MBB.getBasicBlock());
+  auto StoreBB = MF->CreateMachineBasicBlock(MBB.getBasicBlock());
+  auto DoneBB = MF->CreateMachineBasicBlock(MBB.getBasicBlock());
+
+  MF->insert(++MBB.getIterator(), LoadCmpBB);
+  MF->insert(++LoadCmpBB->getIterator(), StoreBB);
+  MF->insert(++StoreBB->getIterator(), DoneBB);
+
+  if (UxtOp) {
+    MachineInstrBuilder MIB =
+        BuildMI(MBB, MBBI, DL, TII->get(UxtOp), Desired.getReg())
+            .addReg(Desired.getReg(), RegState::Kill);
+    if (!IsThumb)
+      MIB.addImm(0);
+    AddDefaultPred(MIB);
+  }
+
+  // .Lloadcmp:
+  //     ldrex rDest, [rAddr]
+  //     cmp rDest, rDesired
+  //     bne .Ldone
+  LoadCmpBB->addLiveIn(Addr.getReg());
+  LoadCmpBB->addLiveIn(Dest.getReg());
+  LoadCmpBB->addLiveIn(Desired.getReg());
+  addPostLoopLiveIns(LoadCmpBB, LiveRegs);
+
+  MachineInstrBuilder MIB;
+  MIB = BuildMI(LoadCmpBB, DL, TII->get(LdrexOp), Dest.getReg());
+  MIB.addReg(Addr.getReg());
+  if (LdrexOp == ARM::t2LDREX)
+    MIB.addImm(0); // a 32-bit Thumb ldrex (only) allows an offset.
+  AddDefaultPred(MIB);
+
+  unsigned CMPrr = IsThumb ? ARM::tCMPhir : ARM::CMPrr;
+  AddDefaultPred(BuildMI(LoadCmpBB, DL, TII->get(CMPrr))
+                     .addReg(Dest.getReg(), getKillRegState(Dest.isDead()))
+                     .addOperand(Desired));
+  unsigned Bcc = IsThumb ? ARM::tBcc : ARM::Bcc;
+  BuildMI(LoadCmpBB, DL, TII->get(Bcc))
+      .addMBB(DoneBB)
+      .addImm(ARMCC::NE)
+      .addReg(ARM::CPSR, RegState::Kill);
+  LoadCmpBB->addSuccessor(DoneBB);
+  LoadCmpBB->addSuccessor(StoreBB);
+
+  // .Lstore:
+  //     strex rStatus, rNew, [rAddr]
+  //     cmp rStatus, #0
+  //     bne .Lloadcmp
+  StoreBB->addLiveIn(Addr.getReg());
+  StoreBB->addLiveIn(New.getReg());
+  addPostLoopLiveIns(StoreBB, LiveRegs);
+
+
+  MIB = BuildMI(StoreBB, DL, TII->get(StrexOp), StatusReg);
+  MIB.addOperand(New);
+  MIB.addOperand(Addr);
+  if (StrexOp == ARM::t2STREX)
+    MIB.addImm(0); // a 32-bit Thumb strex (only) allows an offset.
+  AddDefaultPred(MIB);
+
+  unsigned CMPri = IsThumb ? ARM::t2CMPri : ARM::CMPri;
+  AddDefaultPred(BuildMI(StoreBB, DL, TII->get(CMPri))
+                     .addReg(StatusReg, RegState::Kill)
+                     .addImm(0));
+  BuildMI(StoreBB, DL, TII->get(Bcc))
+      .addMBB(LoadCmpBB)
+      .addImm(ARMCC::NE)
+      .addReg(ARM::CPSR, RegState::Kill);
+  StoreBB->addSuccessor(LoadCmpBB);
+  StoreBB->addSuccessor(DoneBB);
+
+  DoneBB->splice(DoneBB->end(), &MBB, MI, MBB.end());
+  DoneBB->transferSuccessors(&MBB);
+  addPostLoopLiveIns(DoneBB, LiveRegs);
+
+  MBB.addSuccessor(LoadCmpBB);
+
+  NextMBBI = MBB.end();
+  MI.eraseFromParent();
+  return true;
+}
+
+/// ARM's ldrexd/strexd take a consecutive register pair (represented as a
+/// single GPRPair register), Thumb's take two separate registers so we need to
+/// extract the subregs from the pair.
+static void addExclusiveRegPair(MachineInstrBuilder &MIB, MachineOperand &Reg,
+                                unsigned Flags, bool IsThumb,
+                                const TargetRegisterInfo *TRI) {
+  if (IsThumb) {
+    unsigned RegLo = TRI->getSubReg(Reg.getReg(), ARM::gsub_0);
+    unsigned RegHi = TRI->getSubReg(Reg.getReg(), ARM::gsub_1);
+    MIB.addReg(RegLo, Flags | getKillRegState(Reg.isDead()));
+    MIB.addReg(RegHi, Flags | getKillRegState(Reg.isDead()));
+  } else
+    MIB.addReg(Reg.getReg(), Flags | getKillRegState(Reg.isDead()));
+}
+
+/// Expand a 64-bit CMP_SWAP to an ldrexd/strexd loop.
+bool ARMExpandPseudo::ExpandCMP_SWAP_64(MachineBasicBlock &MBB,
+                                        MachineBasicBlock::iterator MBBI,
+                                        MachineBasicBlock::iterator &NextMBBI) {
+  bool IsThumb = STI->isThumb();
+  MachineInstr &MI = *MBBI;
+  DebugLoc DL = MI.getDebugLoc();
+  MachineOperand &Dest = MI.getOperand(0);
+  unsigned StatusReg = MI.getOperand(1).getReg();
+  MachineOperand &Addr = MI.getOperand(2);
+  MachineOperand &Desired = MI.getOperand(3);
+  MachineOperand &New = MI.getOperand(4);
+
+  unsigned DestLo = TRI->getSubReg(Dest.getReg(), ARM::gsub_0);
+  unsigned DestHi = TRI->getSubReg(Dest.getReg(), ARM::gsub_1);
+  unsigned DesiredLo = TRI->getSubReg(Desired.getReg(), ARM::gsub_0);
+  unsigned DesiredHi = TRI->getSubReg(Desired.getReg(), ARM::gsub_1);
+
+  LivePhysRegs LiveRegs(&TII->getRegisterInfo());
+  LiveRegs.addLiveOuts(MBB);
+  for (auto I = std::prev(MBB.end()); I != MBBI; --I)
+    LiveRegs.stepBackward(*I);
+
+  MachineFunction *MF = MBB.getParent();
+  auto LoadCmpBB = MF->CreateMachineBasicBlock(MBB.getBasicBlock());
+  auto StoreBB = MF->CreateMachineBasicBlock(MBB.getBasicBlock());
+  auto DoneBB = MF->CreateMachineBasicBlock(MBB.getBasicBlock());
+
+  MF->insert(++MBB.getIterator(), LoadCmpBB);
+  MF->insert(++LoadCmpBB->getIterator(), StoreBB);
+  MF->insert(++StoreBB->getIterator(), DoneBB);
+
+  // .Lloadcmp:
+  //     ldrexd rDestLo, rDestHi, [rAddr]
+  //     cmp rDestLo, rDesiredLo
+  //     sbcs rStatus<dead>, rDestHi, rDesiredHi
+  //     bne .Ldone
+  LoadCmpBB->addLiveIn(Addr.getReg());
+  LoadCmpBB->addLiveIn(Dest.getReg());
+  LoadCmpBB->addLiveIn(Desired.getReg());
+  addPostLoopLiveIns(LoadCmpBB, LiveRegs);
+
+  unsigned LDREXD = IsThumb ? ARM::t2LDREXD : ARM::LDREXD;
+  MachineInstrBuilder MIB;
+  MIB = BuildMI(LoadCmpBB, DL, TII->get(LDREXD));
+  addExclusiveRegPair(MIB, Dest, RegState::Define, IsThumb, TRI);
+  MIB.addReg(Addr.getReg());
+  AddDefaultPred(MIB);
+
+  unsigned CMPrr = IsThumb ? ARM::tCMPhir : ARM::CMPrr;
+  AddDefaultPred(BuildMI(LoadCmpBB, DL, TII->get(CMPrr))
+                     .addReg(DestLo, getKillRegState(Dest.isDead()))
+                     .addReg(DesiredLo, getKillRegState(Desired.isDead())));
+
+  unsigned SBCrr = IsThumb ? ARM::t2SBCrr : ARM::SBCrr;
+  MIB = BuildMI(LoadCmpBB, DL, TII->get(SBCrr))
+            .addReg(StatusReg, RegState::Define | RegState::Dead)
+            .addReg(DestHi, getKillRegState(Dest.isDead()))
+            .addReg(DesiredHi, getKillRegState(Desired.isDead()));
+  AddDefaultPred(MIB);
+  MIB.addReg(ARM::CPSR, RegState::Kill);
+
+  unsigned Bcc = IsThumb ? ARM::tBcc : ARM::Bcc;
+  BuildMI(LoadCmpBB, DL, TII->get(Bcc))
+      .addMBB(DoneBB)
+      .addImm(ARMCC::NE)
+      .addReg(ARM::CPSR, RegState::Kill);
+  LoadCmpBB->addSuccessor(DoneBB);
+  LoadCmpBB->addSuccessor(StoreBB);
+
+  // .Lstore:
+  //     strexd rStatus, rNewLo, rNewHi, [rAddr]
+  //     cmp rStatus, #0
+  //     bne .Lloadcmp
+  StoreBB->addLiveIn(Addr.getReg());
+  StoreBB->addLiveIn(New.getReg());
+  addPostLoopLiveIns(StoreBB, LiveRegs);
+
+  unsigned STREXD = IsThumb ? ARM::t2STREXD : ARM::STREXD;
+  MIB = BuildMI(StoreBB, DL, TII->get(STREXD), StatusReg);
+  addExclusiveRegPair(MIB, New, 0, IsThumb, TRI);
+  MIB.addOperand(Addr);
+  AddDefaultPred(MIB);
+
+  unsigned CMPri = IsThumb ? ARM::t2CMPri : ARM::CMPri;
+  AddDefaultPred(BuildMI(StoreBB, DL, TII->get(CMPri))
+                     .addReg(StatusReg, RegState::Kill)
+                     .addImm(0));
+  BuildMI(StoreBB, DL, TII->get(Bcc))
+      .addMBB(LoadCmpBB)
+      .addImm(ARMCC::NE)
+      .addReg(ARM::CPSR, RegState::Kill);
+  StoreBB->addSuccessor(LoadCmpBB);
+  StoreBB->addSuccessor(DoneBB);
+
+  DoneBB->splice(DoneBB->end(), &MBB, MI, MBB.end());
+  DoneBB->transferSuccessors(&MBB);
+  addPostLoopLiveIns(DoneBB, LiveRegs);
+
+  MBB.addSuccessor(LoadCmpBB);
+
+  NextMBBI = MBB.end();
+  MI.eraseFromParent();
+  return true;
+}
+
+
 bool ARMExpandPseudo::ExpandMI(MachineBasicBlock &MBB,
-                               MachineBasicBlock::iterator MBBI) {
+                               MachineBasicBlock::iterator MBBI,
+                               MachineBasicBlock::iterator &NextMBBI) {
   MachineInstr &MI = *MBBI;
   unsigned Opcode = MI.getOpcode();
   switch (Opcode) {
     default:
       return false;
+
+    case ARM::TCRETURNdi:
+    case ARM::TCRETURNri: {
+      MachineBasicBlock::iterator MBBI = MBB.getLastNonDebugInstr();
+      assert(MBBI->isReturn() &&
+             "Can only insert epilog into returning blocks");
+      unsigned RetOpcode = MBBI->getOpcode();
+      DebugLoc dl = MBBI->getDebugLoc();
+      const ARMBaseInstrInfo &TII = *static_cast<const ARMBaseInstrInfo *>(
+          MBB.getParent()->getSubtarget().getInstrInfo());
+
+      // Tail call return: adjust the stack pointer and jump to callee.
+      MBBI = MBB.getLastNonDebugInstr();
+      MachineOperand &JumpTarget = MBBI->getOperand(0);
+
+      // Jump to label or value in register.
+      if (RetOpcode == ARM::TCRETURNdi) {
+        unsigned TCOpcode =
+            STI->isThumb()
+                ? (STI->isTargetMachO() ? ARM::tTAILJMPd : ARM::tTAILJMPdND)
+                : ARM::TAILJMPd;
+        MachineInstrBuilder MIB = BuildMI(MBB, MBBI, dl, TII.get(TCOpcode));
+        if (JumpTarget.isGlobal())
+          MIB.addGlobalAddress(JumpTarget.getGlobal(), JumpTarget.getOffset(),
+                               JumpTarget.getTargetFlags());
+        else {
+          assert(JumpTarget.isSymbol());
+          MIB.addExternalSymbol(JumpTarget.getSymbolName(),
+                                JumpTarget.getTargetFlags());
+        }
+
+        // Add the default predicate in Thumb mode.
+        if (STI->isThumb())
+          MIB.addImm(ARMCC::AL).addReg(0);
+      } else if (RetOpcode == ARM::TCRETURNri) {
+        BuildMI(MBB, MBBI, dl,
+                TII.get(STI->isThumb() ? ARM::tTAILJMPr : ARM::TAILJMPr))
+            .addReg(JumpTarget.getReg(), RegState::Kill);
+      }
+
+      auto NewMI = std::prev(MBBI);
+      for (unsigned i = 1, e = MBBI->getNumOperands(); i != e; ++i)
+        NewMI->addOperand(MBBI->getOperand(i));
+
+      // Delete the pseudo instruction TCRETURN.
+      MBB.erase(MBBI);
+      MBBI = NewMI;
+      return true;
+    }
     case ARM::VMOVScc:
     case ARM::VMOVDcc: {
       unsigned newOpc = Opcode == ARM::VMOVScc ? ARM::VMOVS : ARM::VMOVD;
@@ -1018,8 +1225,6 @@ bool ARMExpandPseudo::ExpandMI(MachineBasicBlock &MBB,
     }
     case ARM::tTPsoft:
     case ARM::TPsoft: {
-      // @LOCALMOD-BEGIN
-      if (!STI->isTargetNaCl() || llvm::TLSUseCall) {
       MachineInstrBuilder MIB;
       if (Opcode == ARM::tTPsoft)
         MIB = BuildMI(MBB, MBBI, MI.getDebugLoc(),
@@ -1027,24 +1232,12 @@ bool ARMExpandPseudo::ExpandMI(MachineBasicBlock &MBB,
               .addImm((unsigned)ARMCC::AL).addReg(0)
               .addExternalSymbol("__aeabi_read_tp", 0);
       else
-        MIB = BuildMI_NoImp(MBB, MBBI, MI.getDebugLoc(), // @LOCALMOD
+        MIB = BuildMI(MBB, MBBI, MI.getDebugLoc(),
                       TII->get( ARM::BL))
               .addExternalSymbol("__aeabi_read_tp", 0);
 
       MIB->setMemRefs(MI.memoperands_begin(), MI.memoperands_end());
       TransferImpOps(MI, MIB, MIB);
-      } else {
-        // Inline version for native client.
-        // See native_client/src/untrusted/nacl/aeabi_read_tp.S
-        // .nexe builds use this version, while irt builds use a call to
-        // __aeabi_read_tp.
-        // ldr r0, [r9, #0]
-        AddDefaultPred(BuildMI(MBB, MBBI, MI.getDebugLoc(),
-                               TII->get(ARM::LDRi12), ARM::R0)
-                       .addReg(ARM::R9)
-                       .addImm(0));
-      }
-      // @LOCALMOD-END
       MI.eraseFromParent();
       return true;
     }
@@ -1165,7 +1358,6 @@ bool ARMExpandPseudo::ExpandMI(MachineBasicBlock &MBB,
     }
 
     case ARM::MOVi32imm:
-    case ARM::MOVti32imm: // @LOCALMOD
     case ARM::MOVCCi32imm:
     case ARM::t2MOVi32imm:
     case ARM::t2MOVCCi32imm:
@@ -1433,61 +1625,29 @@ bool ARMExpandPseudo::ExpandMI(MachineBasicBlock &MBB,
     case ARM::VTBX3Pseudo: ExpandVTBL(MBBI, ARM::VTBX3, true); return true;
     case ARM::VTBX4Pseudo: ExpandVTBL(MBBI, ARM::VTBX4, true); return true;
 
-    // @LOCALMOD-BEGIN
-    case ARM::ARMeh_return: {
-      // This pseudo instruction is generated as part of the lowering of
-      // ISD::EH_RETURN (c.f. ARMISelLowering.cpp)
-      // we convert it to a stack increment by OffsetReg and
-      // indirect jump to TargetReg
-      unsigned PredReg = 0;
-      ARMCC::CondCodes Pred = llvm::getInstrPredicate(&MI, PredReg);
-      unsigned OffsetReg = MI.getOperand(0).getReg();
-      unsigned TargetReg = MI.getOperand(1).getReg();
-      BuildMI(MBB, MBBI, MI.getDebugLoc(), TII->get(ARM::ADDrr), ARM::SP)
-          .addReg(OffsetReg)
-          .addReg(ARM::SP)
-          .addImm(Pred)
-          .addReg(PredReg)
-          .addReg(0);
+    case ARM::CMP_SWAP_8:
+      if (STI->isThumb())
+        return ExpandCMP_SWAP(MBB, MBBI, ARM::t2LDREXB, ARM::t2STREXB,
+                              ARM::tUXTB, NextMBBI);
+      else
+        return ExpandCMP_SWAP(MBB, MBBI, ARM::LDREXB, ARM::STREXB,
+                              ARM::UXTB, NextMBBI);
+    case ARM::CMP_SWAP_16:
+      if (STI->isThumb())
+        return ExpandCMP_SWAP(MBB, MBBI, ARM::t2LDREXH, ARM::t2STREXH,
+                              ARM::tUXTH, NextMBBI);
+      else
+        return ExpandCMP_SWAP(MBB, MBBI, ARM::LDREXH, ARM::STREXH,
+                              ARM::UXTH, NextMBBI);
+    case ARM::CMP_SWAP_32:
+      if (STI->isThumb())
+        return ExpandCMP_SWAP(MBB, MBBI, ARM::t2LDREX, ARM::t2STREX, 0,
+                              NextMBBI);
+      else
+        return ExpandCMP_SWAP(MBB, MBBI, ARM::LDREX, ARM::STREX, 0, NextMBBI);
 
-      BuildMI(MBB, MBBI, MI.getDebugLoc(), TII->get(ARM::BX))
-          .addReg(TargetReg);
-      MI.eraseFromParent();
-      return true;
-    }
-    case ARM::MOVGOTAddr : {
-      // Expand the pseudo-inst that requests for the GOT address
-      // to be materialized into a register. We use MOVW/MOVT for this.
-      // See ARMISelLowering.cpp for a comment on the strategy.
-      unsigned PredReg = 0;
-      ARMCC::CondCodes Pred = llvm::getInstrPredicate(&MI, PredReg);
-      unsigned DstReg = MI.getOperand(0).getReg();
-      bool DstIsDead = MI.getOperand(0).isDead();
-      MachineInstrBuilder LO16, HI16;
-
-      LO16 = BuildMI(MBB, MBBI, MI.getDebugLoc(),
-                     TII->get(ARM::MOVi16PIC),
-                     DstReg)
-        .addExternalSymbol("_GLOBAL_OFFSET_TABLE_", ARMII::MO_LO16);
-
-      HI16 = BuildMI(MBB, MBBI, MI.getDebugLoc(),
-                     TII->get(ARM::MOVTi16PIC))
-        .addReg(DstReg, RegState::Define | getDeadRegState(DstIsDead))
-        .addReg(DstReg)
-        .addExternalSymbol("_GLOBAL_OFFSET_TABLE_", ARMII::MO_HI16);
-
-      AddPICADD_MOVi16_PICID(MI, MBB, MBBI, true,
-                             PredReg, Pred, DstReg, DstIsDead, LO16, HI16);
-
-      (*LO16).setMemRefs(MI.memoperands_begin(), MI.memoperands_end());
-      (*HI16).setMemRefs(MI.memoperands_begin(), MI.memoperands_end());
-      LO16.addImm(Pred).addReg(PredReg);
-      HI16.addImm(Pred).addReg(PredReg);
-      TransferImpOps(MI, LO16, HI16);
-      MI.eraseFromParent();
-      return true;
-    }
-    // @LOCALMOD-END
+    case ARM::CMP_SWAP_64:
+      return ExpandCMP_SWAP_64(MBB, MBBI, NextMBBI);
   }
 }
 
@@ -1497,7 +1657,7 @@ bool ARMExpandPseudo::ExpandMBB(MachineBasicBlock &MBB) {
   MachineBasicBlock::iterator MBBI = MBB.begin(), E = MBB.end();
   while (MBBI != E) {
     MachineBasicBlock::iterator NMBBI = std::next(MBBI);
-    Modified |= ExpandMI(MBB, MBBI);
+    Modified |= ExpandMI(MBB, MBBI, NMBBI);
     MBBI = NMBBI;
   }
 
@@ -1509,7 +1669,6 @@ bool ARMExpandPseudo::runOnMachineFunction(MachineFunction &MF) {
   TII = STI->getInstrInfo();
   TRI = STI->getRegisterInfo();
   AFI = MF.getInfo<ARMFunctionInfo>();
-  IsRelocPIC = MF.getTarget().getRelocationModel() == Reloc::PIC_;
 
   bool Modified = false;
   for (MachineFunction::iterator MFI = MF.begin(), E = MF.end(); MFI != E;

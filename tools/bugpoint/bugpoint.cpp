@@ -50,7 +50,7 @@ TimeoutValue("timeout", cl::init(300), cl::value_desc("seconds"),
 static cl::opt<int>
 MemoryLimit("mlimit", cl::init(-1), cl::value_desc("MBytes"),
             cl::desc("Maximum amount of memory to use. 0 disables check."
-                     " Defaults to 300MB (800MB under valgrind)."));
+                     " Defaults to 400MB (800MB under valgrind)."));
 
 static cl::opt<bool>
 UseValgrind("enable-valgrind",
@@ -113,7 +113,7 @@ void initializePollyPasses(llvm::PassRegistry &Registry);
 
 int main(int argc, char **argv) {
 #ifndef DEBUG_BUGPOINT
-  llvm::sys::PrintStackTraceOnErrorSignal();
+  llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
   llvm::PrettyStackTraceProgram X(argc, argv);
   llvm_shutdown_obj Y;  // Call llvm_shutdown() on exit.
 #endif
@@ -126,7 +126,6 @@ int main(int argc, char **argv) {
   initializeVectorization(Registry);
   initializeIPO(Registry);
   initializeAnalysis(Registry);
-  initializeIPA(Registry);
   initializeTransformUtils(Registry);
   initializeInstCombine(Registry);
   initializeInstrumentation(Registry);
@@ -135,66 +134,6 @@ int main(int argc, char **argv) {
 #ifdef LINK_POLLY_INTO_TOOLS
   polly::initializePollyPasses(Registry);
 #endif
-
-  // @LOCALMOD-BEGIN
-  initializeAddPNaClExternalDeclsPass(Registry);
-  initializeAllocateDataSegmentPass(Registry);
-  initializeBackendCanonicalizePass(Registry);
-  initializeCanonicalizeMemIntrinsicsPass(Registry);
-  initializeCleanupUsedGlobalsMetadataPass(Registry);
-  initializeConstantInsertExtractElementIndexPass(Registry);
-  initializeExpandAllocasPass(Registry);
-  initializeExpandArithWithOverflowPass(Registry);
-  initializeExpandByValPass(Registry);
-  initializeExpandConstantExprPass(Registry);
-  initializeExpandCtorsPass(Registry);
-  initializeExpandGetElementPtrPass(Registry);
-  initializeExpandIndirectBrPass(Registry);
-  initializeExpandLargeIntegersPass(Registry);
-  initializeExpandShuffleVectorPass(Registry);
-  initializeExpandSmallArgumentsPass(Registry);
-  initializeExpandStructRegsPass(Registry);
-  initializeExpandTlsConstantExprPass(Registry);
-  initializeExpandTlsPass(Registry);
-  initializeExpandVarArgsPass(Registry);
-  initializeFixVectorLoadStoreAlignmentPass(Registry);
-  initializeFlattenGlobalsPass(Registry);
-  initializeGlobalCleanupPass(Registry);
-  initializeGlobalizeConstantVectorsPass(Registry);
-  initializeInsertDivideCheckPass(Registry);
-  initializeInternalizeUsedGlobalsPass(Registry);
-  initializeNormalizeAlignmentPass(Registry);
-  initializePNaClABIVerifyFunctionsPass(Registry);
-  initializePNaClABIVerifyModulePass(Registry);
-  initializePNaClSjLjEHPass(Registry);
-  initializePromoteI1OpsPass(Registry);
-  initializePromoteIntegersPass(Registry);
-  initializeRemoveAsmMemoryPass(Registry);
-  initializeRenameEntryPointPass(Registry);
-  initializeReplacePtrsWithIntsPass(Registry);
-  initializeResolveAliasesPass(Registry);
-  initializeResolvePNaClIntrinsicsPass(Registry);
-  initializeRewriteAtomicsPass(Registry);
-  initializeRewriteLLVMIntrinsicsPass(Registry);
-  initializeRewritePNaClLibraryCallsPass(Registry);
-  initializeSandboxIndirectCallsPass(Registry);
-  initializeSandboxMemoryAccessesPass(Registry);
-  initializeSimplifyAllocasPass(Registry);
-  initializeSimplifyStructRegSignaturesPass(Registry);
-  initializeStripAttributesPass(Registry);
-  initializeStripMetadataPass(Registry);
-  initializeStripModuleFlagsPass(Registry);
-  initializeStripTlsPass(Registry);
-  initializeSubstituteUndefsPass(Registry);
-  // Emscripten passes:
-  initializeExpandI64Pass(Registry);
-  initializeExpandInsertExtractElementPass(Registry);
-  initializeLowerEmAsyncifyPass(Registry);
-  initializeLowerEmExceptionsPass(Registry);
-  initializeLowerEmSetjmpPass(Registry);
-  initializeNoExitRuntimePass(Registry);
-  // Emscripten passes end.
-  // @LOCALMOD-END
   
   cl::ParseCommandLineOptions(argc, argv,
                               "LLVM automatic testcase reducer. See\nhttp://"
@@ -204,7 +143,7 @@ int main(int argc, char **argv) {
   sys::SetInterruptFunction(BugpointInterruptFunction);
 #endif
 
-  LLVMContext& Context = getGlobalContext();
+  LLVMContext Context;
   // If we have an override, set it and then track the triple we want Modules
   // to use.
   if (!OverrideTriple.empty()) {
@@ -218,7 +157,7 @@ int main(int argc, char **argv) {
     if (sys::RunningOnValgrind() || UseValgrind)
       MemoryLimit = 800;
     else
-      MemoryLimit = 300;
+      MemoryLimit = 400;
   }
 
   BugDriver D(argv[0], FindBugs, TimeoutValue, MemoryLimit,
@@ -241,19 +180,12 @@ int main(int argc, char **argv) {
       Builder.Inliner = createFunctionInliningPass(225);
     else
       Builder.Inliner = createFunctionInliningPass(275);
-
-    // Note that although clang/llvm-gcc use two separate passmanagers
-    // here, it shouldn't normally make a difference.
     Builder.populateFunctionPassManager(PM);
     Builder.populateModulePassManager(PM);
   }
 
-  for (std::vector<const PassInfo*>::iterator I = PassList.begin(),
-         E = PassList.end();
-       I != E; ++I) {
-    const PassInfo* PI = *I;
+  for (const PassInfo *PI : PassList)
     D.addPass(PI->getPassArgument());
-  }
 
   // Bugpoint has the ability of generating a plethora of core files, so to
   // avoid filling up the disk, we prevent it

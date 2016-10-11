@@ -18,7 +18,6 @@
 
 #include "llvm/MC/MCDirectives.h"
 #include "llvm/MC/MCDwarf.h"
-#include "llvm/MC/MachineLocation.h"
 #include <cassert>
 #include <vector>
 
@@ -37,6 +36,7 @@ enum class EncodingType {
   ARM,     /// Windows NT (Windows on ARM)
   CE,      /// Windows CE ARM, PowerPC, SH3, SH4
   Itanium, /// Windows x64, Windows Itanium (IA-64)
+  X86,     /// Windows x86, uses no CFI, just EH tables
   MIPS = Alpha,
 };
 }
@@ -52,6 +52,12 @@ enum class ExceptionHandling {
 namespace LCOMM {
 enum LCOMMType { NoAlignment, ByteAlignment, Log2Alignment };
 }
+
+enum class DebugCompressionType {
+  DCT_None,    // no compression
+  DCT_Zlib,    // zlib style complession
+  DCT_ZlibGnu  // zlib-gnu style compression
+};
 
 /// This class is intended to be used as a base class for asm
 /// properties and features specific to the target.
@@ -155,6 +161,10 @@ protected:
   /// Defaults to false.
   bool AllowAtInName;
 
+  /// If this is true, symbol names with invalid characters will be printed in
+  /// quotes.
+  bool SupportsQuotedNames;
+
   /// This is true if data region markers should be printed as
   /// ".data_region/.end_data_region" directives. If false, use "$d/$a" labels
   /// instead.
@@ -228,7 +238,7 @@ protected:
 
   /// True if the expression
   ///   .long f - g
-  /// uses an relocation but it can be supressed by writting
+  /// uses a relocation but it can be suppressed by writing
   ///   a = f - g
   ///   .long a
   bool SetDirectiveSuppressesReloc;
@@ -256,7 +266,7 @@ protected:
   /// argument and how it is interpreted.  Defaults to NoAlignment.
   LCOMM::LCOMMType LCOMMDirectiveAlignmentType;
 
-  // True if the target allows .align directives on funtions. This is true for
+  // True if the target allows .align directives on functions. This is true for
   // most targets, so defaults to true.
   bool HasFunctionAlignment;
 
@@ -275,6 +285,10 @@ protected:
   /// True if this target supports the MachO .no_dead_strip directive.  Defaults
   /// to false.
   bool HasNoDeadStrip;
+
+  /// True if this target supports the MachO .alt_entry directive.  Defaults to
+  /// false.
+  bool HasAltEntry;
 
   /// Used to declare a global as being a weak symbol. Defaults to ".weak".
   const char *WeakDirective;
@@ -339,7 +353,7 @@ protected:
 
   std::vector<MCCFIInstruction> InitialFrameState;
 
-  //===--- Integrated Assembler State ----------------------------------===//
+  //===--- Integrated Assembler Information ----------------------------===//
 
   /// Should we use the integrated assembler?
   /// The integrated assembler should be enabled by default (by the
@@ -348,8 +362,19 @@ protected:
   /// construction (see LLVMTargetMachine::initAsmInfo()).
   bool UseIntegratedAssembler;
 
-  /// Compress DWARF debug sections. Defaults to false.
-  bool CompressDebugSections;
+  /// Preserve Comments in assembly
+  bool PreserveAsmComments;
+
+  /// Compress DWARF debug sections. Defaults to no compression.
+  DebugCompressionType CompressDebugSections;
+
+  /// True if the integrated assembler should interpret 'a >> b' constant
+  /// expressions as logical rather than arithmetic.
+  bool UseLogicalShr;
+
+  // If true, emit GOTPCRELX/REX_GOTPCRELX instead of GOTPCREL, on
+  // X86_64 ELF.
+  bool RelaxELFRelocations = true;
 
 public:
   explicit MCAsmInfo();
@@ -384,7 +409,7 @@ public:
   /// Targets can implement this method to specify a section to switch to if the
   /// translation unit doesn't have any trampolines that require an executable
   /// stack.
-  virtual const MCSection *getNonexecutableStackSection(MCContext &Ctx) const {
+  virtual MCSection *getNonexecutableStackSection(MCContext &Ctx) const {
     return nullptr;
   }
 
@@ -401,6 +426,19 @@ public:
   virtual const MCExpr *getExprForFDESymbol(const MCSymbol *Sym,
                                             unsigned Encoding,
                                             MCStreamer &Streamer) const;
+
+  /// Return true if the identifier \p Name does not need quotes to be
+  /// syntactically correct.
+  virtual bool isValidUnquotedName(StringRef Name) const;
+
+  /// Return true if the .section directive should be omitted when
+  /// emitting \p SectionName.  For example:
+  ///
+  /// shouldOmitSectionDirective(".text")
+  ///
+  /// returns false => .section .text,#alloc,#execinstr
+  /// returns true  => .text
+  virtual bool shouldOmitSectionDirective(StringRef SectionName) const;
 
   bool usesSunStyleELFSectionSwitchSyntax() const {
     return SunStyleELFSectionSwitchSyntax;
@@ -452,6 +490,7 @@ public:
   const char *getCode64Directive() const { return Code64Directive; }
   unsigned getAssemblerDialect() const { return AssemblerDialect; }
   bool doesAllowAtInName() const { return AllowAtInName; }
+  bool supportsNameQuoting() const { return SupportsQuotedNames; }
   bool doesSupportDataRegionDirectives() const {
     return UseDataRegionDirectives;
   }
@@ -461,7 +500,7 @@ public:
   bool getAlignmentIsInBytes() const { return AlignmentIsInBytes; }
   unsigned getTextAlignFillValue() const { return TextAlignFillValue; }
   const char *getGlobalDirective() const { return GlobalDirective; }
-  bool doesSetDirectiveSuppressesReloc() const {
+  bool doesSetDirectiveSuppressReloc() const {
     return SetDirectiveSuppressesReloc;
   }
   bool hasAggressiveSymbolFolding() const { return HasAggressiveSymbolFolding; }
@@ -476,6 +515,7 @@ public:
   bool hasSingleParameterDotFile() const { return HasSingleParameterDotFile; }
   bool hasIdentDirective() const { return HasIdentDirective; }
   bool hasNoDeadStrip() const { return HasNoDeadStrip; }
+  bool hasAltEntry() const { return HasAltEntry; }
   const char *getWeakDirective() const { return WeakDirective; }
   const char *getWeakRefDirective() const { return WeakRefDirective; }
   bool hasWeakDefDirective() const { return HasWeakDefDirective; }
@@ -498,16 +538,21 @@ public:
   ExceptionHandling getExceptionHandlingType() const { return ExceptionsType; }
   WinEH::EncodingType getWinEHEncodingType() const { return WinEHEncodingType; }
 
+  void setExceptionsType(ExceptionHandling EH) {
+    ExceptionsType = EH;
+  }
+
   /// Returns true if the exception handling method for the platform uses call
   /// frame information to unwind.
   bool usesCFIForEH() const {
     return (ExceptionsType == ExceptionHandling::DwarfCFI ||
-            ExceptionsType == ExceptionHandling::ARM ||
-            ExceptionsType == ExceptionHandling::WinEH);
+            ExceptionsType == ExceptionHandling::ARM || usesWindowsCFI());
   }
 
   bool usesWindowsCFI() const {
-    return ExceptionsType == ExceptionHandling::WinEH;
+    return ExceptionsType == ExceptionHandling::WinEH &&
+           (WinEHEncodingType != WinEH::EncodingType::Invalid &&
+            WinEHEncodingType != WinEH::EncodingType::X86);
   }
 
   bool doesDwarfUseRelocationsAcrossSections() const {
@@ -533,11 +578,26 @@ public:
     UseIntegratedAssembler = Value;
   }
 
-  bool compressDebugSections() const { return CompressDebugSections; }
+  /// Return true if assembly (inline or otherwise) should be parsed.
+  bool preserveAsmComments() const { return PreserveAsmComments; }
 
-  void setCompressDebugSections(bool CompressDebugSections) {
+  /// Set whether assembly (inline or otherwise) should be parsed.
+  virtual void setPreserveAsmComments(bool Value) {
+    PreserveAsmComments = Value;
+  }
+
+  DebugCompressionType compressDebugSections() const {
+    return CompressDebugSections;
+  }
+
+  void setCompressDebugSections(DebugCompressionType CompressDebugSections) {
     this->CompressDebugSections = CompressDebugSections;
   }
+
+  bool shouldUseLogicalShr() const { return UseLogicalShr; }
+
+  bool canRelaxRelocations() const { return RelaxELFRelocations; }
+  void setRelaxELFRelocations(bool V) { RelaxELFRelocations = V; }
 };
 }
 

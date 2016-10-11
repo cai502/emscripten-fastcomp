@@ -148,7 +148,7 @@ public:
       : CurPtr(nullptr), End(nullptr), BytesAllocated(0),
         Allocator(std::forward<T &&>(Allocator)) {}
 
-  // Manually implement a move constructor as we must clear the old allocators
+  // Manually implement a move constructor as we must clear the old allocator's
   // slabs as a matter of correctness.
   BumpPtrAllocatorImpl(BumpPtrAllocatorImpl &&Old)
       : CurPtr(Old.CurPtr), End(Old.End), Slabs(std::move(Old.Slabs)),
@@ -187,6 +187,10 @@ public:
   /// \brief Deallocate all but the current slab and reset the current pointer
   /// to the beginning of it, freeing all memory allocated so far.
   void Reset() {
+    // Deallocate all but the first slab, and deallocate all custom-sized slabs.
+    DeallocateCustomSizedSlabs();
+    CustomSizedSlabs.clear();
+
     if (Slabs.empty())
       return;
 
@@ -195,11 +199,9 @@ public:
     CurPtr = (char *)Slabs.front();
     End = CurPtr + SlabSize;
 
-    // Deallocate all but the first slab, and all custome sized slabs.
+    __asan_poison_memory_region(*Slabs.begin(), computeSlabSize(0));
     DeallocateSlabs(std::next(Slabs.begin()), Slabs.end());
     Slabs.erase(std::next(Slabs.begin()), Slabs.end());
-    DeallocateCustomSizedSlabs();
-    CustomSizedSlabs.clear();
   }
 
   /// \brief Allocate space at the specified alignment.
@@ -221,6 +223,8 @@ public:
       // Without this, MemorySanitizer messages for values originated from here
       // will point to the allocation of the entire slab.
       __msan_allocated_memory(AlignedPtr, Size);
+      // Similarly, tell ASan about this space.
+      __asan_unpoison_memory_region(AlignedPtr, Size);
       return AlignedPtr;
     }
 
@@ -228,12 +232,16 @@ public:
     size_t PaddedSize = Size + Alignment - 1;
     if (PaddedSize > SizeThreshold) {
       void *NewSlab = Allocator.Allocate(PaddedSize, 0);
+      // We own the new slab and don't want anyone reading anyting other than
+      // pieces returned from this method.  So poison the whole slab.
+      __asan_poison_memory_region(NewSlab, PaddedSize);
       CustomSizedSlabs.push_back(std::make_pair(NewSlab, PaddedSize));
 
       uintptr_t AlignedAddr = alignAddr(NewSlab, Alignment);
       assert(AlignedAddr + Size <= (uintptr_t)NewSlab + PaddedSize);
       char *AlignedPtr = (char*)AlignedAddr;
       __msan_allocated_memory(AlignedPtr, Size);
+      __asan_unpoison_memory_region(AlignedPtr, Size);
       return AlignedPtr;
     }
 
@@ -245,13 +253,16 @@ public:
     char *AlignedPtr = (char*)AlignedAddr;
     CurPtr = AlignedPtr + Size;
     __msan_allocated_memory(AlignedPtr, Size);
+    __asan_unpoison_memory_region(AlignedPtr, Size);
     return AlignedPtr;
   }
 
   // Pull in base class overloads.
   using AllocatorBase<BumpPtrAllocatorImpl>::Allocate;
 
-  void Deallocate(const void * /*Ptr*/, size_t /*Size*/) {}
+  void Deallocate(const void *Ptr, size_t Size) {
+    __asan_poison_memory_region(Ptr, Size);
+  }
 
   // Pull in base class overloads.
   using AllocatorBase<BumpPtrAllocatorImpl>::Deallocate;
@@ -266,6 +277,8 @@ public:
       TotalMemory += PtrAndSize.second;
     return TotalMemory;
   }
+
+  size_t getBytesAllocated() const { return BytesAllocated; }
 
   void PrintStats() const {
     detail::printBumpPtrAllocatorStats(Slabs.size(), BytesAllocated,
@@ -309,6 +322,10 @@ private:
     size_t AllocatedSlabSize = computeSlabSize(Slabs.size());
 
     void *NewSlab = Allocator.Allocate(AllocatedSlabSize, 0);
+    // We own the new slab and don't want anyone reading anything other than
+    // pieces returned from this method.  So poison the whole slab.
+    __asan_poison_memory_region(NewSlab, AllocatedSlabSize);
+
     Slabs.push_back(NewSlab);
     CurPtr = (char *)(NewSlab);
     End = ((char *)NewSlab) + AllocatedSlabSize;
@@ -320,14 +337,6 @@ private:
     for (; I != E; ++I) {
       size_t AllocatedSlabSize =
           computeSlabSize(std::distance(Slabs.begin(), I));
-#ifndef NDEBUG
-      // Poison the memory so stale pointers crash sooner.  Note we must
-      // preserve the Size and NextPtr fields at the beginning.
-      if (AllocatedSlabSize != 0) {
-        sys::Memory::setRangeWritable(*I, AllocatedSlabSize);
-        memset(*I, 0xCD, AllocatedSlabSize);
-      }
-#endif
       Allocator.Deallocate(*I, AllocatedSlabSize);
     }
   }
@@ -337,12 +346,6 @@ private:
     for (auto &PtrAndSize : CustomSizedSlabs) {
       void *Ptr = PtrAndSize.first;
       size_t Size = PtrAndSize.second;
-#ifndef NDEBUG
-      // Poison the memory so stale pointers crash sooner.  Note we must
-      // preserve the Size and NextPtr fields at the beginning.
-      sys::Memory::setRangeWritable(Ptr, Size);
-      memset(Ptr, 0xCD, Size);
-#endif
       Allocator.Deallocate(Ptr, Size);
     }
   }

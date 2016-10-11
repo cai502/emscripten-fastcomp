@@ -37,12 +37,12 @@ namespace ARMCP {
   };
 
   enum ARMCPModifier {
-    no_modifier,
-    TLSGD,
-    GOT,
-    GOTOFF,
-    GOTTPOFF,
-    TPOFF
+    no_modifier, /// None
+    TLSGD,       /// Thread Local Storage (General Dynamic Mode)
+    GOT_PREL,    /// Global Offset Table, PC Relative
+    GOTTPOFF,    /// Global Offset Table, Thread Pointer Offset
+    TPOFF,       /// Thread Pointer Offset
+    SECREL,      /// Section Relative (Windows TLS)
   };
 }
 
@@ -102,11 +102,6 @@ public:
   bool isBlockAddress() const { return Kind == ARMCP::CPBlockAddress; }
   bool isLSDA() const { return Kind == ARMCP::CPLSDA; }
   bool isMachineBasicBlock() const{ return Kind == ARMCP::CPMachineBasicBlock; }
-  // @LOCALMOD-START
-  bool isValue() const { return Kind == ARMCP::CPValue; }
-  // @LOCALMOD-END
-
-  unsigned getRelocationInfo() const override { return 2; }
 
   int getExistingMachineCPValue(MachineConstantPool *CP,
                                 unsigned Alignment) override;

@@ -13,6 +13,7 @@
 #include "llvm-pdbdump.h"
 
 #include "llvm/DebugInfo/PDB/IPDBSession.h"
+#include "llvm/DebugInfo/PDB/PDBExtras.h"
 #include "llvm/DebugInfo/PDB/PDBSymbolData.h"
 #include "llvm/DebugInfo/PDB/PDBSymbolFunc.h"
 #include "llvm/DebugInfo/PDB/PDBSymbolFuncDebugEnd.h"
@@ -27,11 +28,13 @@
 #include "llvm/Support/Format.h"
 
 using namespace llvm;
+using namespace llvm::codeview;
+using namespace llvm::pdb;
 
 namespace {
 template <class T>
 void dumpClassParentWithScopeOperator(const T &Symbol, LinePrinter &Printer,
-                                      llvm::FunctionDumper &Dumper) {
+                                      FunctionDumper &Dumper) {
   uint32_t ClassParentId = Symbol.getClassParentId();
   auto ClassParent =
       Symbol.getSession().template getConcreteSymbolById<PDBSymbolTypeUDT>(
@@ -59,8 +62,8 @@ void FunctionDumper::start(const PDBSymbolTypeFunctionSig &Symbol,
 
   PDB_CallingConv CC = Symbol.getCallingConvention();
   bool ShouldDumpCallingConvention = true;
-  if ((ClassParent && CC == PDB_CallingConv::Thiscall) ||
-      (!ClassParent && CC == PDB_CallingConv::NearStdcall)) {
+  if ((ClassParent && CC == CallingConvention::ThisCall) ||
+      (!ClassParent && CC == CallingConvention::NearStdCall)) {
     ShouldDumpCallingConvention = false;
   }
 
@@ -109,19 +112,19 @@ void FunctionDumper::start(const PDBSymbolTypeFunctionSig &Symbol,
 }
 
 void FunctionDumper::start(const PDBSymbolFunc &Symbol, PointerType Pointer) {
-  uint32_t FuncStart = Symbol.getRelativeVirtualAddress();
-  uint32_t FuncEnd = FuncStart + Symbol.getLength();
+  uint64_t FuncStart = Symbol.getVirtualAddress();
+  uint64_t FuncEnd = FuncStart + Symbol.getLength();
 
   Printer << "func [";
   WithColor(Printer, PDB_ColorItem::Address).get() << format_hex(FuncStart, 10);
   if (auto DebugStart = Symbol.findOneChild<PDBSymbolFuncDebugStart>()) {
-    uint32_t Prologue = DebugStart->getRelativeVirtualAddress() - FuncStart;
+    uint64_t Prologue = DebugStart->getVirtualAddress() - FuncStart;
     WithColor(Printer, PDB_ColorItem::Offset).get() << "+" << Prologue;
   }
   Printer << " - ";
   WithColor(Printer, PDB_ColorItem::Address).get() << format_hex(FuncEnd, 10);
   if (auto DebugEnd = Symbol.findOneChild<PDBSymbolFuncDebugEnd>()) {
-    uint32_t Epilogue = FuncEnd - DebugEnd->getRelativeVirtualAddress();
+    uint64_t Epilogue = FuncEnd - DebugEnd->getVirtualAddress();
     WithColor(Printer, PDB_ColorItem::Offset).get() << "-" << Epilogue;
   }
   Printer << "] (";
@@ -152,12 +155,12 @@ void FunctionDumper::start(const PDBSymbolFunc &Symbol, PointerType Pointer) {
   Printer << " ";
 
   auto ClassParent = Symbol.getClassParent();
-  PDB_CallingConv CC = Signature->getCallingConvention();
+  CallingConvention CC = Signature->getCallingConvention();
   if (Pointer != FunctionDumper::PointerType::None)
     Printer << "(";
 
-  if ((ClassParent && CC != PDB_CallingConv::Thiscall) ||
-      (!ClassParent && CC != PDB_CallingConv::NearStdcall)) {
+  if ((ClassParent && CC != CallingConvention::ThisCall) ||
+      (!ClassParent && CC != CallingConvention::NearStdCall)) {
     WithColor(Printer, PDB_ColorItem::Keyword).get()
         << Signature->getCallingConvention() << " ";
   }

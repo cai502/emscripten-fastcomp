@@ -32,8 +32,7 @@ SystemZSubtarget::initializeSubtargetDependencies(StringRef CPU, StringRef FS) {
   return *this;
 }
 
-SystemZSubtarget::SystemZSubtarget(const std::string &TT,
-                                   const std::string &CPU,
+SystemZSubtarget::SystemZSubtarget(const Triple &TT, const std::string &CPU,
                                    const std::string &FS,
                                    const TargetMachine &TM)
     : SystemZGenSubtargetInfo(TT, CPU, FS), HasDistinctOps(false),
@@ -41,20 +40,11 @@ SystemZSubtarget::SystemZSubtarget(const std::string &TT,
       HasPopulationCount(false), HasFastSerialization(false),
       HasInterlockedAccess1(false), HasMiscellaneousExtensions(false),
       HasTransactionalExecution(false), HasProcessorAssist(false),
-      TargetTriple(TT), InstrInfo(initializeSubtargetDependencies(CPU, FS)),
-      TLInfo(TM, *this), TSInfo(*TM.getDataLayout()), FrameLowering() {}
-
-// Return true if GV binds locally under reloc model RM.
-static bool bindsLocally(const GlobalValue *GV, Reloc::Model RM) {
-  // For non-PIC, all symbols bind locally.
-  if (RM == Reloc::Static)
-    return true;
-
-  return GV->hasLocalLinkage() || !GV->hasDefaultVisibility();
-}
+      HasVector(false), HasLoadStoreOnCond2(false), TargetTriple(TT),
+      InstrInfo(initializeSubtargetDependencies(CPU, FS)), TLInfo(TM, *this),
+      TSInfo(), FrameLowering() {}
 
 bool SystemZSubtarget::isPC32DBLSymbol(const GlobalValue *GV,
-                                       Reloc::Model RM,
                                        CodeModel::Model CM) const {
   // PC32DBL accesses require the low bit to be clear.  Note that a zero
   // value selects the default alignment and is therefore OK.
@@ -63,7 +53,7 @@ bool SystemZSubtarget::isPC32DBLSymbol(const GlobalValue *GV,
 
   // For the small model, all locally-binding symbols are in range.
   if (CM == CodeModel::Small)
-    return bindsLocally(GV, RM);
+    return TLInfo.getTargetMachine().shouldAssumeDSOLocal(*GV->getParent(), GV);
 
   // For Medium and above, assume that the symbol is not within the 4GB range.
   // Taking the address of locally-defined text would be OK, but that

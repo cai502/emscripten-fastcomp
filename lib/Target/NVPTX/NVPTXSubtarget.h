@@ -19,8 +19,8 @@
 #include "NVPTXISelLowering.h"
 #include "NVPTXInstrInfo.h"
 #include "NVPTXRegisterInfo.h"
+#include "llvm/CodeGen/SelectionDAGTargetInfo.h"
 #include "llvm/IR/DataLayout.h"
-#include "llvm/Target/TargetSelectionDAGInfo.h"
 #include "llvm/Target/TargetSubtargetInfo.h"
 #include <string>
 
@@ -42,7 +42,7 @@ class NVPTXSubtarget : public NVPTXGenSubtargetInfo {
   const NVPTXTargetMachine &TM;
   NVPTXInstrInfo InstrInfo;
   NVPTXTargetLowering TLInfo;
-  TargetSelectionDAGInfo TSInfo;
+  SelectionDAGTargetInfo TSInfo;
 
   // NVPTX does not have any call stack frame, but need a NVPTX specific
   // FrameLowering class because TargetFrameLowering is abstract.
@@ -52,7 +52,7 @@ public:
   /// This constructor initializes the data members to match that
   /// of the specified module.
   ///
-  NVPTXSubtarget(const std::string &TT, const std::string &CPU,
+  NVPTXSubtarget(const Triple &TT, const std::string &CPU,
                  const std::string &FS, const NVPTXTargetMachine &TM);
 
   const TargetFrameLowering *getFrameLowering() const override {
@@ -65,7 +65,7 @@ public:
   const NVPTXTargetLowering *getTargetLowering() const override {
     return &TLInfo;
   }
-  const TargetSelectionDAGInfo *getSelectionDAGInfo() const override {
+  const SelectionDAGTargetInfo *getSelectionDAGInfo() const override {
     return &TSInfo;
   }
 

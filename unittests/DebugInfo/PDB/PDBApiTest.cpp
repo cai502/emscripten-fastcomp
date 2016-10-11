@@ -50,6 +50,7 @@
 #include "llvm/DebugInfo/PDB/PDBTypes.h"
 #include "gtest/gtest.h"
 using namespace llvm;
+using namespace llvm::pdb;
 
 namespace {
 
@@ -72,6 +73,42 @@ class MockSession : public IPDBSession {
   getSourceFileById(uint32_t SymbolId) const override {
     return nullptr;
   }
+
+  std::unique_ptr<PDBSymbol>
+  findSymbolByAddress(uint64_t Address, PDB_SymType Type) const override {
+    return nullptr;
+  }
+  std::unique_ptr<IPDBEnumLineNumbers>
+  findLineNumbers(const PDBSymbolCompiland &Compiland,
+                  const IPDBSourceFile &File) const override {
+    return nullptr;
+  }
+  std::unique_ptr<IPDBEnumLineNumbers>
+  findLineNumbersByAddress(uint64_t Address, uint32_t Length) const override {
+    return nullptr;
+  }
+  std::unique_ptr<IPDBEnumSourceFiles>
+  findSourceFiles(const PDBSymbolCompiland *Compiland, llvm::StringRef Pattern,
+                  PDB_NameSearchFlags Flags) const override {
+    return nullptr;
+  }
+  std::unique_ptr<IPDBSourceFile>
+  findOneSourceFile(const PDBSymbolCompiland *Compiland,
+                    llvm::StringRef Pattern,
+                    PDB_NameSearchFlags Flags) const override {
+    return nullptr;
+  }
+  std::unique_ptr<IPDBEnumChildren<PDBSymbolCompiland>>
+  findCompilandsForSourceFile(llvm::StringRef Pattern,
+                              PDB_NameSearchFlags Flags) const override {
+    return nullptr;
+  }
+  std::unique_ptr<PDBSymbolCompiland>
+  findOneCompilandForSourceFile(llvm::StringRef Pattern,
+                                PDB_NameSearchFlags Flags) const override {
+    return nullptr;
+  }
+
   std::unique_ptr<IPDBEnumSourceFiles> getAllSourceFiles() const override {
     return nullptr;
   }

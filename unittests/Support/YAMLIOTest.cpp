@@ -7,9 +7,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/YAMLTraits.h"
 #include "gtest/gtest.h"
@@ -386,6 +386,111 @@ TEST(YAMLIO, TestReadWriteBuiltInTypes) {
     EXPECT_EQ(map.h16,      Hex16(50000));
     EXPECT_EQ(map.h32,      Hex32(3000000000U));
     EXPECT_EQ(map.h64,      Hex64(6000000000LL));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+//  Test endian-aware types
+//===----------------------------------------------------------------------===//
+
+struct EndianTypes {
+  typedef llvm::support::detail::packed_endian_specific_integral<
+      float, llvm::support::little, llvm::support::unaligned>
+      ulittle_float;
+  typedef llvm::support::detail::packed_endian_specific_integral<
+      double, llvm::support::little, llvm::support::unaligned>
+      ulittle_double;
+
+  llvm::support::ulittle64_t u64;
+  llvm::support::ulittle32_t u32;
+  llvm::support::ulittle16_t u16;
+  llvm::support::little64_t s64;
+  llvm::support::little32_t s32;
+  llvm::support::little16_t s16;
+  ulittle_float f;
+  ulittle_double d;
+};
+
+namespace llvm {
+namespace yaml {
+template <> struct MappingTraits<EndianTypes> {
+  static void mapping(IO &io, EndianTypes &et) {
+    io.mapRequired("u64", et.u64);
+    io.mapRequired("u32", et.u32);
+    io.mapRequired("u16", et.u16);
+    io.mapRequired("s64", et.s64);
+    io.mapRequired("s32", et.s32);
+    io.mapRequired("s16", et.s16);
+    io.mapRequired("f", et.f);
+    io.mapRequired("d", et.d);
+  }
+};
+}
+}
+
+//
+// Test the reading of all endian scalar conversions
+//
+TEST(YAMLIO, TestReadEndianTypes) {
+  EndianTypes map;
+  Input yin("---\n"
+            "u64:      5000000000\n"
+            "u32:      4000000000\n"
+            "u16:      65000\n"
+            "s64:      -5000000000\n"
+            "s32:      -2000000000\n"
+            "s16:      -32000\n"
+            "f:        3.25\n"
+            "d:        -2.8625\n"
+            "...\n");
+  yin >> map;
+
+  EXPECT_FALSE(yin.error());
+  EXPECT_EQ(map.u64, 5000000000ULL);
+  EXPECT_EQ(map.u32, 4000000000U);
+  EXPECT_EQ(map.u16, 65000);
+  EXPECT_EQ(map.s64, -5000000000LL);
+  EXPECT_EQ(map.s32, -2000000000L);
+  EXPECT_EQ(map.s16, -32000);
+  EXPECT_EQ(map.f, 3.25f);
+  EXPECT_EQ(map.d, -2.8625);
+}
+
+//
+// Test writing then reading back all endian-aware scalar types
+//
+TEST(YAMLIO, TestReadWriteEndianTypes) {
+  std::string intermediate;
+  {
+    EndianTypes map;
+    map.u64 = 6000000000ULL;
+    map.u32 = 3000000000U;
+    map.u16 = 50000;
+    map.s64 = -6000000000LL;
+    map.s32 = -2000000000;
+    map.s16 = -32000;
+    map.f = 3.25f;
+    map.d = -2.8625;
+
+    llvm::raw_string_ostream ostr(intermediate);
+    Output yout(ostr);
+    yout << map;
+  }
+
+  {
+    Input yin(intermediate);
+    EndianTypes map;
+    yin >> map;
+
+    EXPECT_FALSE(yin.error());
+    EXPECT_EQ(map.u64, 6000000000ULL);
+    EXPECT_EQ(map.u32, 3000000000U);
+    EXPECT_EQ(map.u16, 50000);
+    EXPECT_EQ(map.s64, -6000000000LL);
+    EXPECT_EQ(map.s32, -2000000000L);
+    EXPECT_EQ(map.s16, -32000);
+    EXPECT_EQ(map.f, 3.25f);
+    EXPECT_EQ(map.d, -2.8625);
   }
 }
 
@@ -780,6 +885,146 @@ TEST(YAMLIO, TestReadWriteMyCustomType) {
 
 
 //===----------------------------------------------------------------------===//
+//  Test BlockScalarTraits
+//===----------------------------------------------------------------------===//
+
+struct MultilineStringType {
+  std::string str;
+};
+
+struct MultilineStringTypeMap {
+  MultilineStringType name;
+  MultilineStringType description;
+  MultilineStringType ingredients;
+  MultilineStringType recipes;
+  MultilineStringType warningLabels;
+  MultilineStringType documentation;
+  int price;
+};
+
+namespace llvm {
+namespace yaml {
+  template <>
+  struct MappingTraits<MultilineStringTypeMap> {
+    static void mapping(IO &io, MultilineStringTypeMap& s) {
+      io.mapRequired("name", s.name);
+      io.mapRequired("description", s.description);
+      io.mapRequired("ingredients", s.ingredients);
+      io.mapRequired("recipes", s.recipes);
+      io.mapRequired("warningLabels", s.warningLabels);
+      io.mapRequired("documentation", s.documentation);
+      io.mapRequired("price", s.price);
+     }
+  };
+
+  // MultilineStringType is formatted as a yaml block literal scalar. A value of
+  // "Hello\nWorld" would be represented in yaml as
+  //  |
+  //    Hello
+  //    World
+  template <>
+  struct BlockScalarTraits<MultilineStringType> {
+    static void output(const MultilineStringType &value, void *ctxt,
+                       llvm::raw_ostream &out) {
+      out << value.str;
+    }
+    static StringRef input(StringRef scalar, void *ctxt,
+                           MultilineStringType &value) {
+      value.str = scalar.str();
+      return StringRef();
+    }
+  };
+}
+}
+
+LLVM_YAML_IS_DOCUMENT_LIST_VECTOR(MultilineStringType)
+
+//
+// Test writing then reading back custom values
+//
+TEST(YAMLIO, TestReadWriteMultilineStringType) {
+  std::string intermediate;
+  {
+    MultilineStringTypeMap map;
+    map.name.str = "An Item";
+    map.description.str = "Hello\nWorld";
+    map.ingredients.str = "SubItem 1\nSub Item 2\n\nSub Item 3\n";
+    map.recipes.str = "\n\nTest 1\n\n\n";
+    map.warningLabels.str = "";
+    map.documentation.str = "\n\n";
+    map.price = 350;
+
+    llvm::raw_string_ostream ostr(intermediate);
+    Output yout(ostr);
+    yout << map;
+  }
+  {
+    Input yin(intermediate);
+    MultilineStringTypeMap map2;
+    yin >> map2;
+
+    EXPECT_FALSE(yin.error());
+    EXPECT_EQ(map2.name.str, "An Item\n");
+    EXPECT_EQ(map2.description.str, "Hello\nWorld\n");
+    EXPECT_EQ(map2.ingredients.str, "SubItem 1\nSub Item 2\n\nSub Item 3\n");
+    EXPECT_EQ(map2.recipes.str, "\n\nTest 1\n");
+    EXPECT_TRUE(map2.warningLabels.str.empty());
+    EXPECT_TRUE(map2.documentation.str.empty());
+    EXPECT_EQ(map2.price, 350);
+  }
+}
+
+//
+// Test writing then reading back custom values
+//
+TEST(YAMLIO, TestReadWriteBlockScalarDocuments) {
+  std::string intermediate;
+  {
+    std::vector<MultilineStringType> documents;
+    MultilineStringType doc;
+    doc.str = "Hello\nWorld";
+    documents.push_back(doc);
+
+    llvm::raw_string_ostream ostr(intermediate);
+    Output yout(ostr);
+    yout << documents;
+
+    // Verify that the block scalar header was written out on the same line
+    // as the document marker.
+    EXPECT_NE(llvm::StringRef::npos, llvm::StringRef(ostr.str()).find("--- |"));
+  }
+  {
+    Input yin(intermediate);
+    std::vector<MultilineStringType> documents2;
+    yin >> documents2;
+
+    EXPECT_FALSE(yin.error());
+    EXPECT_EQ(documents2.size(), size_t(1));
+    EXPECT_EQ(documents2[0].str, "Hello\nWorld\n");
+  }
+}
+
+TEST(YAMLIO, TestReadWriteBlockScalarValue) {
+  std::string intermediate;
+  {
+    MultilineStringType doc;
+    doc.str = "Just a block\nscalar doc";
+
+    llvm::raw_string_ostream ostr(intermediate);
+    Output yout(ostr);
+    yout << doc;
+  }
+  {
+    Input yin(intermediate);
+    MultilineStringType doc;
+    yin >> doc;
+
+    EXPECT_FALSE(yin.error());
+    EXPECT_EQ(doc.str, "Just a block\nscalar doc\n");
+  }
+}
+
+//===----------------------------------------------------------------------===//
 //  Test flow sequences
 //===----------------------------------------------------------------------===//
 
@@ -829,6 +1074,26 @@ namespace yaml {
 }
 }
 
+typedef std::vector<MyNumber> MyNumberFlowSequence;
+
+LLVM_YAML_IS_SEQUENCE_VECTOR(MyNumberFlowSequence)
+
+struct NameAndNumbersFlow {
+  llvm::StringRef                    name;
+  std::vector<MyNumberFlowSequence>  sequenceOfNumbers;
+};
+
+namespace llvm {
+namespace yaml {
+  template <>
+  struct MappingTraits<NameAndNumbersFlow> {
+    static void mapping(IO &io, NameAndNumbersFlow& nn) {
+      io.mapRequired("name",     nn.name);
+      io.mapRequired("sequenceOfNumbers",  nn.sequenceOfNumbers);
+    }
+  };
+}
+}
 
 //
 // Test writing then reading back custom values
@@ -875,6 +1140,51 @@ TEST(YAMLIO, TestReadWriteMyFlowSequence) {
   }
 }
 
+
+//
+// Test writing then reading back a sequence of flow sequences.
+//
+TEST(YAMLIO, TestReadWriteSequenceOfMyFlowSequence) {
+  std::string intermediate;
+  {
+    NameAndNumbersFlow map;
+    map.name  = "hello";
+    MyNumberFlowSequence single = { 0 };
+    MyNumberFlowSequence numbers = { 12, 1, -512 };
+    map.sequenceOfNumbers.push_back(single);
+    map.sequenceOfNumbers.push_back(numbers);
+    map.sequenceOfNumbers.push_back(MyNumberFlowSequence());
+
+    llvm::raw_string_ostream ostr(intermediate);
+    Output yout(ostr);
+    yout << map;
+
+    // Verify sequences were written in flow style
+    // and that the parent sequence used '-'.
+    ostr.flush();
+    llvm::StringRef flowOut(intermediate);
+    EXPECT_NE(llvm::StringRef::npos, flowOut.find("- [ 0 ]"));
+    EXPECT_NE(llvm::StringRef::npos, flowOut.find("- [ 12, 1, -512 ]"));
+    EXPECT_NE(llvm::StringRef::npos, flowOut.find("- [  ]"));
+  }
+
+  {
+    Input yin(intermediate);
+    NameAndNumbersFlow map2;
+    yin >> map2;
+
+    EXPECT_FALSE(yin.error());
+    EXPECT_TRUE(map2.name.equals("hello"));
+    EXPECT_EQ(map2.sequenceOfNumbers.size(), 3UL);
+    EXPECT_EQ(map2.sequenceOfNumbers[0].size(), 1UL);
+    EXPECT_EQ(0,    map2.sequenceOfNumbers[0][0]);
+    EXPECT_EQ(map2.sequenceOfNumbers[1].size(), 3UL);
+    EXPECT_EQ(12,   map2.sequenceOfNumbers[1][0]);
+    EXPECT_EQ(1,    map2.sequenceOfNumbers[1][1]);
+    EXPECT_EQ(-512, map2.sequenceOfNumbers[1][2]);
+    EXPECT_TRUE(map2.sequenceOfNumbers[2].empty());
+  }
+}
 
 //===----------------------------------------------------------------------===//
 //  Test normalizing/denormalizing
@@ -1302,6 +1612,91 @@ TEST(YAMLIO, TestValidatingInput) {
   EXPECT_TRUE(!!yin.error());
 }
 
+//===----------------------------------------------------------------------===//
+//  Test flow mapping
+//===----------------------------------------------------------------------===//
+
+struct FlowFooBar {
+  int foo;
+  int bar;
+
+  FlowFooBar() : foo(0), bar(0) {}
+  FlowFooBar(int foo, int bar) : foo(foo), bar(bar) {}
+};
+
+typedef std::vector<FlowFooBar> FlowFooBarSequence;
+
+LLVM_YAML_IS_SEQUENCE_VECTOR(FlowFooBar)
+
+struct FlowFooBarDoc {
+  FlowFooBar attribute;
+  FlowFooBarSequence seq;
+};
+
+namespace llvm {
+namespace yaml {
+  template <>
+  struct MappingTraits<FlowFooBar> {
+    static void mapping(IO &io, FlowFooBar &fb) {
+      io.mapRequired("foo", fb.foo);
+      io.mapRequired("bar", fb.bar);
+    }
+
+    static const bool flow = true;
+  };
+
+  template <>
+  struct MappingTraits<FlowFooBarDoc> {
+    static void mapping(IO &io, FlowFooBarDoc &fb) {
+      io.mapRequired("attribute", fb.attribute);
+      io.mapRequired("seq", fb.seq);
+    }
+  };
+}
+}
+
+//
+// Test writing then reading back custom mappings
+//
+TEST(YAMLIO, TestReadWriteMyFlowMapping) {
+  std::string intermediate;
+  {
+    FlowFooBarDoc doc;
+    doc.attribute = FlowFooBar(42, 907);
+    doc.seq.push_back(FlowFooBar(1, 2));
+    doc.seq.push_back(FlowFooBar(0, 0));
+    doc.seq.push_back(FlowFooBar(-1, 1024));
+
+    llvm::raw_string_ostream ostr(intermediate);
+    Output yout(ostr);
+    yout << doc;
+
+    // Verify that mappings were written in flow style
+    ostr.flush();
+    llvm::StringRef flowOut(intermediate);
+    EXPECT_NE(llvm::StringRef::npos, flowOut.find("{ foo: 42, bar: 907 }"));
+    EXPECT_NE(llvm::StringRef::npos, flowOut.find("- { foo: 1, bar: 2 }"));
+    EXPECT_NE(llvm::StringRef::npos, flowOut.find("- { foo: 0, bar: 0 }"));
+    EXPECT_NE(llvm::StringRef::npos, flowOut.find("- { foo: -1, bar: 1024 }"));
+  }
+
+  {
+    Input yin(intermediate);
+    FlowFooBarDoc doc2;
+    yin >> doc2;
+
+    EXPECT_FALSE(yin.error());
+    EXPECT_EQ(doc2.attribute.foo, 42);
+    EXPECT_EQ(doc2.attribute.bar, 907);
+    EXPECT_EQ(doc2.seq.size(), 3UL);
+    EXPECT_EQ(doc2.seq[0].foo, 1);
+    EXPECT_EQ(doc2.seq[0].bar, 2);
+    EXPECT_EQ(doc2.seq[1].foo, 0);
+    EXPECT_EQ(doc2.seq[1].bar, 0);
+    EXPECT_EQ(doc2.seq[2].foo, -1);
+    EXPECT_EQ(doc2.seq[2].bar, 1024);
+  }
+}
 
 //===----------------------------------------------------------------------===//
 //  Test error handling
@@ -1783,4 +2178,124 @@ TEST(YAMLIO, TestEmptyStringSucceedsForSequence) {
 
   EXPECT_FALSE(yin.error());
   EXPECT_TRUE(seq.empty());
+}
+
+struct FlowMap {
+  llvm::StringRef str1, str2, str3;
+  FlowMap(llvm::StringRef str1, llvm::StringRef str2, llvm::StringRef str3)
+    : str1(str1), str2(str2), str3(str3) {}
+};
+
+struct FlowSeq {
+  llvm::StringRef str;
+  FlowSeq(llvm::StringRef S) : str(S) {}
+  FlowSeq() = default;
+};
+
+namespace llvm {
+namespace yaml {
+  template <>
+  struct MappingTraits<FlowMap> {
+    static void mapping(IO &io, FlowMap &fm) {
+      io.mapRequired("str1", fm.str1);
+      io.mapRequired("str2", fm.str2);
+      io.mapRequired("str3", fm.str3);
+    }
+
+    static const bool flow = true;
+  };
+
+template <>
+struct ScalarTraits<FlowSeq> {
+  static void output(const FlowSeq &value, void*, llvm::raw_ostream &out) {
+    out << value.str;
+  }
+  static StringRef input(StringRef scalar, void*, FlowSeq &value) {
+    value.str = scalar;
+    return "";
+  }
+
+  static bool mustQuote(StringRef S) { return false; }
+};
+}
+}
+
+LLVM_YAML_IS_FLOW_SEQUENCE_VECTOR(FlowSeq)
+
+TEST(YAMLIO, TestWrapFlow) {
+  std::string out;
+  llvm::raw_string_ostream ostr(out);
+  FlowMap Map("This is str1", "This is str2", "This is str3");
+  std::vector<FlowSeq> Seq;
+  Seq.emplace_back("This is str1");
+  Seq.emplace_back("This is str2");
+  Seq.emplace_back("This is str3");
+
+  {
+    // 20 is just bellow the total length of the first mapping field.
+    // We should wreap at every element.
+    Output yout(ostr, nullptr, 15);
+
+    yout << Map;
+    ostr.flush();
+    EXPECT_EQ(out,
+              "---\n"
+              "{ str1: This is str1, \n"
+              "  str2: This is str2, \n"
+              "  str3: This is str3 }\n"
+              "...\n");
+    out.clear();
+
+    yout << Seq;
+    ostr.flush();
+    EXPECT_EQ(out,
+              "---\n"
+              "[ This is str1, \n"
+              "  This is str2, \n"
+              "  This is str3 ]\n"
+              "...\n");
+    out.clear();
+  }
+  {
+    // 25 will allow the second field to be output on the first line.
+    Output yout(ostr, nullptr, 25);
+
+    yout << Map;
+    ostr.flush();
+    EXPECT_EQ(out,
+              "---\n"
+              "{ str1: This is str1, str2: This is str2, \n"
+              "  str3: This is str3 }\n"
+              "...\n");
+    out.clear();
+
+    yout << Seq;
+    ostr.flush();
+    EXPECT_EQ(out,
+              "---\n"
+              "[ This is str1, This is str2, \n"
+              "  This is str3 ]\n"
+              "...\n");
+    out.clear();
+  }
+  {
+    // 0 means no wrapping.
+    Output yout(ostr, nullptr, 0);
+
+    yout << Map;
+    ostr.flush();
+    EXPECT_EQ(out,
+              "---\n"
+              "{ str1: This is str1, str2: This is str2, str3: This is str3 }\n"
+              "...\n");
+    out.clear();
+
+    yout << Seq;
+    ostr.flush();
+    EXPECT_EQ(out,
+              "---\n"
+              "[ This is str1, This is str2, This is str3 ]\n"
+              "...\n");
+    out.clear();
+  }
 }

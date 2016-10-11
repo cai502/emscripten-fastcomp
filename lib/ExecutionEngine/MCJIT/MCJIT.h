@@ -10,7 +10,6 @@
 #ifndef LLVM_LIB_EXECUTIONENGINE_MCJIT_MCJIT_H
 #define LLVM_LIB_EXECUTIONENGINE_MCJIT_MCJIT_H
 
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
@@ -86,7 +85,7 @@ class MCJIT : public ExecutionEngine {
     ModulePtrSet::iterator begin_added() { return AddedModules.begin(); }
     ModulePtrSet::iterator end_added() { return AddedModules.end(); }
     iterator_range<ModulePtrSet::iterator> added() {
-      return iterator_range<ModulePtrSet::iterator>(begin_added(), end_added());
+      return make_range(begin_added(), end_added());
     }
 
     ModulePtrSet::iterator begin_loaded() { return LoadedModules.begin(); }
@@ -200,6 +199,11 @@ class MCJIT : public ExecutionEngine {
                                             ModulePtrSet::iterator I,
                                             ModulePtrSet::iterator E);
 
+  GlobalVariable *FindGlobalVariableNamedInModulePtrSet(const char *Name,
+                                                        bool AllowInternal,
+                                                        ModulePtrSet::iterator I,
+                                                        ModulePtrSet::iterator E);
+
   void runStaticConstructorsDestructorsInModulePtrSet(bool isDtors,
                                                       ModulePtrSet::iterator I,
                                                       ModulePtrSet::iterator E);
@@ -215,10 +219,16 @@ public:
   void addArchive(object::OwningBinary<object::Archive> O) override;
   bool removeModule(Module *M) override;
 
-  /// FindFunctionNamed - Search all of the active modules to find the one that
+  /// FindFunctionNamed - Search all of the active modules to find the function that
   /// defines FnName.  This is very slow operation and shouldn't be used for
   /// general code.
   Function *FindFunctionNamed(const char *FnName) override;
+
+  /// FindGlobalVariableNamed - Search all of the active modules to find the
+  /// global variable that defines Name.  This is very slow operation and
+  /// shouldn't be used for general code.
+  GlobalVariable *FindGlobalVariableNamed(const char *Name,
+                                          bool AllowInternal = false) override;
 
   /// Sets the object manager that MCJIT should use to avoid compilation.
   void setObjectCache(ObjectCache *manager) override;
@@ -251,7 +261,7 @@ public:
   void *getPointerToFunction(Function *F) override;
 
   GenericValue runFunction(Function *F,
-                           const std::vector<GenericValue> &ArgValues) override;
+                           ArrayRef<GenericValue> ArgValues) override;
 
   /// getPointerToNamedFunction - This method returns the address of the
   /// specified function by using the dlsym function call.  As such it is only
@@ -325,6 +335,6 @@ protected:
                               bool CheckFunctionsOnly);
 };
 
-} // End llvm namespace
+} // end llvm namespace
 
-#endif
+#endif // LLVM_LIB_EXECUTIONENGINE_MCJIT_MCJIT_H

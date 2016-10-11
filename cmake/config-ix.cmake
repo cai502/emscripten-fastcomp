@@ -11,9 +11,10 @@ include(CheckFunctionExists)
 include(CheckCXXSourceCompiles)
 include(TestBigEndian)
 
+include(CheckCompilerVersion)
 include(HandleLLVMStdlib)
 
-if( UNIX AND NOT BEOS )
+if( UNIX AND NOT (BEOS OR HAIKU) )
   # Used by check_symbol_exists:
   set(CMAKE_REQUIRED_LIBRARIES m)
 endif()
@@ -66,8 +67,8 @@ check_include_file(sys/param.h HAVE_SYS_PARAM_H)
 check_include_file(sys/resource.h HAVE_SYS_RESOURCE_H)
 check_include_file(sys/stat.h HAVE_SYS_STAT_H)
 check_include_file(sys/time.h HAVE_SYS_TIME_H)
+check_include_file(sys/types.h HAVE_SYS_TYPES_H)
 check_include_file(sys/uio.h HAVE_SYS_UIO_H)
-check_include_file(sys/wait.h HAVE_SYS_WAIT_H)
 check_include_file(termios.h HAVE_TERMIOS_H)
 check_include_file(unistd.h HAVE_UNISTD_H)
 check_include_file(utime.h HAVE_UTIME_H)
@@ -106,6 +107,22 @@ if( NOT PURE_WINDOWS )
   endif()
   check_library_exists(dl dlopen "" HAVE_LIBDL)
   check_library_exists(rt clock_gettime "" HAVE_LIBRT)
+endif()
+
+if(HAVE_LIBPTHREAD)
+  # We want to find pthreads library and at the moment we do want to
+  # have it reported as '-l<lib>' instead of '-pthread'.
+  # TODO: switch to -pthread once the rest of the build system can deal with it.
+  set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
+  set(THREADS_HAVE_PTHREAD_ARG Off)
+  find_package(Threads REQUIRED)
+  set(PTHREAD_LIB ${CMAKE_THREAD_LIBS_INIT})
+endif()
+
+# Don't look for these libraries on Windows. Also don't look for them if we're
+# using MSan, since uninstrmented third party code may call MSan interceptors
+# like strlen, leading to false positives.
+if( NOT PURE_WINDOWS AND NOT LLVM_USE_SANITIZER MATCHES "Memory.*")
   if (LLVM_ENABLE_ZLIB)
     check_library_exists(z compress2 "" HAVE_LIBZ)
   else()
@@ -130,9 +147,15 @@ if( NOT PURE_WINDOWS )
   endif()
 endif()
 
+check_library_exists(xar xar_open "" HAVE_LIBXAR)
+if(HAVE_LIBXAR)
+  set(XAR_LIB xar)
+endif()
+
 # function checks
 check_symbol_exists(arc4random "stdlib.h" HAVE_DECL_ARC4RANDOM)
 check_symbol_exists(backtrace "execinfo.h" HAVE_BACKTRACE)
+check_symbol_exists(_Unwind_Backtrace "unwind.h" HAVE_UNWIND_BACKTRACE)
 check_symbol_exists(getpagesize unistd.h HAVE_GETPAGESIZE)
 check_symbol_exists(getrusage sys/resource.h HAVE_GETRUSAGE)
 check_symbol_exists(setrlimit sys/resource.h HAVE_SETRLIMIT)
@@ -144,6 +167,9 @@ if( HAVE_SETJMP_H )
   check_symbol_exists(setjmp setjmp.h HAVE_SETJMP)
   check_symbol_exists(siglongjmp setjmp.h HAVE_SIGLONGJMP)
   check_symbol_exists(sigsetjmp setjmp.h HAVE_SIGSETJMP)
+endif()
+if( HAVE_SIGNAL_H )
+  check_symbol_exists(sigaltstack signal.h HAVE_SIGALTSTACK)
 endif()
 if( HAVE_SYS_UIO_H )
   check_symbol_exists(writev sys/uio.h HAVE_WRITEV)
@@ -294,6 +320,10 @@ if( LLVM_ENABLE_PIC )
   set(ENABLE_PIC 1)
 else()
   set(ENABLE_PIC 0)
+  check_cxx_compiler_flag("-fno-pie" SUPPORTS_NO_PIE_FLAG)
+  if(SUPPORTS_NO_PIE_FLAG)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fno-pie")
+  endif()
 endif()
 
 check_cxx_compiler_flag("-Wno-variadic-macros" SUPPORTS_NO_VARIADIC_MACROS_FLAG)
@@ -358,6 +388,10 @@ elseif (LLVM_NATIVE_ARCH MATCHES "hexagon")
   set(LLVM_NATIVE_ARCH Hexagon)
 elseif (LLVM_NATIVE_ARCH MATCHES "s390x")
   set(LLVM_NATIVE_ARCH SystemZ)
+elseif (LLVM_NATIVE_ARCH MATCHES "wasm32")
+  set(LLVM_NATIVE_ARCH WebAssembly)
+elseif (LLVM_NATIVE_ARCH MATCHES "wasm64")
+  set(LLVM_NATIVE_ARCH WebAssembly)
 else ()
   message(FATAL_ERROR "Unknown architecture ${LLVM_NATIVE_ARCH}")
 endif ()
@@ -382,23 +416,21 @@ else ()
   set(LLVM_NATIVE_ASMPRINTER LLVMInitialize${LLVM_NATIVE_ARCH}AsmPrinter)
 
   # We don't have an ASM parser for all architectures yet.
-  if (EXISTS ${CMAKE_SOURCE_DIR}/lib/Target/${LLVM_NATIVE_ARCH}/AsmParser/CMakeLists.txt)
+  if (EXISTS ${PROJECT_SOURCE_DIR}/lib/Target/${LLVM_NATIVE_ARCH}/AsmParser/CMakeLists.txt)
     set(LLVM_NATIVE_ASMPARSER LLVMInitialize${LLVM_NATIVE_ARCH}AsmParser)
   endif ()
 
   # We don't have an disassembler for all architectures yet.
-  if (EXISTS ${CMAKE_SOURCE_DIR}/lib/Target/${LLVM_NATIVE_ARCH}/Disassembler/CMakeLists.txt)
+  if (EXISTS ${PROJECT_SOURCE_DIR}/lib/Target/${LLVM_NATIVE_ARCH}/Disassembler/CMakeLists.txt)
     set(LLVM_NATIVE_DISASSEMBLER LLVMInitialize${LLVM_NATIVE_ARCH}Disassembler)
   endif ()
 endif ()
 
 if( MINGW )
-  set(HAVE_LIBIMAGEHLP 1)
   set(HAVE_LIBPSAPI 1)
   set(HAVE_LIBSHELL32 1)
   # TODO: Check existence of libraries.
   #   include(CheckLibraryExists)
-  #   CHECK_LIBRARY_EXISTS(imagehlp ??? . HAVE_LIBIMAGEHLP)
 endif( MINGW )
 
 if (NOT HAVE_STRTOLL)
@@ -434,21 +466,6 @@ if( MSVC )
 else()
   set(HAVE_DIA_SDK 0)
 endif( MSVC )
-
-if( PURE_WINDOWS )
-  CHECK_CXX_SOURCE_COMPILES("
-    #include <windows.h>
-    #include <imagehlp.h>
-    extern \"C\" void foo(PENUMLOADED_MODULES_CALLBACK);
-    extern \"C\" void foo(BOOL(CALLBACK*)(PCSTR,ULONG_PTR,ULONG,PVOID));
-    int main(){return 0;}"
-    HAVE_ELMCB_PCSTR)
-  if( HAVE_ELMCB_PCSTR )
-    set(WIN32_ELMCB_PCSTR "PCSTR")
-  else()
-    set(WIN32_ELMCB_PCSTR "PSTR")
-  endif()
-endif( PURE_WINDOWS )
 
 # FIXME: Signal handler return type, currently hardcoded to 'void'
 set(RETSIGTYPE void)
@@ -489,7 +506,7 @@ if (LLVM_ENABLE_DOXYGEN)
 
     option(LLVM_DOXYGEN_EXTERNAL_SEARCH "Enable doxygen external search." OFF)
     if (LLVM_DOXYGEN_EXTERNAL_SEARCH)
-      set(LLVM_DOXYGEN_SEARCHENGINE_URL "" CACHE STRING "URL to use for external searhc.")
+      set(LLVM_DOXYGEN_SEARCHENGINE_URL "" CACHE STRING "URL to use for external search.")
       set(LLVM_DOXYGEN_SEARCH_MAPPINGS "" CACHE STRING "Doxygen Search Mappings")
     endif()
   endif()
@@ -515,7 +532,7 @@ else()
   if(GO_EXECUTABLE STREQUAL "GO_EXECUTABLE-NOTFOUND")
     message(STATUS "Go bindings disabled.")
   else()
-    execute_process(COMMAND ${GO_EXECUTABLE} run ${CMAKE_SOURCE_DIR}/bindings/go/conftest.go
+    execute_process(COMMAND ${GO_EXECUTABLE} run ${PROJECT_SOURCE_DIR}/bindings/go/conftest.go
                     RESULT_VARIABLE GO_CONFTEST)
     if(GO_CONFTEST STREQUAL "0")
       set(LLVM_BINDINGS "${LLVM_BINDINGS} go")
@@ -526,11 +543,9 @@ else()
   endif()
 endif()
 
-find_program(GOLD_EXECUTABLE NAMES ld.gold ld DOC "The gold linker")
-if(GOLD_EXECUTABLE)
-	set(LLVM_BINUTILS_INCDIR "" CACHE PATH
-		"PATH to binutils/include containing plugin-api.h for gold plugin.")
-endif()
+find_program(GOLD_EXECUTABLE NAMES ${LLVM_DEFAULT_TARGET_TRIPLE}-ld.gold ld.gold ${LLVM_DEFAULT_TARGET_TRIPLE}-ld ld DOC "The gold linker")
+set(LLVM_BINUTILS_INCDIR "" CACHE PATH
+	"PATH to binutils/include containing plugin-api.h for gold plugin.")
 
 if(APPLE)
   find_program(LD64_EXECUTABLE NAMES ld DOC "The ld64 linker")
@@ -548,13 +563,13 @@ else()
     if( OCAML_VERSION VERSION_LESS "4.00.0" )
       message(STATUS "OCaml bindings disabled, need OCaml >=4.00.0.")
     else()
-      find_ocamlfind_package(ctypes VERSION 0.3 OPTIONAL)
+      find_ocamlfind_package(ctypes VERSION 0.4 OPTIONAL)
       if( HAVE_OCAML_CTYPES )
         message(STATUS "OCaml bindings enabled.")
         find_ocamlfind_package(oUnit VERSION 2 OPTIONAL)
         set(LLVM_BINDINGS "${LLVM_BINDINGS} ocaml")
       else()
-        message(STATUS "OCaml bindings disabled, need ctypes >=0.3.")
+        message(STATUS "OCaml bindings disabled, need ctypes >=0.4.")
       endif()
     endif()
   endif()

@@ -175,7 +175,7 @@ The :program:`llvm-cov show` command shows line by line coverage of a binary
 *BIN* using the profile data *PROFILE*. It can optionally be filtered to only
 show the coverage for the files listed in *SOURCES*.
 
-To use :program:`llvm-cov show`, you need a program that's compiled with
+To use :program:`llvm-cov show`, you need a program that is compiled with
 instrumentation to emit profile and coverage data. To build such a program with
 ``clang`` use the ``-fprofile-instr-generate`` and ``-fcoverage-mapping``
 flags. If linking with the ``clang`` driver, pass ``-fprofile-instr-generate``
@@ -223,10 +223,10 @@ OPTIONS
 
 .. option:: -arch=<name>
 
- If the covered binary is a universal binary, select the architecture to use
- when looking up the coverage map. Errors out if the supplied architecture is
- not found in the universal binary, or if used on a non-universal binary of
- a different architecture.
+ If the covered binary is a universal binary, select the architecture to use.
+ It is an error to specify an architecture that is not included in the
+ universal binary or to use an architecture that does not match a
+ non-universal binary.
 
 .. option:: -name=<NAME>
 
@@ -235,6 +235,26 @@ OPTIONS
 .. option:: -name-regex=<PATTERN>
 
  Show code coverage only for functions that match the given regular expression.
+
+.. option:: -format=<FORMAT>
+
+ Use the specified output format. The supported formats are: "text", "html".
+
+.. option:: -output-dir=PATH
+
+ Specify a directory to write coverage reports into. If the directory does not
+ exist, it is created. When used in function view mode (i.e when -name or
+ -name-regex are used to select specific functions), the report is written to
+ PATH/functions.EXTENSION. When used in file view mode, a report for each file
+ is written to PATH/REL_PATH_TO_FILE.EXTENSION.
+
+.. option:: -Xdemangler=<TOOL>|<TOOL-OPTION>
+
+ Specify a symbol demangler. This can be used to make reports more
+ human-readable. This option can be specified multiple times to supply
+ arguments to the demangler (e.g `-Xdemangler c++filt -Xdemangler -n` for C++).
+ The demangler is expected to read a newline-separated list of symbols from
+ stdin and write a newline-separated list of the same length to stdout.
 
 .. option:: -line-coverage-gt=<N>
 
@@ -291,7 +311,7 @@ OPTIONS
 
 .. option:: -arch=<name>
 
- If the covered binary is a universal binary, select the architecture to use
- when looking up the coverage map. Errors out if the supplied architecture is
- not found in the universal binary, or if used on a non-universal binary of
- a different architecture.
+ If the covered binary is a universal binary, select the architecture to use.
+ It is an error to specify an architecture that is not included in the
+ universal binary or to use an architecture that does not match a
+ non-universal binary.

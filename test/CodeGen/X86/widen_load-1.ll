@@ -1,5 +1,5 @@
-; RUN: llc %s -o - -march=x86-64 -mattr=-avx -mtriple=x86_64-unknown-linux-gnu | FileCheck %s --check-prefix=SSE
-; RUN: llc %s -o - -march=x86-64 -mattr=+avx -mtriple=x86_64-unknown-linux-gnu | FileCheck %s --check-prefix=AVX
+; RUN: llc -stack-symbol-ordering=0 %s -o - -march=x86-64 -mattr=-avx -mtriple=x86_64-unknown-linux-gnu | FileCheck %s --check-prefix=SSE
+; RUN: llc -stack-symbol-ordering=0 %s -o - -march=x86-64 -mattr=+avx -mtriple=x86_64-unknown-linux-gnu | FileCheck %s --check-prefix=AVX
 ; PR4891
 ; PR5626
 
@@ -9,8 +9,8 @@
 ; SSE: movaps  %xmm0, (%rsp)
 ; SSE: callq   killcommon
 
-; AVX: vmovdqa    compl+128(%rip), %xmm0
-; AVX: vmovdqa  %xmm0, (%rsp)
+; AVX: vmovaps    compl+128(%rip), %xmm0
+; AVX: vmovaps  %xmm0, (%rsp)
 ; AVX: callq   killcommon
 
 @compl = linkonce global [20 x i64] zeroinitializer, align 64 ; <[20 x i64]*> [#uses=1]

@@ -124,6 +124,7 @@ public:
   void EmitFunctionEntryLabel() override;
   void EmitFunctionBodyStart() override;
   void EmitFunctionBodyEnd() override;
+  void EmitBasicBlockEnd(const MachineBasicBlock &MBB) override;
   bool isBlockOnlyReachableByFallthrough(
                                    const MachineBasicBlock* MBB) const override;
   bool PrintAsmOperand(const MachineInstr *MI, unsigned OpNo,
@@ -133,8 +134,6 @@ public:
                              unsigned AsmVariant, const char *ExtraCode,
                              raw_ostream &O) override;
   void printOperand(const MachineInstr *MI, int opNum, raw_ostream &O);
-  void printUnsignedImm(const MachineInstr *MI, int opNum, raw_ostream &O);
-  void printUnsignedImm8(const MachineInstr *MI, int opNum, raw_ostream &O);
   void printMemOperand(const MachineInstr *MI, int opNum, raw_ostream &O);
   void printMemOperandEA(const MachineInstr *MI, int opNum, raw_ostream &O);
   void printFCCOperand(const MachineInstr *MI, int opNum, raw_ostream &O,
@@ -143,12 +142,6 @@ public:
   void EmitStartOfAsmFile(Module &M) override;
   void EmitEndOfAsmFile(Module &M) override;
   void PrintDebugValueComment(const MachineInstr *MI, raw_ostream &OS);
-
-  // @LOCALMOD-START
-  unsigned GetTargetLabelAlign(const MachineInstr *MI) const override;
-  /// UseReadOnlyJumpTables - true if JumpTableInfo must be in rodata.
-  bool UseReadOnlyJumpTables() const override;
-  // @LOCALMOD-END
 };
 }
 

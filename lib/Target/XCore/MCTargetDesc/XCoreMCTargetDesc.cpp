@@ -15,7 +15,6 @@
 #include "InstPrinter/XCoreInstPrinter.h"
 #include "XCoreMCAsmInfo.h"
 #include "XCoreTargetStreamer.h"
-#include "llvm/MC/MCCodeGenInfo.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSubtargetInfo.h"
@@ -40,21 +39,19 @@ static MCInstrInfo *createXCoreMCInstrInfo() {
   return X;
 }
 
-static MCRegisterInfo *createXCoreMCRegisterInfo(StringRef TT) {
+static MCRegisterInfo *createXCoreMCRegisterInfo(const Triple &TT) {
   MCRegisterInfo *X = new MCRegisterInfo();
   InitXCoreMCRegisterInfo(X, XCore::LR);
   return X;
 }
 
-static MCSubtargetInfo *createXCoreMCSubtargetInfo(StringRef TT, StringRef CPU,
-                                                   StringRef FS) {
-  MCSubtargetInfo *X = new MCSubtargetInfo();
-  InitXCoreMCSubtargetInfo(X, TT, CPU, FS);
-  return X;
+static MCSubtargetInfo *
+createXCoreMCSubtargetInfo(const Triple &TT, StringRef CPU, StringRef FS) {
+  return createXCoreMCSubtargetInfoImpl(TT, CPU, FS);
 }
 
 static MCAsmInfo *createXCoreMCAsmInfo(const MCRegisterInfo &MRI,
-                                       StringRef TT) {
+                                       const Triple &TT) {
   MCAsmInfo *MAI = new XCoreMCAsmInfo(TT);
 
   // Initial state of the frame pointer is SP.
@@ -64,21 +61,13 @@ static MCAsmInfo *createXCoreMCAsmInfo(const MCRegisterInfo &MRI,
   return MAI;
 }
 
-static MCCodeGenInfo *createXCoreMCCodeGenInfo(StringRef TT, Reloc::Model RM,
-                                               CodeModel::Model CM,
-                                               CodeGenOpt::Level OL) {
-  MCCodeGenInfo *X = new MCCodeGenInfo();
-  if (RM == Reloc::Default) {
-    RM = Reloc::Static;
-  }
+static void adjustCodeGenOpts(const Triple &TT, Reloc::Model RM,
+                              CodeModel::Model &CM) {
   if (CM == CodeModel::Default) {
     CM = CodeModel::Small;
   }
   if (CM != CodeModel::Small && CM != CodeModel::Large)
     report_fatal_error("Target only supports CodeModel Small or Large");
-
-  X->InitMCCodeGenInfo(RM, CM, OL);
-  return X;
 }
 
 static MCInstPrinter *createXCoreMCInstPrinter(const Triple &T,
@@ -138,8 +127,8 @@ extern "C" void LLVMInitializeXCoreTargetMC() {
   RegisterMCAsmInfoFn X(TheXCoreTarget, createXCoreMCAsmInfo);
 
   // Register the MC codegen info.
-  TargetRegistry::RegisterMCCodeGenInfo(TheXCoreTarget,
-                                        createXCoreMCCodeGenInfo);
+  TargetRegistry::registerMCAdjustCodeGenOpts(TheXCoreTarget,
+                                              adjustCodeGenOpts);
 
   // Register the MC instruction info.
   TargetRegistry::RegisterMCInstrInfo(TheXCoreTarget, createXCoreMCInstrInfo);

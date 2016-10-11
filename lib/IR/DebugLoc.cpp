@@ -9,18 +9,17 @@
 
 #include "llvm/IR/DebugLoc.h"
 #include "LLVMContextImpl.h"
-#include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/IR/DebugInfo.h"
 using namespace llvm;
 
 //===----------------------------------------------------------------------===//
 // DebugLoc Implementation
 //===----------------------------------------------------------------------===//
-DebugLoc::DebugLoc(const MDLocation *L) : Loc(const_cast<MDLocation *>(L)) {}
+DebugLoc::DebugLoc(const DILocation *L) : Loc(const_cast<DILocation *>(L)) {}
 DebugLoc::DebugLoc(const MDNode *L) : Loc(const_cast<MDNode *>(L)) {}
 
-MDLocation *DebugLoc::get() const {
-  return cast_or_null<MDLocation>(Loc.get());
+DILocation *DebugLoc::get() const {
+  return cast_or_null<DILocation>(Loc.get());
 }
 
 unsigned DebugLoc::getLine() const {
@@ -38,19 +37,19 @@ MDNode *DebugLoc::getScope() const {
   return get()->getScope();
 }
 
-MDLocation *DebugLoc::getInlinedAt() const {
+DILocation *DebugLoc::getInlinedAt() const {
   assert(get() && "Expected valid DebugLoc");
   return get()->getInlinedAt();
 }
 
 MDNode *DebugLoc::getInlinedAtScope() const {
-  return cast<MDLocation>(Loc)->getInlinedAtScope();
+  return cast<DILocation>(Loc)->getInlinedAtScope();
 }
 
 DebugLoc DebugLoc::getFnDebugLoc() const {
-  // FIXME: Add a method on \a MDLocation that does this work.
+  // FIXME: Add a method on \a DILocation that does this work.
   const MDNode *Scope = getInlinedAtScope();
-  if (DISubprogram SP = getDISubprogram(Scope))
+  if (auto *SP = getDISubprogram(Scope))
     return DebugLoc::get(SP->getScopeLine(), 0, SP);
 
   return DebugLoc();
@@ -62,12 +61,12 @@ DebugLoc DebugLoc::get(unsigned Line, unsigned Col, const MDNode *Scope,
   if (!Scope)
     return DebugLoc();
 
-  return MDLocation::get(Scope->getContext(), Line, Col,
+  return DILocation::get(Scope->getContext(), Line, Col,
                          const_cast<MDNode *>(Scope),
                          const_cast<MDNode *>(InlinedAt));
 }
 
-void DebugLoc::dump() const {
+LLVM_DUMP_METHOD void DebugLoc::dump() const {
 #ifndef NDEBUG
   if (!Loc)
     return;
@@ -88,7 +87,7 @@ void DebugLoc::print(raw_ostream &OS) const {
     return;
 
   // Print source line info.
-  auto *Scope = cast<MDScope>(getScope());
+  auto *Scope = cast<DIScope>(getScope());
   OS << Scope->getFilename();
   OS << ':' << getLine();
   if (getCol() != 0)

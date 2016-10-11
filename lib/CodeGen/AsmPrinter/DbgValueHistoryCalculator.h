@@ -12,13 +12,12 @@
 
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 
 namespace llvm {
 
 class MachineFunction;
 class MachineInstr;
-class MDLocalVariable;
-class MDLocation;
 class TargetRegisterInfo;
 
 // For each user variable, keep a list of instruction ranges where this variable
@@ -32,7 +31,7 @@ class DbgValueHistoryMap {
 public:
   typedef std::pair<const MachineInstr *, const MachineInstr *> InstrRange;
   typedef SmallVector<InstrRange, 4> InstrRanges;
-  typedef std::pair<const MDLocalVariable *, const MDLocation *>
+  typedef std::pair<const DILocalVariable *, const DILocation *>
       InlinedVariable;
   typedef MapVector<InlinedVariable, InstrRanges> InstrRangesMap;
 

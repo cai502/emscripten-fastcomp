@@ -27,12 +27,13 @@
 #include "llvm/Support/Format.h"
 
 using namespace llvm;
+using namespace llvm::pdb;
 
 VariableDumper::VariableDumper(LinePrinter &P)
     : PDBSymDumper(true), Printer(P) {}
 
 void VariableDumper::start(const PDBSymbolData &Var) {
-  if (Var.isCompilerGenerated() && opts::ExcludeCompilerGenerated)
+  if (Var.isCompilerGenerated() && opts::pretty::ExcludeCompilerGenerated)
     return;
   if (Printer.IsSymbolExcluded(Var.getName()))
     return;
@@ -44,7 +45,7 @@ void VariableDumper::start(const PDBSymbolData &Var) {
     Printer.NewLine();
     Printer << "data [";
     WithColor(Printer, PDB_ColorItem::Address).get()
-        << format_hex(Var.getRelativeVirtualAddress(), 10);
+        << format_hex(Var.getVirtualAddress(), 10);
     Printer << "] ";
     WithColor(Printer, PDB_ColorItem::Keyword).get() << "static ";
     dumpSymbolTypeAndName(*VarType, Var.getName());

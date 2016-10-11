@@ -26,7 +26,7 @@ namespace llvm {
   class XCoreTargetMachine;
 
   namespace XCoreISD {
-    enum NodeType {
+    enum NodeType : unsigned {
       // Start the numbering where the builtin ops and target ops leave off.
       FIRST_NUMBER = ISD::BUILTIN_OP_END,
 
@@ -101,7 +101,9 @@ namespace llvm {
 
 
     unsigned getJumpTableEncoding() const override;
-    MVT getScalarShiftAmountTy(EVT LHSTy) const override { return MVT::i32; }
+    MVT getScalarShiftAmountTy(const DataLayout &DL, EVT) const override {
+      return MVT::i32;
+    }
 
     /// LowerOperation - Provide custom lowering hooks for some operations.
     SDValue LowerOperation(SDValue Op, SelectionDAG &DAG) const override;
@@ -117,21 +119,35 @@ namespace llvm {
     const char *getTargetNodeName(unsigned Opcode) const override;
 
     MachineBasicBlock *
-      EmitInstrWithCustomInserter(MachineInstr *MI,
-                                  MachineBasicBlock *MBB) const override;
+    EmitInstrWithCustomInserter(MachineInstr &MI,
+                                MachineBasicBlock *MBB) const override;
 
-    bool isLegalAddressingMode(const AddrMode &AM, Type *Ty) const override;
+    bool isLegalAddressingMode(const DataLayout &DL, const AddrMode &AM,
+                               Type *Ty, unsigned AS) const override;
+
+    /// If a physical register, this returns the register that receives the
+    /// exception address on entry to an EH pad.
+    unsigned
+    getExceptionPointerRegister(const Constant *PersonalityFn) const override {
+      return XCore::R0;
+    }
+
+    /// If a physical register, this returns the register that receives the
+    /// exception typeid on entry to a landing pad.
+    unsigned
+    getExceptionSelectorRegister(const Constant *PersonalityFn) const override {
+      return XCore::R1;
+    }
 
   private:
     const TargetMachine &TM;
     const XCoreSubtarget &Subtarget;
 
     // Lower Operand helpers
-    SDValue LowerCCCArguments(SDValue Chain,
-                              CallingConv::ID CallConv,
+    SDValue LowerCCCArguments(SDValue Chain, CallingConv::ID CallConv,
                               bool isVarArg,
                               const SmallVectorImpl<ISD::InputArg> &Ins,
-                              SDLoc dl, SelectionDAG &DAG,
+                              const SDLoc &dl, SelectionDAG &DAG,
                               SmallVectorImpl<SDValue> &InVals) const;
     SDValue LowerCCCCallTo(SDValue Chain, SDValue Callee,
                            CallingConv::ID CallConv, bool isVarArg,
@@ -139,13 +155,14 @@ namespace llvm {
                            const SmallVectorImpl<ISD::OutputArg> &Outs,
                            const SmallVectorImpl<SDValue> &OutVals,
                            const SmallVectorImpl<ISD::InputArg> &Ins,
-                           SDLoc dl, SelectionDAG &DAG,
+                           const SDLoc &dl, SelectionDAG &DAG,
                            SmallVectorImpl<SDValue> &InVals) const;
     SDValue getReturnAddressFrameIndex(SelectionDAG &DAG) const;
     SDValue getGlobalAddressWrapper(SDValue GA, const GlobalValue *GV,
                                     SelectionDAG &DAG) const;
-    SDValue lowerLoadWordFromAlignedBasePlusOffset(SDLoc DL, SDValue Chain,
-                                                   SDValue Base, int64_t Offset,
+    SDValue lowerLoadWordFromAlignedBasePlusOffset(const SDLoc &DL,
+                                                   SDValue Chain, SDValue Base,
+                                                   int64_t Offset,
                                                    SelectionDAG &DAG) const;
 
     // Lower Operand specifics
@@ -174,14 +191,7 @@ namespace llvm {
     // Inline asm support
     std::pair<unsigned, const TargetRegisterClass *>
     getRegForInlineAsmConstraint(const TargetRegisterInfo *TRI,
-                                 const std::string &Constraint,
-                                 MVT VT) const override;
-
-    unsigned getInlineAsmMemConstraint(
-        const std::string &ConstraintCode) const override {
-      // FIXME: Map different constraints differently.
-      return InlineAsm::Constraint_m;
-    }
+                                 StringRef Constraint, MVT VT) const override;
 
     // Expand specifics
     SDValue TryExpandADDWithMul(SDNode *Op, SelectionDAG &DAG) const;
@@ -196,29 +206,28 @@ namespace llvm {
                                        unsigned Depth = 0) const override;
 
     SDValue
-      LowerFormalArguments(SDValue Chain,
-                           CallingConv::ID CallConv,
-                           bool isVarArg,
-                           const SmallVectorImpl<ISD::InputArg> &Ins,
-                           SDLoc dl, SelectionDAG &DAG,
-                           SmallVectorImpl<SDValue> &InVals) const override;
+    LowerFormalArguments(SDValue Chain, CallingConv::ID CallConv, bool isVarArg,
+                         const SmallVectorImpl<ISD::InputArg> &Ins,
+                         const SDLoc &dl, SelectionDAG &DAG,
+                         SmallVectorImpl<SDValue> &InVals) const override;
 
     SDValue
       LowerCall(TargetLowering::CallLoweringInfo &CLI,
                 SmallVectorImpl<SDValue> &InVals) const override;
 
-    SDValue
-      LowerReturn(SDValue Chain,
-                  CallingConv::ID CallConv, bool isVarArg,
-                  const SmallVectorImpl<ISD::OutputArg> &Outs,
-                  const SmallVectorImpl<SDValue> &OutVals,
-                  SDLoc dl, SelectionDAG &DAG) const override;
+    SDValue LowerReturn(SDValue Chain, CallingConv::ID CallConv, bool isVarArg,
+                        const SmallVectorImpl<ISD::OutputArg> &Outs,
+                        const SmallVectorImpl<SDValue> &OutVals,
+                        const SDLoc &dl, SelectionDAG &DAG) const override;
 
     bool
       CanLowerReturn(CallingConv::ID CallConv, MachineFunction &MF,
                      bool isVarArg,
                      const SmallVectorImpl<ISD::OutputArg> &ArgsFlags,
                      LLVMContext &Context) const override;
+    bool shouldInsertFencesForAtomic(const Instruction *I) const override {
+      return true;
+    }
   };
 }
 

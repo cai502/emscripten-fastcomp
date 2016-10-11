@@ -1,8 +1,7 @@
 add_llvm_library(LLVMAnalysis
   AliasAnalysis.cpp
-  AliasAnalysisCounter.cpp
   AliasAnalysisEvaluator.cpp
-  AliasDebugger.cpp
+  AliasAnalysisSummary.cpp
   AliasSetTracker.cpp
   Analysis.cpp
   AssumptionCache.cpp
@@ -12,39 +11,57 @@ add_llvm_library(LLVMAnalysis
   BranchProbabilityInfo.cpp
   CFG.cpp
   CFGPrinter.cpp
-  CFLAliasAnalysis.cpp
+  CFLAndersAliasAnalysis.cpp
+  CFLSteensAliasAnalysis.cpp
   CGSCCPassManager.cpp
+  CallGraph.cpp
+  CallGraphSCCPass.cpp
+  CallPrinter.cpp
   CaptureTracking.cpp
   CostModel.cpp
   CodeMetrics.cpp
   ConstantFolding.cpp
   Delinearization.cpp
+  DemandedBits.cpp
   DependenceAnalysis.cpp
   DivergenceAnalysis.cpp
   DomPrinter.cpp
   DominanceFrontier.cpp
+  EHPersonalities.cpp
+  GlobalsModRef.cpp
   IVUsers.cpp
+  IndirectCallPromotionAnalysis.cpp
+  InlineCost.cpp
   InstCount.cpp
   InstructionSimplify.cpp
   Interval.cpp
   IntervalPartition.cpp
+  IteratedDominanceFrontier.cpp
+  LazyBlockFrequencyInfo.cpp
   LazyCallGraph.cpp
   LazyValueInfo.cpp
-  LibCallAliasAnalysis.cpp
-  LibCallSemantics.cpp
   Lint.cpp
   Loads.cpp
   LoopAccessAnalysis.cpp
+  LoopUnrollAnalyzer.cpp
   LoopInfo.cpp
   LoopPass.cpp
+  LoopPassManager.cpp
   MemDepPrinter.cpp
   MemDerefPrinter.cpp
   MemoryBuiltins.cpp
   MemoryDependenceAnalysis.cpp
+  MemoryLocation.cpp
   ModuleDebugInfoPrinter.cpp
-  NoAliasAnalysis.cpp
+  ModuleSummaryAnalysis.cpp
+  ObjCARCAliasAnalysis.cpp
+  ObjCARCAnalysisUtils.cpp
+  ObjCARCInstKind.cpp
+  OptimizationDiagnosticInfo.cpp
+  OrderedBasicBlock.cpp
   PHITransAddr.cpp
   PostDominators.cpp
+  ProfileSummaryInfo.cpp
   PtrUseVisitor.cpp
   RegionInfo.cpp
   RegionPass.cpp
@@ -58,14 +75,13 @@ add_llvm_library(LLVMAnalysis
   TargetTransformInfo.cpp
   Trace.cpp
   TypeBasedAliasAnalysis.cpp
+  TypeMetadataUtils.cpp
   ScopedNoAliasAA.cpp
   ValueTracking.cpp
+  VectorUtils.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Analysis
   )
 
 add_dependencies(LLVMAnalysis intrinsics_gen)
-
-add_subdirectory(IPA)
-add_subdirectory(NaCl) # LOCALMOD

@@ -19,11 +19,13 @@
 #include "llvm/MC/MCInst.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
+#include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace llvm;
 
 #define DEBUG_TYPE "asm-printer"
 
+#define PRINT_ALIAS_INSTR
 #include "ARMGenAsmWriter.inc"
 
 /// translateShiftImm - Convert shift immediate from 0-31 to 1-32 for printing.
@@ -71,43 +73,6 @@ void ARMInstPrinter::printInst(const MCInst *MI, raw_ostream &O,
   unsigned Opcode = MI->getOpcode();
 
   switch (Opcode) {
-
-  // Check for HINT instructions w/ canonical names.
-  case ARM::HINT:
-  case ARM::tHINT:
-  case ARM::t2HINT:
-    switch (MI->getOperand(0).getImm()) {
-    case 0:
-      O << "\tnop";
-      break;
-    case 1:
-      O << "\tyield";
-      break;
-    case 2:
-      O << "\twfe";
-      break;
-    case 3:
-      O << "\twfi";
-      break;
-    case 4:
-      O << "\tsev";
-      break;
-    case 5:
-      if ((STI.getFeatureBits() & ARM::HasV8Ops)) {
-        O << "\tsevl";
-        break;
-      } // Fallthrough for non-v8
-    default:
-      // Anything else should just print normally.
-      printInstruction(MI, STI, O);
-      printAnnotation(O, Annot);
-      return;
-    }
-    printPredicateOperand(MI, 1, STI, O);
-    if (Opcode == ARM::t2HINT)
-      O << ".w";
-    printAnnotation(O, Annot);
-    return;
 
   // Check for MOVs and print canonical forms, instead.
   case ARM::MOVsr: {
@@ -284,7 +249,7 @@ void ARMInstPrinter::printInst(const MCInst *MI, raw_ostream &O,
 
       if (isStore)
         NewMI.addOperand(MI->getOperand(0));
-      NewReg = MCOperand::CreateReg(MRI.getMatchingSuperReg(
+      NewReg = MCOperand::createReg(MRI.getMatchingSuperReg(
           Reg, ARM::gsub_0, &MRI.getRegClass(ARM::GPRPairRegClassID)));
       NewMI.addOperand(NewReg);
 
@@ -296,88 +261,11 @@ void ARMInstPrinter::printInst(const MCInst *MI, raw_ostream &O,
     }
     break;
   }
-  // B9.3.3 ERET (Thumb)
-  // For a target that has Virtualization Extensions, ERET is the preferred
-  // disassembly of SUBS PC, LR, #0
-  case ARM::t2SUBS_PC_LR: {
-    if (MI->getNumOperands() == 3 && MI->getOperand(0).isImm() &&
-        MI->getOperand(0).getImm() == 0 &&
-        (STI.getFeatureBits() & ARM::FeatureVirtualization)) {
-      O << "\teret";
-      printPredicateOperand(MI, 1, STI, O);
-      printAnnotation(O, Annot);
-      return;
-    }
-    break;
-  }
   }
 
-  // @LOCALMOD-BEGIN
-  // TODO(pdox): Kill this code once we switch to MC object emission
-  const char *SFIInst = NULL;
-  unsigned SFIEmitDest = ~0;
-  unsigned SFIEmitPred = ~0;
-  switch (Opcode) {
-  case ARM::SFI_NOP_IF_AT_BUNDLE_END :
-    SFIInst = "sfi_nop_if_at_bundle_end";
-    SFIEmitDest = ~0;
-    SFIEmitPred = ~0;
-    break;
-  case ARM::SFI_GUARD_LOADSTORE    :
-    SFIInst = "sfi_load_store_preamble";
-    SFIEmitDest = 0;
-    SFIEmitPred = 2;
-    break;
-  case ARM::SFI_GUARD_INDIRECT_CALL:
-    SFIInst = "sfi_indirect_call_preamble";
-    SFIEmitDest = 0;
-    SFIEmitPred = 2;
-    break;
-  case ARM::SFI_GUARD_INDIRECT_JMP :
-    SFIInst = "sfi_indirect_jump_preamble";
-    SFIEmitDest = 0;
-    SFIEmitPred = 2;
-    break;
-  case ARM::SFI_DATA_MASK          :
-    SFIInst = "sfi_data_mask";
-    SFIEmitDest = 0;
-    SFIEmitPred = 2;
-    break;
-  case ARM::SFI_GUARD_LOADSTORE_TST:
-    SFIInst = "sfi_cload_store_preamble";
-    SFIEmitDest = 0;
-    SFIEmitPred = ~0;
-    break;
-  case ARM::SFI_GUARD_CALL     :
-    SFIInst = "sfi_call_preamble";
-    SFIEmitDest = ~0;
-    SFIEmitPred = 0;
-    break;
-  case ARM::SFI_GUARD_RETURN   :
-    SFIInst = "sfi_return_preamble lr,";
-    SFIEmitDest = ~0;
-    SFIEmitPred = 0;
-    break;
-  }
-  if (SFIInst) {
-    O << '\t' << SFIInst;
-    if (SFIEmitDest != (unsigned)~0) {
-      O << ' ';
-      printOperand(MI, SFIEmitDest, STI, O);
-    }
-    if (SFIEmitDest != (unsigned)~0 && SFIEmitPred != (unsigned)~0) {
-      O << ',';
-    }
-    if (SFIEmitPred != (unsigned)~0) {
-      O << ' ';
-      printPredicateOperand(MI, SFIEmitPred, STI, O);
-    }
-    O << '\n';
-    return;
-  }
-  // @LOCALMOD-END
+  if (!printAliasInstr(MI, STI, O))
+    printInstruction(MI, STI, O);
 
-  printInstruction(MI, STI, O);
   printAnnotation(O, Annot);
 }
 
@@ -394,7 +282,8 @@ void ARMInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
     const MCExpr *Expr = Op.getExpr();
     switch (Expr->getKind()) {
     case MCExpr::Binary:
-      O << '#' << *Expr;
+      O << '#';
+      Expr->print(O, &MAI);
       break;
     case MCExpr::Constant: {
       // If a symbolic branch target was added as a constant expression then
@@ -402,8 +291,9 @@ void ARMInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
       // address.
       const MCConstantExpr *Constant = cast<MCConstantExpr>(Expr);
       int64_t TargetAddress;
-      if (!Constant->EvaluateAsAbsolute(TargetAddress)) {
-        O << '#' << *Expr;
+      if (!Constant->evaluateAsAbsolute(TargetAddress)) {
+        O << '#';
+        Expr->print(O, &MAI);
       } else {
         O << "0x";
         O.write_hex(static_cast<uint32_t>(TargetAddress));
@@ -413,7 +303,7 @@ void ARMInstPrinter::printOperand(const MCInst *MI, unsigned OpNo,
     default:
       // FIXME: Should we always treat this as if it is a constant literal and
       // prefix it with '#'?
-      O << *Expr;
+      Expr->print(O, &MAI);
       break;
     }
   }
@@ -424,7 +314,7 @@ void ARMInstPrinter::printThumbLdrLabelOperand(const MCInst *MI, unsigned OpNum,
                                                raw_ostream &O) {
   const MCOperand &MO1 = MI->getOperand(OpNum);
   if (MO1.isExpr()) {
-    O << *MO1.getExpr();
+    MO1.getExpr()->print(O, &MAI);
     return;
   }
 
@@ -707,6 +597,34 @@ void ARMInstPrinter::printAddrMode5Operand(const MCInst *MI, unsigned OpNum,
   O << "]" << markup(">");
 }
 
+template <bool AlwaysPrintImm0>
+void ARMInstPrinter::printAddrMode5FP16Operand(const MCInst *MI, unsigned OpNum,
+                                               const MCSubtargetInfo &STI,
+                                               raw_ostream &O) {
+  const MCOperand &MO1 = MI->getOperand(OpNum);
+  const MCOperand &MO2 = MI->getOperand(OpNum+1);
+
+  if (!MO1.isReg()) {   // FIXME: This is for CP entries, but isn't right.
+    printOperand(MI, OpNum, STI, O);
+    return;
+  }
+
+  O << markup("<mem:") << "[";
+  printRegName(O, MO1.getReg());
+
+  unsigned ImmOffs = ARM_AM::getAM5FP16Offset(MO2.getImm());
+  unsigned Op = ARM_AM::getAM5FP16Op(MO2.getImm());
+  if (AlwaysPrintImm0 || ImmOffs || Op == ARM_AM::sub) {
+    O << ", "
+      << markup("<imm:")
+      << "#"
+      << ARM_AM::getAddrOpcStr(ARM_AM::getAM5FP16Op(MO2.getImm()))
+      << ImmOffs * 2
+      << markup(">");
+  }
+  O << "]" << markup(">");
+}
+
 void ARMInstPrinter::printAddrMode6Operand(const MCInst *MI, unsigned OpNum,
                                            const MCSubtargetInfo &STI,
                                            raw_ostream &O) {
@@ -760,7 +678,7 @@ void ARMInstPrinter::printMemBOption(const MCInst *MI, unsigned OpNum,
                                      const MCSubtargetInfo &STI,
                                      raw_ostream &O) {
   unsigned val = MI->getOperand(OpNum).getImm();
-  O << ARM_MB::MemBOptToString(val, (STI.getFeatureBits() & ARM::HasV8Ops));
+  O << ARM_MB::MemBOptToString(val, STI.getFeatureBits()[ARM::HasV8Ops]);
 }
 
 void ARMInstPrinter::printInstSyncBOption(const MCInst *MI, unsigned OpNum,
@@ -860,14 +778,14 @@ void ARMInstPrinter::printMSRMaskOperand(const MCInst *MI, unsigned OpNum,
   const MCOperand &Op = MI->getOperand(OpNum);
   unsigned SpecRegRBit = Op.getImm() >> 4;
   unsigned Mask = Op.getImm() & 0xf;
-  uint64_t FeatureBits = STI.getFeatureBits();
+  const FeatureBitset &FeatureBits = STI.getFeatureBits();
 
-  if (FeatureBits & ARM::FeatureMClass) {
+  if (FeatureBits[ARM::FeatureMClass]) {
     unsigned SYSm = Op.getImm();
     unsigned Opcode = MI->getOpcode();
 
     // For writes, handle extended mask bits if the DSP extension is present.
-    if (Opcode == ARM::t2MSR_M && (FeatureBits & ARM::FeatureDSPThumb2)) {
+    if (Opcode == ARM::t2MSR_M && FeatureBits[ARM::FeatureDSP]) {
       switch (SYSm) {
       case 0x400:
         O << "apsr_g";
@@ -899,7 +817,7 @@ void ARMInstPrinter::printMSRMaskOperand(const MCInst *MI, unsigned OpNum,
     // Handle the basic 8-bit mask.
     SYSm &= 0xff;
 
-    if (Opcode == ARM::t2MSR_M && (FeatureBits & ARM::HasV7Ops)) {
+    if (Opcode == ARM::t2MSR_M && FeatureBits [ARM::HasV7Ops]) {
       // ARMv7-M deprecates using MSR APSR without a _<bits> qualifier as an
       // alias for MSR APSR_nzcvq.
       switch (SYSm) {
@@ -962,6 +880,42 @@ void ARMInstPrinter::printMSRMaskOperand(const MCInst *MI, unsigned OpNum,
       return;
     case 20:
       O << "control";
+      return;
+    case 10:
+      O << "msplim";
+      return;
+    case 11:
+      O << "psplim";
+      return;
+    case 0x88:
+      O << "msp_ns";
+      return;
+    case 0x89:
+      O << "psp_ns";
+      return;
+    case 0x8a:
+      O << "msplim_ns";
+      return;
+    case 0x8b:
+      O << "psplim_ns";
+      return;
+    case 0x90:
+      O << "primask_ns";
+      return;
+    case 0x91:
+      O << "basepri_ns";
+      return;
+    case 0x92:
+      O << "basepri_max_ns";
+      return;
+    case 0x93:
+      O << "faultmask_ns";
+      return;
+    case 0x94:
+      O << "control_ns";
+      return;
+    case 0x98:
+      O << "sp_ns";
       return;
     }
   }
@@ -1120,7 +1074,7 @@ void ARMInstPrinter::printAdrLabelOperand(const MCInst *MI, unsigned OpNum,
   const MCOperand &MO = MI->getOperand(OpNum);
 
   if (MO.isExpr()) {
-    O << *MO.getExpr();
+    MO.getExpr()->print(O, &MAI);
     return;
   }
 
@@ -1444,21 +1398,8 @@ void ARMInstPrinter::printRotImmOperand(const MCInst *MI, unsigned OpNum,
   unsigned Imm = MI->getOperand(OpNum).getImm();
   if (Imm == 0)
     return;
-  O << ", ror " << markup("<imm:") << "#";
-  switch (Imm) {
-  default:
-    assert(0 && "illegal ror immediate!");
-  case 1:
-    O << "8";
-    break;
-  case 2:
-    O << "16";
-    break;
-  case 3:
-    O << "24";
-    break;
-  }
-  O << markup(">");
+  assert(Imm <= 3 && "illegal ror immediate!");
+  O << ", ror " << markup("<imm:") << "#" << 8 * Imm << markup(">");
 }
 
 void ARMInstPrinter::printModImmOperand(const MCInst *MI, unsigned OpNum,

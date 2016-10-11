@@ -143,19 +143,19 @@ entry:
 ; NOCMOV-NEXT:   jp  [[TBB]]
 ; NOCMOV-NEXT:   leal  24(%esp), %eax
 ; NOCMOV-NEXT: [[TBB]]:
-; NOCMOV-NEXT:   movl  (%eax), %eax
-; NOCMOV-NEXT:   leal  44(%esp), %ecx
+; NOCMOV-NEXT:   movl  (%eax), %ecx
+; NOCMOV-NEXT:   leal  44(%esp), %edx
 ; NOCMOV-NEXT:   jne  [[TBB:.LBB[0-9_]+]]
 ; NOCMOV-NEXT:   jp  [[TBB]]
-; NOCMOV-NEXT:   leal  28(%esp), %ecx
+; NOCMOV-NEXT:   leal  28(%esp), %edx
 ; NOCMOV-NEXT: [[TBB]]:
-; NOCMOV-NEXT:   movl  (%ecx), %ecx
+; NOCMOV-NEXT:   movl  12(%esp), %eax
+; NOCMOV-NEXT:   movl  (%edx), %edx
 ; NOCMOV-NEXT:   leal  48(%esp), %esi
 ; NOCMOV-NEXT:   jne  [[TBB:.LBB[0-9_]+]]
 ; NOCMOV-NEXT:   jp  [[TBB]]
 ; NOCMOV-NEXT:   leal  32(%esp), %esi
 ; NOCMOV-NEXT: [[TBB]]:
-; NOCMOV-NEXT:   movl  12(%esp), %edx
 ; NOCMOV-NEXT:   movl  (%esi), %esi
 ; NOCMOV-NEXT:   leal  52(%esp), %edi
 ; NOCMOV-NEXT:   jne  [[TBB:.LBB[0-9_]+]]
@@ -163,10 +163,10 @@ entry:
 ; NOCMOV-NEXT:   leal  36(%esp), %edi
 ; NOCMOV-NEXT: [[TBB]]:
 ; NOCMOV-NEXT:   movl  (%edi), %edi
-; NOCMOV-NEXT:   movl  %edi, 12(%edx)
-; NOCMOV-NEXT:   movl  %esi, 8(%edx)
-; NOCMOV-NEXT:   movl  %ecx, 4(%edx)
-; NOCMOV-NEXT:   movl  %eax, (%edx)
+; NOCMOV-NEXT:   movl  %edi, 12(%eax)
+; NOCMOV-NEXT:   movl  %esi, 8(%eax)
+; NOCMOV-NEXT:   movl  %edx, 4(%eax)
+; NOCMOV-NEXT:   movl  %ecx, (%eax)
 ; NOCMOV-NEXT:   popl  %esi
 ; NOCMOV-NEXT:   popl  %edi
 ; NOCMOV-NEXT:   retl  $4
@@ -224,3 +224,52 @@ entry:
 }
 
 attributes #0 = { nounwind }
+
+@g8 = global i8 0
+
+; The following test failed because llvm had a bug where a structure like:
+;
+; %vreg12<def> = CMOV_GR8 %vreg7, %vreg11 ... (lt)
+; %vreg13<def> = CMOV_GR8 %vreg12, %vreg11 ... (gt)
+;
+; was lowered to:
+;
+; The first two cmovs got expanded to:
+; BB#0:
+;   JL_1 BB#9
+; BB#7:
+;   JG_1 BB#9
+; BB#8:
+; BB#9:
+;   vreg12 = phi(vreg7, BB#8, vreg11, BB#0, vreg12, BB#7)
+;   vreg13 = COPY vreg12
+; Which was invalid as %vreg12 is not the same value as %vreg13
+
+; CHECK-LABEL: no_cascade_opt:
+; CMOV-DAG: cmpl %edx, %esi
+; CMOV-DAG: movb $20, %al
+; CMOV-DAG: movb $20, %dl
+; CMOV:   jl [[BB0:.LBB[0-9_]+]]
+; CMOV:   movl %ecx, %edx
+; CMOV: [[BB0]]:
+; CMOV:   jg [[BB1:.LBB[0-9_]+]]
+; CMOV:   movl %edx, %eax
+; CMOV: [[BB1]]:
+; CMOV:   testl %edi, %edi
+; CMOV:   je [[BB2:.LBB[0-9_]+]]
+; CMOV:   movl %edx, %eax
+; CMOV: [[BB2]]:
+; CMOV:   movb %al, g8(%rip)
+; CMOV:   retq
+define void @no_cascade_opt(i32 %v0, i32 %v1, i32 %v2, i32 %v3) {
+entry:
+  %c0 = icmp eq i32 %v0, 0
+  %c1 = icmp slt i32 %v1, %v2
+  %c2 = icmp sgt i32 %v1, %v2
+  %trunc = trunc i32 %v3 to i8
+  %sel0 = select i1 %c1, i8 20, i8 %trunc
+  %sel1 = select i1 %c2, i8 20, i8 %sel0
+  %sel2 = select i1 %c0, i8 %sel1, i8 %sel0
+  store volatile i8 %sel2, i8* @g8
+  ret void
+}

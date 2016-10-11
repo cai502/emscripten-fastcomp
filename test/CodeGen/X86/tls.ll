@@ -10,8 +10,10 @@
 @i3 = internal thread_local global i32 15
 @i4 = hidden thread_local global i32 15
 @i5 = external hidden thread_local global i32
+@i6 = external protected thread_local global i32
 @s1 = thread_local global i16 15
 @b1 = thread_local global i8 0
+@b2 = thread_local(localexec) global i8 0
 
 define i32 @f1() {
 ; X32_LINUX-LABEL: f1:
@@ -409,3 +411,45 @@ entry:
 	ret i32 %tmp2
 }
 
+define i8* @f15() {
+; X32_LINUX-LABEL: f15:
+; X32_LINUX:      movl %gs:0, %eax
+; X32_LINUX-NEXT: leal b2@NTPOFF(%eax), %eax
+; X32_LINUX-NEXT: ret
+; X64_LINUX-LABEL: f15:
+; X64_LINUX:      movq %fs:0, %rax
+; X64_LINUX-NEXT: leaq b2@TPOFF(%rax), %rax
+; X64_LINUX-NEXT: ret
+; X32_WIN-LABEL: f15:
+; X32_WIN:      movl %fs:__tls_array, %eax
+; X32_WIN-NEXT: movl (%eax), %eax
+; X32_WIN-NEXT: leal _b2@SECREL32(%eax), %eax
+; X32_WIN-NEXT: ret
+; X64_WIN-LABEL: f15:
+; X64_WIN:      movq %gs:88, %rax
+; X64_WIN-NEXT: movq (%rax), %rax
+; X64_WIN-NEXT: leaq b2@SECREL32(%rax), %rax
+; X64_WIN-NEXT: ret
+; MINGW32-LABEL: f15:
+; MINGW32:      movl %fs:44, %eax
+; MINGW32-NEXT: movl (%eax), %eax
+; MINGW32-NEXT: leal _b2@SECREL32(%eax), %eax
+; MINGW32-NEXT: ret
+entry:
+	ret i8* @b2
+}
+
+
+define i32* @f16() {
+; X32_LINUX-LABEL: f16:
+; X32_LINUX:       movl %gs:0, %eax
+; X32_LINUX-NEXT:  leal i6@NTPOFF(%eax), %eax
+; X32_LINUX-NEXT:  ret
+
+; X64_LINUX-LABEL: f16:
+; X64_LINUX:       movq %fs:0, %rax
+; X64_LINUX-NEXT:  leaq i6@TPOFF(%rax), %rax
+; X64_LINUX-NEXT:  ret
+
+  ret i32* @i6
+}

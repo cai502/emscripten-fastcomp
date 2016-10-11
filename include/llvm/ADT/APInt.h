@@ -16,7 +16,6 @@
 #ifndef LLVM_ADT_APINT_H
 #define LLVM_ADT_APINT_H
 
-#include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/MathExtras.h"
 #include <cassert>
@@ -31,6 +30,7 @@ class hash_code;
 class raw_ostream;
 
 template <typename T> class SmallVectorImpl;
+template <typename T> class ArrayRef;
 
 // An unsigned host type used as a single part of a multi-part
 // bignum.
@@ -129,7 +129,7 @@ class APInt {
 
   /// \brief Clear unused high order bits
   ///
-  /// This method is used internally to clear the to "N" bits in the high order
+  /// This method is used internally to clear the top "N" bits in the high order
   /// word that are not used by the APInt. This is needed after the most
   /// significant word is assigned a value to ensure that those bits are
   /// zero'd out.
@@ -177,11 +177,11 @@ class APInt {
   /// provides a more convenient form of divide for internal use since KnuthDiv
   /// has specific constraints on its inputs. If those constraints are not met
   /// then it provides a simpler form of divide.
-  static void divide(const APInt LHS, unsigned lhsWords, const APInt &RHS,
+  static void divide(const APInt &LHS, unsigned lhsWords, const APInt &RHS,
                      unsigned rhsWords, APInt *Quotient, APInt *Remainder);
 
   /// out-of-line slow case for inline constructor
-  void initSlowCase(unsigned numBits, uint64_t val, bool isSigned);
+  void initSlowCase(uint64_t val, bool isSigned);
 
   /// shared code between two array constructors
   void initFromArray(ArrayRef<uint64_t> array);
@@ -239,7 +239,7 @@ public:
     if (isSingleWord())
       VAL = val;
     else
-      initSlowCase(numBits, val, isSigned);
+      initSlowCase(val, isSigned);
     clearUnusedBits();
   }
 
@@ -294,11 +294,12 @@ public:
       delete[] pVal;
   }
 
-  /// \brief Default constructor that creates an uninitialized APInt.
+  /// \brief Default constructor that creates an uninteresting APInt
+  /// representing a 1-bit zero value.
   ///
   /// This is useful for object deserialization (pair this with the static
   ///  method Read).
-  explicit APInt() : BitWidth(1) {}
+  explicit APInt() : BitWidth(1), VAL(0) {}
 
   /// \brief Returns whether this instance allocated memory.
   bool needsCleanup() const { return !isSingleWord(); }
@@ -351,8 +352,7 @@ public:
   /// This checks to see if the value of this APInt is the maximum signed
   /// value for the APInt's bit width.
   bool isMaxSignedValue() const {
-    return BitWidth == 1 ? VAL == 0
-                         : !isNegative() && countPopulation() == BitWidth - 1;
+    return !isNegative() && countPopulation() == BitWidth - 1;
   }
 
   /// \brief Determine if this is the smallest unsigned value.
@@ -366,7 +366,7 @@ public:
   /// This checks to see if the value of this APInt is the minimum signed
   /// value for the APInt's bit width.
   bool isMinSignedValue() const {
-    return BitWidth == 1 ? VAL == 1 : isNegative() && isPowerOf2();
+    return isNegative() && isPowerOf2();
   }
 
   /// \brief Check if this APInt has an N-bits unsigned integer value.
@@ -625,7 +625,12 @@ public:
   /// Negates *this using two's complement logic.
   ///
   /// \returns An APInt value representing the negation of *this.
-  APInt operator-() const { return APInt(BitWidth, 0) - (*this); }
+  APInt operator-() const {
+    APInt Result(*this);
+    Result.flipAllBits();
+    ++Result;
+    return Result;
+  }
 
   /// \brief Logical negation operator.
   ///
@@ -796,7 +801,7 @@ public:
 
   /// \brief Bitwise OR function.
   ///
-  /// Performs a bitwise or on *this and RHS. This is implemented bny simply
+  /// Performs a bitwise or on *this and RHS. This is implemented by simply
   /// calling operator|.
   ///
   /// \returns An APInt value representing the bitwise OR of *this and RHS.
@@ -835,13 +840,13 @@ public:
   ///
   /// Adds RHS to this APInt and returns the result.
   APInt operator+(const APInt &RHS) const;
-  APInt operator+(uint64_t RHS) const { return (*this) + APInt(BitWidth, RHS); }
+  APInt operator+(uint64_t RHS) const;
 
   /// \brief Subtraction operator.
   ///
   /// Subtracts RHS from this APInt and returns the result.
   APInt operator-(const APInt &RHS) const;
-  APInt operator-(uint64_t RHS) const { return (*this) - APInt(BitWidth, RHS); }
+  APInt operator-(uint64_t RHS) const;
 
   /// \brief Left logical shift operator.
   ///
@@ -1039,7 +1044,9 @@ public:
   /// the validity of the less-than relationship.
   ///
   /// \returns true if *this < RHS when considered unsigned.
-  bool ult(uint64_t RHS) const { return ult(APInt(getBitWidth(), RHS)); }
+  bool ult(uint64_t RHS) const {
+    return getActiveBits() > 64 ? false : getZExtValue() < RHS;
+  }
 
   /// \brief Signed less than comparison
   ///
@@ -1055,7 +1062,9 @@ public:
   /// the validity of the less-than relationship.
   ///
   /// \returns true if *this < RHS when considered signed.
-  bool slt(uint64_t RHS) const { return slt(APInt(getBitWidth(), RHS)); }
+  bool slt(int64_t RHS) const {
+    return getMinSignedBits() > 64 ? isNegative() : getSExtValue() < RHS;
+  }
 
   /// \brief Unsigned less or equal comparison
   ///
@@ -1071,7 +1080,7 @@ public:
   /// the validity of the less-or-equal relationship.
   ///
   /// \returns true if *this <= RHS when considered unsigned.
-  bool ule(uint64_t RHS) const { return ule(APInt(getBitWidth(), RHS)); }
+  bool ule(uint64_t RHS) const { return !ugt(RHS); }
 
   /// \brief Signed less or equal comparison
   ///
@@ -1087,7 +1096,7 @@ public:
   /// validity of the less-or-equal relationship.
   ///
   /// \returns true if *this <= RHS when considered signed.
-  bool sle(uint64_t RHS) const { return sle(APInt(getBitWidth(), RHS)); }
+  bool sle(uint64_t RHS) const { return !sgt(RHS); }
 
   /// \brief Unsigned greather than comparison
   ///
@@ -1103,7 +1112,9 @@ public:
   /// the validity of the greater-than relationship.
   ///
   /// \returns true if *this > RHS when considered unsigned.
-  bool ugt(uint64_t RHS) const { return ugt(APInt(getBitWidth(), RHS)); }
+  bool ugt(uint64_t RHS) const {
+    return getActiveBits() > 64 ? true : getZExtValue() > RHS;
+  }
 
   /// \brief Signed greather than comparison
   ///
@@ -1119,7 +1130,9 @@ public:
   /// the validity of the greater-than relationship.
   ///
   /// \returns true if *this > RHS when considered signed.
-  bool sgt(uint64_t RHS) const { return sgt(APInt(getBitWidth(), RHS)); }
+  bool sgt(int64_t RHS) const {
+    return getMinSignedBits() > 64 ? !isNegative() : getSExtValue() > RHS;
+  }
 
   /// \brief Unsigned greater or equal comparison
   ///
@@ -1135,7 +1148,7 @@ public:
   /// the validity of the greater-or-equal relationship.
   ///
   /// \returns true if *this >= RHS when considered unsigned.
-  bool uge(uint64_t RHS) const { return uge(APInt(getBitWidth(), RHS)); }
+  bool uge(uint64_t RHS) const { return !ult(RHS); }
 
   /// \brief Signed greather or equal comparison
   ///
@@ -1151,7 +1164,7 @@ public:
   /// the validity of the greater-or-equal relationship.
   ///
   /// \returns true if *this >= RHS when considered signed.
-  bool sge(uint64_t RHS) const { return sge(APInt(getBitWidth(), RHS)); }
+  bool sge(int64_t RHS) const { return !slt(RHS); }
 
   /// This operation tests if there are any pairs of corresponding bits
   /// between this APInt and RHS that are both set.
@@ -1443,6 +1456,10 @@ public:
   /// \returns a byte-swapped representation of this APInt Value.
   APInt LLVM_ATTRIBUTE_UNUSED_RESULT byteSwap() const;
 
+  /// \returns the value with the bit representation reversed of this APInt
+  /// Value.
+  APInt LLVM_ATTRIBUTE_UNUSED_RESULT reverseBits() const;
+
   /// \brief Converts this APInt to a double value.
   double roundToDouble(bool isSigned) const;
 
@@ -1521,7 +1538,7 @@ public:
   /// \returns the nearest log base 2 of this APInt. Ties round up.
   ///
   /// NOTE: When we have a BitWidth of 1, we define:
-  /// 
+  ///
   ///   log2(0) = UINT32_MAX
   ///   log2(1) = 0
   ///
@@ -1736,16 +1753,24 @@ inline raw_ostream &operator<<(raw_ostream &OS, const APInt &I) {
 namespace APIntOps {
 
 /// \brief Determine the smaller of two APInts considered to be signed.
-inline APInt smin(const APInt &A, const APInt &B) { return A.slt(B) ? A : B; }
+inline const APInt &smin(const APInt &A, const APInt &B) {
+  return A.slt(B) ? A : B;
+}
 
 /// \brief Determine the larger of two APInts considered to be signed.
-inline APInt smax(const APInt &A, const APInt &B) { return A.sgt(B) ? A : B; }
+inline const APInt &smax(const APInt &A, const APInt &B) {
+  return A.sgt(B) ? A : B;
+}
 
 /// \brief Determine the smaller of two APInts considered to be signed.
-inline APInt umin(const APInt &A, const APInt &B) { return A.ult(B) ? A : B; }
+inline const APInt &umin(const APInt &A, const APInt &B) {
+  return A.ult(B) ? A : B;
+}
 
 /// \brief Determine the larger of two APInts considered to be unsigned.
-inline APInt umax(const APInt &A, const APInt &B) { return A.ugt(B) ? A : B; }
+inline const APInt &umax(const APInt &A, const APInt &B) {
+  return A.ugt(B) ? A : B;
+}
 
 /// \brief Check if the specified APInt has a N-bits unsigned integer value.
 inline bool isIntN(unsigned N, const APInt &APIVal) { return APIVal.isIntN(N); }
@@ -1760,6 +1785,13 @@ inline bool isSignedIntN(unsigned N, const APInt &APIVal) {
 inline bool isMask(unsigned numBits, const APInt &APIVal) {
   return numBits <= APIVal.getBitWidth() &&
          APIVal == APInt::getLowBitsSet(APIVal.getBitWidth(), numBits);
+}
+
+/// \returns true if the argument is a non-empty sequence of ones starting at
+/// the least significant bit with the remainder zero (32 bit version).
+/// Ex. isMask(0x0000FFFFU) == true.
+inline bool isMask(const APInt &Value) {
+  return (Value != 0) && ((Value + 1) & Value) == 0;
 }
 
 /// \brief Return true if the argument APInt value contains a sequence of ones

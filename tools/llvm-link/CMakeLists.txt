@@ -3,8 +3,9 @@ set(LLVM_LINK_COMPONENTS
   Core
   IRReader
   Linker
-  NaClBitWriter # @LOCALMOD
+  Object
   Support
+  TransformUtils
   )
 
 add_llvm_tool(llvm-link

@@ -40,20 +40,18 @@
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/NaCl.h"
+#include "llvm/Transforms/Scalar.h"
 #include <algorithm>
 #include <cstdio>
 #include <map>
 #include <set> // TODO: unordered_set?
+#include <sstream>
 using namespace llvm;
 
 #include <OptPasses.h>
 #include <Relooper.h>
-
-#ifdef NDEBUG
-#undef assert
-#define assert(x) { if (!(x)) report_fatal_error(#x); }
-#endif
 
 raw_ostream &prettyWarning() {
   errs().changeColor(raw_ostream::YELLOW);
@@ -113,6 +111,43 @@ Relocatable("emscripten-relocatable",
             cl::desc("Whether to emit relocatable code (see emscripten RELOCATABLE option)"),
             cl::init(false));
 
+static cl::opt<bool>
+EnableSjLjEH("enable-pnacl-sjlj-eh",
+             cl::desc("Enable use of SJLJ-based C++ exception handling "
+                      "as part of the pnacl-abi-simplify passes"),
+             cl::init(false));
+
+static cl::opt<bool>
+EnableEmCxxExceptions("enable-emscripten-cxx-exceptions",
+                      cl::desc("Enables C++ exceptions in emscripten"),
+                      cl::init(false));
+
+static cl::opt<bool>
+EnableEmAsyncify("emscripten-asyncify",
+                 cl::desc("Enable asyncify transformation (see emscripten ASYNCIFY option)"),
+                 cl::init(false));
+
+static cl::opt<bool>
+NoExitRuntime("emscripten-no-exit-runtime",
+              cl::desc("Generate code which assumes the runtime is never exited (so atexit etc. is unneeded; see emscripten NO_EXIT_RUNTIME setting)"),
+              cl::init(false));
+
+static cl::opt<bool>
+
+EnableCyberDWARF("enable-cyberdwarf",
+                 cl::desc("Include CyberDWARF debug information"),
+                 cl::init(false));
+
+static cl::opt<bool>
+EnableCyberDWARFIntrinsics("enable-debug-intrinsics",
+                           cl::desc("Include debug intrinsics in generated output"),
+                           cl::init(false));
+
+static cl::opt<bool>
+WebAssembly("emscripten-wasm",
+            cl::desc("Generate asm.js which will later be compiled to WebAssembly (see emscripten BINARYEN setting)"),
+            cl::init(false));
+
 
 extern "C" void LLVMInitializeJSBackendTarget() {
   // Register the target.
@@ -135,7 +170,12 @@ namespace {
   typedef std::vector<unsigned char> HeapData;
   typedef std::map<int, HeapData> HeapDataMap;
   typedef std::vector<int> AlignedHeapStartMap;
-  typedef std::pair<unsigned, unsigned> Address;
+  struct Address {
+    unsigned Offset, Alignment;
+    bool ZeroInit;
+    Address() {}
+    Address(unsigned Offset, unsigned Alignment, bool ZeroInit) : Offset(Offset), Alignment(Alignment), ZeroInit(ZeroInit) {}
+  };
   typedef std::map<std::string, Type *> VarMap;
   typedef std::map<std::string, Address> GlobalAddressMap;
   typedef std::vector<std::string> FunctionTable;
@@ -146,6 +186,10 @@ namespace {
   typedef std::map<const BasicBlock*, unsigned> BlockIndexMap;
   typedef std::map<const Function*, BlockIndexMap> BlockAddressMap;
   typedef std::map<const BasicBlock*, Block*> LLVMToRelooperMap;
+  struct AsmConstInfo {
+    int Id;
+    std::set<std::string> Sigs;
+  };
   typedef std::vector<unsigned> AddressList;
 
   /// JSWriter - This class is the main chunk of code that converts an LLVM
@@ -159,7 +203,8 @@ namespace {
     VarMap UsedVars;
     AllocaManager Allocas;
     HeapDataMap GlobalDataMap;
-    AlignedHeapStartMap AlignedHeapStarts;
+    std::vector<int> ZeroInitSizes; // alignment => used offset in the zeroinit zone
+    AlignedHeapStartMap AlignedHeapStarts, ZeroInitStarts;
     GlobalAddressMap GlobalAddresses;
     NameSet Externals; // vars
     NameSet Declares; // funcs
@@ -174,8 +219,7 @@ namespace {
     std::vector<std::string> Exports; // additional exports
     StringMap Aliases;
     BlockAddressMap BlockAddresses;
-    NameIntMap AsmConsts;
-    IntIntSetMap AsmConstArities;
+    std::map<std::string, AsmConstInfo> AsmConsts; // code => { index, list of seen sigs }
     NameSet FuncRelocatableExterns; // which externals are accessed in this function; we load them once at the beginning (avoids a potential call in a heap access, and might be faster)
     AddressList objcSelectorRefs;
     AddressList objcMessageRefs;
@@ -188,18 +232,37 @@ namespace {
     AddressList objcProtocolList;
     AddressList objcProtocolRefs;
 
+    struct {
+      // 0 is reserved for void type
+      unsigned MetadataNum = 1;
+      std::map<Metadata *, unsigned> IndexedMetadata;
+      std::map<unsigned, std::string> VtableOffsets;
+      std::ostringstream TypeDebugData;
+      std::ostringstream TypeNameMap;
+      std::ostringstream FunctionMembers;
+    } cyberDWARFData;
+
     std::string CantValidate;
+    bool UsesSIMDUint8x16;
     bool UsesSIMDInt8x16;
+    bool UsesSIMDUint16x8;
     bool UsesSIMDInt16x8;
+    bool UsesSIMDUint32x4;
     bool UsesSIMDInt32x4;
     bool UsesSIMDFloat32x4;
     bool UsesSIMDFloat64x2;
+    bool UsesSIMDBool8x16;
+    bool UsesSIMDBool16x8;
+    bool UsesSIMDBool32x4;
+    bool UsesSIMDBool64x2;
     int InvokeState; // cycles between 0, 1 after preInvoke, 2 after call, 0 again after postInvoke. hackish, no argument there.
     CodeGenOpt::Level OptLevel;
     const DataLayout *DL;
     bool StackBumped;
     int GlobalBasePadding;
     int MaxGlobalAlign;
+    int StaticBump;
+    const Instruction* CurrInstruction;
 
     #include "CallHandlers.h"
 
@@ -207,9 +270,12 @@ namespace {
     static char ID;
     JSWriter(raw_pwrite_stream &o, CodeGenOpt::Level OptLevel)
       : ModulePass(ID), Out(o), UniqueNum(0), NextFunctionIndex(0), CantValidate(""),
-        UsesSIMDInt8x16(false), UsesSIMDInt16x8(false), UsesSIMDInt32x4(false),
-        UsesSIMDFloat32x4(false), UsesSIMDFloat64x2(false), InvokeState(0),
-        OptLevel(OptLevel), StackBumped(false), GlobalBasePadding(0), MaxGlobalAlign(0) {}
+        UsesSIMDUint8x16(false), UsesSIMDInt8x16(false), UsesSIMDUint16x8(false),
+        UsesSIMDInt16x8(false), UsesSIMDUint32x4(false), UsesSIMDInt32x4(false),
+        UsesSIMDFloat32x4(false), UsesSIMDFloat64x2(false), UsesSIMDBool8x16(false),
+        UsesSIMDBool16x8(false), UsesSIMDBool32x4(false), UsesSIMDBool64x2(false), InvokeState(0),
+        OptLevel(OptLevel), StackBumped(false), GlobalBasePadding(0), MaxGlobalAlign(0),
+        CurrInstruction(nullptr) {}
 
     const char *getPassName() const override { return "JavaScript backend"; }
 
@@ -241,7 +307,7 @@ namespace {
     #define STACK_ALIGN_BITS 128
 
     unsigned stackAlign(unsigned x) {
-      return RoundUpToAlignment(x, STACK_ALIGN);
+      return alignTo(x, STACK_ALIGN);
     }
     std::string stackAlignStr(std::string x) {
       return "((" + x + "+" + utostr(STACK_ALIGN-1) + ")&-" + utostr(STACK_ALIGN) + ")";
@@ -260,8 +326,16 @@ namespace {
       assert(isPowerOf2_32(Alignment) && Alignment > 0);
       HeapData* GlobalData = &GlobalDataMap[Alignment];
       ensureAligned(Alignment, GlobalData);
-      GlobalAddresses[Name] = Address(GlobalData->size(), Alignment*8);
+      GlobalAddresses[Name] = Address(GlobalData->size(), Alignment*8, false);
       return GlobalData;
+    }
+
+    void allocateZeroInitAddress(const std::string& Name, unsigned Alignment, unsigned Size) {
+      assert(isPowerOf2_32(Alignment) && Alignment > 0);
+      while (ZeroInitSizes.size() <= Alignment) ZeroInitSizes.push_back(0);
+      GlobalAddresses[Name] = Address(ZeroInitSizes[Alignment], Alignment*8, true);
+      ZeroInitSizes[Alignment] += Size;
+      while (ZeroInitSizes[Alignment] & (Alignment-1)) ZeroInitSizes[Alignment]++;
     }
 
     // return the absolute offset of a global
@@ -271,9 +345,10 @@ namespace {
         report_fatal_error("cannot find global address " + Twine(s));
       }
       Address a = I->second;
-      int Alignment = a.second/8;
+      int Alignment = a.Alignment/8;
       assert(AlignedHeapStarts.size() > (unsigned)Alignment);
-      int Ret = a.first + AlignedHeapStarts[Alignment];
+      int Ret = a.Offset + (a.ZeroInit ? ZeroInitStarts[Alignment] : AlignedHeapStarts[Alignment]);
+      assert(Alignment < (int)(a.ZeroInit ? ZeroInitStarts.size() : AlignedHeapStarts.size()));
       assert(Ret % Alignment == 0);
       return Ret;
     }
@@ -284,7 +359,7 @@ namespace {
         report_fatal_error("cannot find global address " + Twine(s));
       }
       Address a = I->second;
-      return a.first;
+      return a.Offset;
     }
     char getFunctionSignatureLetter(Type *T) {
       if (T->isVoidTy()) return 'v';
@@ -308,7 +383,7 @@ namespace {
     bool isObjCFunction(const std::string *Name) {
       return Name && (Name->compare(0, 6, "_OBJC_") == 0 || Name->compare(0, 9, "_objc_msg") == 0);
     }
-    std::string getFunctionSignature(const FunctionType *F, const std::string *Name=NULL) {
+    std::string getFunctionSignature(const FunctionType *F) {
       std::string Ret;
       Ret += getFunctionSignatureLetter(F->getReturnType());
       for (FunctionType::param_iterator AI = F->param_begin(),
@@ -317,8 +392,8 @@ namespace {
       }
       return Ret;
     }
-    FunctionTable& ensureFunctionTable(const FunctionType *FT, const std::string *Name=NULL) {
-      FunctionTable &Table = FunctionTables[getFunctionSignature(FT, Name)];
+    FunctionTable& ensureFunctionTable(const FunctionType *FT) {
+      FunctionTable &Table = FunctionTables[getFunctionSignature(FT)];
       unsigned MinSize = ReservedFunctionPointers ? 2*(ReservedFunctionPointers+1) : 1; // each reserved slot must be 2-aligned
       while (Table.size() < MinSize) Table.push_back("0");
 
@@ -327,8 +402,8 @@ namespace {
     unsigned getFunctionIndex(const Function *F) {
       const std::string &Name = getJSName(F);
       if (IndexedFunctions.find(Name) != IndexedFunctions.end()) return IndexedFunctions[Name];
-      std::string Sig = getFunctionSignature(F->getFunctionType(), &Name);
-      FunctionTable& Table = ensureFunctionTable(F->getFunctionType(), &Name);
+      std::string Sig = getFunctionSignature(F->getFunctionType());
+      FunctionTable& Table = ensureFunctionTable(F->getFunctionType());
       if (NoAliasingFunctionPointers) {
         while (Table.size() < NextFunctionIndex) Table.push_back("0");
       }
@@ -391,6 +466,13 @@ namespace {
       return Relocatable ? "(gb + (" + G + ") | 0)" : G;
     }
 
+    unsigned getIDForMetadata(Metadata *MD) {
+      if (cyberDWARFData.IndexedMetadata.find(MD) == cyberDWARFData.IndexedMetadata.end()) {
+        cyberDWARFData.IndexedMetadata[MD] = cyberDWARFData.MetadataNum++;
+      }
+      return cyberDWARFData.IndexedMetadata[MD];
+    }
+
     // Return a constant we are about to write into a global as a numeric offset. If the
     // value is not known at compile time, emit a postSet to that location.
     unsigned getConstAsOffset(const Value *V, unsigned AbsoluteTarget) {
@@ -440,7 +522,7 @@ namespace {
     // Transform the string input into emscripten_asm_const_*(str, args1, arg2)
     // into an id. We emit a map of id => string contents, and emscripten
     // wraps it up so that calling that id calls that function.
-    unsigned getAsmConstId(const Value *V, int Arity) {
+    unsigned getAsmConstId(const Value *V, std::string Sig) {
       V = resolveFully(V);
       const Constant *CI = cast<GlobalVariable>(V)->getInitializer();
       std::string code;
@@ -467,15 +549,18 @@ namespace {
           }
         }
       }
-      unsigned id;
+      unsigned Id;
       if (AsmConsts.count(code) > 0) {
-        id = AsmConsts[code];
+        auto& Info = AsmConsts[code];
+        Id = Info.Id;
+        Info.Sigs.insert(Sig);
       } else {
-        id = AsmConsts.size();
-        AsmConsts[code] = id;
+        AsmConstInfo Info;
+        Info.Id = Id = AsmConsts.size();
+        Info.Sigs.insert(Sig);
+        AsmConsts[code] = Info;
       }
-      AsmConstArities[id].insert(Arity);
-      return id;
+      return Id;
     }
 
     // Test whether the given value is known to be an absolute value or one we turn into an absolute value
@@ -507,7 +592,13 @@ namespace {
         if (VT->getNumElements() <= 16 && VT->getElementType()->getPrimitiveSizeInBits() == 8) UsesSIMDInt8x16 = true;
         else if (VT->getNumElements() <= 8 && VT->getElementType()->getPrimitiveSizeInBits() == 16) UsesSIMDInt16x8 = true;
         else if (VT->getNumElements() <= 4 && VT->getElementType()->getPrimitiveSizeInBits() == 32) UsesSIMDInt32x4 = true;
-        else if (VT->getElementType()->getPrimitiveSizeInBits() != 1 && VT->getElementType()->getPrimitiveSizeInBits() != 128) {
+        else if (VT->getElementType()->getPrimitiveSizeInBits() == 1) {
+          if (VT->getNumElements() == 16) UsesSIMDBool8x16 = true;
+          else if (VT->getNumElements() == 8) UsesSIMDBool16x8 = true;
+          else if (VT->getNumElements() == 4) UsesSIMDBool32x4 = true;
+          else if (VT->getNumElements() == 2) UsesSIMDBool64x2 = true;
+          else report_fatal_error("Unsupported boolean vector type with numElems: " + Twine(VT->getNumElements()) + ", primitiveSize: " + Twine(VT->getElementType()->getPrimitiveSizeInBits()) + "!");
+        } else if (VT->getElementType()->getPrimitiveSizeInBits() != 1 && VT->getElementType()->getPrimitiveSizeInBits() != 128) {
           report_fatal_error("Unsupported integer vector type with numElems: " + Twine(VT->getNumElements()) + ", primitiveSize: " + Twine(VT->getElementType()->getPrimitiveSizeInBits()) + "!");
         }
       }
@@ -524,6 +615,19 @@ namespace {
       return S;
     }
 
+    static void emitDebugInfo(raw_ostream& Code, const Instruction *I) {
+      auto &Loc = I->getDebugLoc();
+      if (Loc) {
+        unsigned Line = Loc.getLine();
+        auto *Scope = cast_or_null<DIScope>(Loc.getScope());
+        if (Scope) {
+          StringRef File = Scope->getFilename();
+          if (Line > 0)
+            Code << " //@line " << utostr(Line) << " \"" << (File.size() > 0 ? File.str() : "?") << "\"";
+        }
+      }
+    }
+
     std::string ftostr(const ConstantFP *CFP, AsmCast sign) {
       const APFloat &flt = CFP->getValueAPF();
 
@@ -536,6 +640,11 @@ namespace {
           // this a build error in order to not break people's existing code, so issue a warning instead.
           if (WarnOnNoncanonicalNans) {
             errs() << "emcc: warning: cannot represent a NaN literal '" << CFP << "' with custom bit pattern in NaN-canonicalizing JS engines (e.g. Firefox and Safari) without erasing bits!\n";
+            if (CurrInstruction) {
+              errs() << "  in " << *CurrInstruction << " in " << CurrInstruction->getParent()->getParent()->getName() << "() ";
+              emitDebugInfo(errs(), CurrInstruction);
+              errs() << '\n';
+            }
           }
         }
         return ensureCast("nan", CFP->getType(), sign);
@@ -565,11 +674,11 @@ namespace {
     /// @return The index to the heap HeapName for the memory access.
     std::string getHeapNameAndIndex(const Value *Ptr, const char **HeapName);
 
-    // Like getHeapNameAndIndex(), but uses the given memory operation size instead of the one from Ptr.
-    std::string getHeapNameAndIndex(const Value *Ptr, const char **HeapName, unsigned Bytes);
+    // Like getHeapNameAndIndex(), but uses the given memory operation size and whether it is an Integer instead of the type of Ptr.
+    std::string getHeapNameAndIndex(const Value *Ptr, const char **HeapName, unsigned Bytes, bool Integer);
 
     /// Like getHeapNameAndIndex(), but for global variables only.
-    std::string getHeapNameAndIndexToGlobal(const GlobalVariable *GV, const char **HeapName);
+    std::string getHeapNameAndIndexToGlobal(const GlobalVariable *GV, unsigned Bytes, bool Integer, const char **HeapName);
 
     /// Like getHeapNameAndIndex(), but for pointers represented in string expression form.
     static std::string getHeapNameAndIndexToPtr(const std::string& Ptr, unsigned Bytes, bool Integer, const char **HeapName);
@@ -614,7 +723,7 @@ namespace {
     void printFunctionBody(const Function *F);
     void generateInsertElementExpression(const InsertElementInst *III, raw_string_ostream& Code);
     void generateExtractElementExpression(const ExtractElementInst *EEI, raw_string_ostream& Code);
-    std::string getSIMDCast(VectorType *fromType, VectorType *toType, const std::string &valueStr);
+    std::string getSIMDCast(VectorType *fromType, VectorType *toType, const std::string &valueStr, bool signExtend);
     void generateShuffleVectorExpression(const ShuffleVectorInst *SVI, raw_string_ostream& Code);
     void generateICmpExpression(const ICmpInst *I, raw_string_ostream& Code);
     void generateFCmpExpression(const FCmpInst *I, raw_string_ostream& Code);
@@ -622,6 +731,10 @@ namespace {
     void generateUnrolledExpression(const User *I, raw_string_ostream& Code);
     bool generateSIMDExpression(const User *I, raw_string_ostream& Code);
     void generateExpression(const User *I, raw_string_ostream& Code);
+
+    // debug information
+    std::string generateDebugRecordForVar(Metadata *MD);
+    void buildCyberDWARFData();
 
     std::string getOpName(const Value*);
 
@@ -733,19 +846,6 @@ static inline std::string ensureFloat(const std::string &value, bool wrap) {
     return "Math_fround(" + value + ')';
   }
   return value;
-}
-
-static void emitDebugInfo(raw_ostream& Code, const Instruction *I) {
-  auto &Loc = I->getDebugLoc();
-  if (Loc) {
-    unsigned Line = Loc.getLine();
-    auto *Scope = cast_or_null<MDScope>(Loc.getScope());
-    if (Scope) {
-      StringRef File = Scope->getFilename();
-      if (Line > 0)
-        Code << " //@line " << utostr(Line) << " \"" << (File.size() > 0 ? File.str() : "?") << "\"";
-    }
-  }
 }
 
 void JSWriter::error(const std::string& msg) {
@@ -868,22 +968,33 @@ std::string JSWriter::getAssignIfNeeded(const Value *V) {
   return std::string();
 }
 
-// We currently replace <i1 x 4> with <i32 x 4>
-int actualPrimitiveSize(VectorType *t) {
-  bool isInt = t->getElementType()->isIntegerTy();
+const char *SIMDType(VectorType *t) {
   int primSize = t->getElementType()->getPrimitiveSizeInBits();
   assert(primSize <= 128);
-  int numElems = t->getNumElements();
-  if (isInt && primSize == 1) primSize = 128 / numElems; // Always treat bit vectors as integer vectors of the base width.
-  assert(128 % primSize == 0);
-  return primSize;
-}
 
-std::string SIMDType(VectorType *t) {
-  bool isInt = t->getElementType()->isIntegerTy();
-  int primSize = actualPrimitiveSize(t);
-  int numElems = 128 / primSize; // Promote smaller than 128-bit vector types to 128-bit since smaller ones do not exist in SIMD.js. (pad with zero lanes)
-  return (isInt ? "Int" : "Float") + std::to_string(primSize) + 'x' + std::to_string(numElems);
+  if (t->getElementType()->isIntegerTy()) {
+    if (t->getElementType()->getPrimitiveSizeInBits() == 1) {
+      if (t->getNumElements() == 2) return "Bool64x2";
+      if (t->getNumElements() <= 4) return "Bool32x4";
+      if (t->getNumElements() <= 8) return "Bool16x8";
+      if (t->getNumElements() <= 16) return "Bool8x16";
+      // fall-through to error
+    } else {
+      if (t->getElementType()->getPrimitiveSizeInBits() > 32 && t->getNumElements() <= 2) return "Int64x2";
+      if (t->getElementType()->getPrimitiveSizeInBits() > 16 && t->getNumElements() <= 4) return "Int32x4";
+      if (t->getElementType()->getPrimitiveSizeInBits() > 8 && t->getNumElements() <= 8) return "Int16x8";
+      if (t->getElementType()->getPrimitiveSizeInBits() <= 8 && t->getNumElements() <= 16) return "Int8x16";
+      // fall-through to error
+    }
+  } else { // float type
+    if (t->getElementType()->getPrimitiveSizeInBits() > 32 && t->getNumElements() <= 2) return "Float64x2";
+    if (t->getElementType()->getPrimitiveSizeInBits() > 16 && t->getNumElements() <= 4) return "Float32x4";
+    if (t->getElementType()->getPrimitiveSizeInBits() > 8 && t->getNumElements() <= 8) return "Float16x8";
+    if (t->getElementType()->getPrimitiveSizeInBits() <= 8 && t->getNumElements() <= 16) return "Float8x16";
+    // fall-through to error
+  }
+  errs() << *t << "\n";
+  report_fatal_error("Unsupported type!");
 }
 
 std::string JSWriter::getCast(const StringRef &s, Type *t, AsmCast sign) {
@@ -987,12 +1098,10 @@ static inline const char *getHeapShiftStr(int Bytes)
   }
 }
 
-std::string JSWriter::getHeapNameAndIndexToGlobal(const GlobalVariable *GV, const char **HeapName)
+std::string JSWriter::getHeapNameAndIndexToGlobal(const GlobalVariable *GV, unsigned Bytes, bool Integer, const char **HeapName)
 {
-  Type *t = cast<PointerType>(GV->getType())->getElementType();
-  unsigned Bytes = DL->getTypeAllocSize(t);
   unsigned Addr = getGlobalAddress(GV->getName().str());
-  *HeapName = getHeapName(Bytes, t->isIntegerTy() || t->isPointerTy());
+  *HeapName = getHeapName(Bytes, Integer);
   if (!Relocatable) {
     return utostr(Addr >> getHeapShift(Bytes));
   } else {
@@ -1006,22 +1115,21 @@ std::string JSWriter::getHeapNameAndIndexToPtr(const std::string& Ptr, unsigned 
   return Ptr + getHeapShiftStr(Bytes);
 }
 
-std::string JSWriter::getHeapNameAndIndex(const Value *Ptr, const char **HeapName, unsigned Bytes)
+std::string JSWriter::getHeapNameAndIndex(const Value *Ptr, const char **HeapName, unsigned Bytes, bool Integer)
 {
-  Type *t = cast<PointerType>(Ptr->getType())->getElementType();
-
-  if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(Ptr)) {
-    return getHeapNameAndIndexToGlobal(GV, HeapName);
+  const GlobalVariable *GV;
+  if ((GV = dyn_cast<GlobalVariable>(Ptr->stripPointerCasts())) && GV->hasInitializer()) {
+    // Note that we use the type of the pointer, as it might be a bitcast of the underlying global. We need the right type.
+    return getHeapNameAndIndexToGlobal(GV, Bytes, Integer, HeapName);
   } else {
-    return getHeapNameAndIndexToPtr(getValueAsStr(Ptr), Bytes, t->isIntegerTy() || t->isPointerTy(), HeapName);
+    return getHeapNameAndIndexToPtr(getValueAsStr(Ptr), Bytes, Integer, HeapName);
   }
 }
 
 std::string JSWriter::getHeapNameAndIndex(const Value *Ptr, const char **HeapName)
 {
   Type *t = cast<PointerType>(Ptr->getType())->getElementType();
-  unsigned Bytes = DL->getTypeAllocSize(t);
-  return getHeapNameAndIndex(Ptr, HeapName, Bytes);
+  return getHeapNameAndIndex(Ptr, HeapName, DL->getTypeAllocSize(t), t->isIntegerTy() || t->isPointerTy());
 }
 
 static const char *heapNameToAtomicTypeName(const char *HeapName)
@@ -1045,7 +1153,7 @@ std::string JSWriter::getLoad(const Instruction *I, const Value *P, Type *T, uns
         // implemented, we could remove the emulation, but until then we must emulate manually.
         text = Assign + (fround ? "Math_fround(" : "+") + "_emscripten_atomic_load_" + heapNameToAtomicTypeName(HeapName) + "(" + getValueAsStr(P) + (fround ? "))" : ")");
       } else {
-        text = Assign + "Atomics_load(" + HeapName + ',' + Index + ')';
+        text = Assign + "(Atomics_load(" + HeapName + ',' + Index + ")|0)";
       }
     } else {
       text = Assign + getPtrLoad(P);
@@ -1166,7 +1274,7 @@ std::string JSWriter::getStore(const Instruction *I, const Value *P, Type *T, co
         else
           text = "+" + text;
       } else {
-        text = std::string("Atomics_store(") + HeapName + ',' + Index + ',' + VS + ')';
+        text = std::string("Atomics_store(") + HeapName + ',' + Index + ',' + VS + ")|0";
       }
     } else {
       text = getPtrUse(P) + " = " + VS;
@@ -1274,7 +1382,7 @@ std::string JSWriter::getStackBump(unsigned Size) {
 std::string JSWriter::getStackBump(const std::string &Size) {
   std::string ret = "STACKTOP = STACKTOP + " + Size + "|0;";
   if (EmscriptenAssertions) {
-    ret += " if ((STACKTOP|0) >= (STACK_MAX|0)) abort();";
+    ret += " if ((STACKTOP|0) >= (STACK_MAX|0)) abortStackOverflow(" + Size + "|0);";
   }
   return ret;
 }
@@ -1296,7 +1404,7 @@ std::string JSWriter::getHeapAccess(const std::string& Name, unsigned Bytes, boo
 
 std::string JSWriter::getShiftedPtr(const Value *Ptr, unsigned Bytes) {
   const char *HeapName = 0; // unused
-  return getHeapNameAndIndex(Ptr, &HeapName, Bytes);
+  return getHeapNameAndIndex(Ptr, &HeapName, Bytes, true /* Integer; doesn't matter */);
 }
 
 std::string JSWriter::getPtrUse(const Value* Ptr) {
@@ -1454,7 +1562,7 @@ std::string JSWriter::getConstantVector(const ConstantVectorType *C) {
     } else {
       VectorType *IntTy = VectorType::getInteger(C->getType());
       checkVectorType(IntTy);
-      return getSIMDCast(IntTy, C->getType(), std::string("SIMD_") + SIMDType(IntTy) + "_splat(" + op0 + ')');
+      return getSIMDCast(IntTy, C->getType(), std::string("SIMD_") + SIMDType(IntTy) + "_splat(" + op0 + ')', true);
     }
   }
 
@@ -1486,7 +1594,7 @@ std::string JSWriter::getConstantVector(const ConstantVectorType *C) {
       c += ',' + ensureFloat(isInt ? "0" : "+0", !isInt);
     }
 
-    return getSIMDCast(IntTy, C->getType(), c + ")");
+    return getSIMDCast(IntTy, C->getType(), c + ")", true);
   }
 }
 
@@ -1621,7 +1729,7 @@ void JSWriter::generateInsertElementExpression(const InsertElementInst *III, raw
       if (!PreciseF32 && VT->getElementType()->isFloatTy()) {
         operand = "Math_fround(" + operand + ")";
       }
-      Result = "SIMD_" + SIMDType(VT) + "_replaceLane(" + Result + ',' + utostr(Index) + ',' + operand + ')';
+      Result = std::string("SIMD_") + SIMDType(VT) + "_replaceLane(" + Result + ',' + utostr(Index) + ',' + operand + ')';
     }
     Code << Result;
   }
@@ -1644,12 +1752,6 @@ void JSWriter::generateExtractElementExpression(const ExtractElementInst *EEI, r
   error("SIMD extract element with non-constant index not implemented yet");
 }
 
-std::string castBoolVecToIntVec(int numElems, const std::string &str)
-{
-  int elemWidth = 128 / numElems;
-  std::string simdType = "SIMD_Int" + std::to_string(elemWidth) + "x" + std::to_string(numElems);
-  return simdType + "_select(" + str + ", " + simdType + "_splat(-1), " + simdType + "_splat(0))";
-}
 
 std::string castIntVecToBoolVec(int numElems, const std::string &str)
 {
@@ -1658,7 +1760,7 @@ std::string castIntVecToBoolVec(int numElems, const std::string &str)
   return simdType + "_notEqual(" + str + ", " + simdType + "_splat(0))";
 }
 
-std::string JSWriter::getSIMDCast(VectorType *fromType, VectorType *toType, const std::string &valueStr)
+std::string JSWriter::getSIMDCast(VectorType *fromType, VectorType *toType, const std::string &valueStr, bool signExtend)
 {
   bool toInt = toType->getElementType()->isIntegerTy();
   bool fromInt = fromType->getElementType()->isIntegerTy();
@@ -1676,7 +1778,7 @@ std::string JSWriter::getSIMDCast(VectorType *fromType, VectorType *toType, cons
   bool fromIsBool = (fromInt && fromPrimSize == 1);
   bool toIsBool = (toInt && toPrimSize == 1);
   if (fromIsBool && !toIsBool) { // Casting from bool vector to a bit vector looks more complicated (e.g. Bool32x4 to Int32x4)
-    return castBoolVecToIntVec(toNumElems, valueStr);
+    return castBoolVecToIntVec(toNumElems, valueStr, signExtend);
   }
 
   if (fromType->getBitWidth() != toType->getBitWidth() && !fromIsBool && !toIsBool) {
@@ -1705,7 +1807,7 @@ void JSWriter::generateShuffleVectorExpression(const ShuffleVectorInst *SVI, raw
           // otherwise not being precise about it.
           operand = "Math_fround(" + operand + ")";
         }
-        Code << "SIMD_" + SIMDType(SVI->getType()) + "_splat(" << operand << ')';
+        Code << "SIMD_" << SIMDType(SVI->getType()) << "_splat(" << operand << ')';
         return;
       }
     }
@@ -1754,8 +1856,8 @@ void JSWriter::generateShuffleVectorExpression(const ShuffleVectorInst *SVI, raw
   // Emit a fully-general shuffle.
   Code << "SIMD_" << SIMDType(SVI->getType()) << "_shuffle(";
 
-  Code << getSIMDCast(cast<VectorType>(SVI->getOperand(0)->getType()), SVI->getType(), A) << ", "
-       << getSIMDCast(cast<VectorType>(SVI->getOperand(1)->getType()), SVI->getType(), B) << ", ";
+  Code << getSIMDCast(cast<VectorType>(SVI->getOperand(0)->getType()), SVI->getType(), A, true) << ", "
+       << getSIMDCast(cast<VectorType>(SVI->getOperand(1)->getType()), SVI->getType(), B, true) << ", ";
 
   SmallVector<int, 16> Indices;
   SVI->getShuffleMask(Indices);
@@ -1796,10 +1898,15 @@ void JSWriter::generateICmpExpression(const ICmpInst *I, raw_string_ostream& Cod
     default: I->dump(); error("invalid vector icmp"); break;
   }
 
+  checkVectorType(I->getOperand(0)->getType());
+  checkVectorType(I->getOperand(1)->getType());
+
+  Code << getAssignIfNeeded(I);
+
   if (Invert)
     Code << "SIMD_" << SIMDType(cast<VectorType>(I->getType())) << "_not(";
 
-  Code << getAssignIfNeeded(I) << "SIMD_" << SIMDType(cast<VectorType>(I->getOperand(0)->getType())) << '_' << Name << '('
+  Code << "SIMD_" << SIMDType(cast<VectorType>(I->getOperand(0)->getType())) << '_' << Name << '('
        << getValueAsStr(I->getOperand(0)) << ',' << getValueAsStr(I->getOperand(1)) << ')';
 
   if (Invert)
@@ -1822,36 +1929,36 @@ void JSWriter::generateFCmpExpression(const FCmpInst *I, raw_string_ostream& Cod
       checkVectorType(I->getOperand(0)->getType());
       checkVectorType(I->getOperand(1)->getType());
       Code << getAssignIfNeeded(I)
-           << castIntVecToBoolVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getType())) + "_and(SIMD_" + SIMDType(cast<VectorType>(I->getType())) + "_and("
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_equal(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(0)) + ')') + ','
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(1)->getType())) + "_equal(" + getValueAsStr(I->getOperand(1)) + ',' + getValueAsStr(I->getOperand(1)) + ')') + ','
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_notEqual(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(1)) + ')') + ')');
+           << castIntVecToBoolVec(VT->getNumElements(), std::string("SIMD_") + SIMDType(cast<VectorType>(I->getType())) + "_and(SIMD_" + SIMDType(cast<VectorType>(I->getType())) + "_and("
+            + castBoolVecToIntVec(VT->getNumElements(), std::string("SIMD_") + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_equal(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(0)) + ')', true) + ','
+            + castBoolVecToIntVec(VT->getNumElements(), std::string("SIMD_") + SIMDType(cast<VectorType>(I->getOperand(1)->getType())) + "_equal(" + getValueAsStr(I->getOperand(1)) + ',' + getValueAsStr(I->getOperand(1)) + ')', true) + ','
+            + castBoolVecToIntVec(VT->getNumElements(), std::string("SIMD_") + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_notEqual(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(1)) + ')', true) + ')');
       return;
     case ICmpInst::FCMP_UEQ:
       checkVectorType(I->getOperand(0)->getType());
       checkVectorType(I->getOperand(1)->getType());
       Code << getAssignIfNeeded(I)
-           << castIntVecToBoolVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getType())) + "_or(SIMD_" + SIMDType(cast<VectorType>(I->getType())) + "_or("
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_notEqual(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(0)) + ')') + ','
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(1)->getType())) + "_notEqual(" + getValueAsStr(I->getOperand(1)) + ',' + getValueAsStr(I->getOperand(1)) + ')') + ','
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_equal(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(1)) + ')') + ')');
+           << castIntVecToBoolVec(VT->getNumElements(), std::string("SIMD_") + SIMDType(cast<VectorType>(I->getType())) + "_or(SIMD_" + SIMDType(cast<VectorType>(I->getType())) + "_or("
+            + castBoolVecToIntVec(VT->getNumElements(), std::string("SIMD_") + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_notEqual(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(0)) + ')', true) + ','
+            + castBoolVecToIntVec(VT->getNumElements(), std::string("SIMD_") + SIMDType(cast<VectorType>(I->getOperand(1)->getType())) + "_notEqual(" + getValueAsStr(I->getOperand(1)) + ',' + getValueAsStr(I->getOperand(1)) + ')', true) + ','
+            + castBoolVecToIntVec(VT->getNumElements(), std::string("SIMD_") + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_equal(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(1)) + ')', true) + ')');
       return;
     case FCmpInst::FCMP_ORD:
       checkVectorType(I->getOperand(0)->getType());
       checkVectorType(I->getOperand(1)->getType());
       Code << getAssignIfNeeded(I)
-           << castIntVecToBoolVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getType())) + "_and("
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_equal(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(0)) + ')') + ','
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(1)->getType())) + "_equal(" + getValueAsStr(I->getOperand(1)) + ',' + getValueAsStr(I->getOperand(1)) + ')') + ')');
+           << "SIMD_" << SIMDType(cast<VectorType>(I->getType())) << "_and("
+           << "SIMD_" << SIMDType(cast<VectorType>(I->getOperand(0)->getType())) << "_equal(" << getValueAsStr(I->getOperand(0)) << ',' << getValueAsStr(I->getOperand(0)) << "),"
+           << "SIMD_" << SIMDType(cast<VectorType>(I->getOperand(1)->getType())) << "_equal(" << getValueAsStr(I->getOperand(1)) << ',' << getValueAsStr(I->getOperand(1)) << "))";
       return;
 
     case FCmpInst::FCMP_UNO:
       checkVectorType(I->getOperand(0)->getType());
       checkVectorType(I->getOperand(1)->getType());
       Code << getAssignIfNeeded(I)
-           << castIntVecToBoolVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getType())) + "_or("
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(0)->getType())) + "_notEqual(" + getValueAsStr(I->getOperand(0)) + ',' + getValueAsStr(I->getOperand(0)) + ')') + ','
-            + castBoolVecToIntVec(VT->getNumElements(), "SIMD_" + SIMDType(cast<VectorType>(I->getOperand(1)->getType())) + "_notEqual(" + getValueAsStr(I->getOperand(1)) + ',' + getValueAsStr(I->getOperand(1)) + ')') + ')');
+           << "SIMD_" << SIMDType(cast<VectorType>(I->getType())) << "_or("
+           << "SIMD_" << SIMDType(cast<VectorType>(I->getOperand(0)->getType())) << "_notEqual(" << getValueAsStr(I->getOperand(0)) << ',' << getValueAsStr(I->getOperand(0)) << "),"
+           << "SIMD_" << SIMDType(cast<VectorType>(I->getOperand(1)->getType())) << "_notEqual(" << getValueAsStr(I->getOperand(1)) << ',' << getValueAsStr(I->getOperand(1)) << "))";
       return;
 
     case ICmpInst::FCMP_OEQ:  Name = "equal"; break;
@@ -1867,12 +1974,15 @@ void JSWriter::generateFCmpExpression(const FCmpInst *I, raw_string_ostream& Cod
     default: I->dump(); error("invalid vector fcmp"); break;
   }
 
+  checkVectorType(I->getOperand(0)->getType());
+  checkVectorType(I->getOperand(1)->getType());
+
+  Code << getAssignIfNeeded(I);
+
   if (Invert)
     Code << "SIMD_" << SIMDType(cast<VectorType>(I->getType())) << "_not(";
 
-  checkVectorType(I->getOperand(0)->getType());
-  checkVectorType(I->getOperand(1)->getType());
-  Code << getAssignIfNeeded(I) << "SIMD_" << SIMDType(cast<VectorType>(I->getOperand(0)->getType())) << "_" << Name << "("
+  Code << "SIMD_" << SIMDType(cast<VectorType>(I->getOperand(0)->getType())) << "_" << Name << "("
        << getValueAsStr(I->getOperand(0)) << ", " << getValueAsStr(I->getOperand(1)) << ")";
 
   if (Invert)
@@ -2031,7 +2141,12 @@ bool JSWriter::generateSIMDExpression(const User *I, raw_string_ostream& Code) {
       case Instruction::SExt:
         assert(cast<VectorType>(I->getOperand(0)->getType())->getElementType()->isIntegerTy(1) &&
                "sign-extension from vector of other than i1 not yet supported");
-        Code << getAssignIfNeeded(I) << getSIMDCast(cast<VectorType>(I->getOperand(0)->getType()), VT, getValueAsStr(I->getOperand(0)));
+        Code << getAssignIfNeeded(I) << getSIMDCast(cast<VectorType>(I->getOperand(0)->getType()), VT, getValueAsStr(I->getOperand(0)), true /* signExtend */);
+        break;
+      case Instruction::ZExt:
+        assert(cast<VectorType>(I->getOperand(0)->getType())->getElementType()->isIntegerTy(1) &&
+               "sign-extension from vector of other than i1 not yet supported");
+        Code << getAssignIfNeeded(I) << getSIMDCast(cast<VectorType>(I->getOperand(0)->getType()), VT, getValueAsStr(I->getOperand(0)), false /* signExtend */);
         break;
       case Instruction::Select:
         // Since we represent vectors of i1 as vectors of sign extended wider integers,
@@ -2075,7 +2190,7 @@ bool JSWriter::generateSIMDExpression(const User *I, raw_string_ostream& Code) {
       case Instruction::BitCast: {
       case Instruction::SIToFP:
         Code << getAssignIfNeeded(I);
-        Code << getSIMDCast(cast<VectorType>(I->getOperand(0)->getType()), cast<VectorType>(I->getType()), getValueAsStr(I->getOperand(0)));
+        Code << getSIMDCast(cast<VectorType>(I->getOperand(0)->getType()), cast<VectorType>(I->getType()), getValueAsStr(I->getOperand(0)), true);
         break;
       }
       case Instruction::Load: {
@@ -2084,7 +2199,7 @@ bool JSWriter::generateSIMDExpression(const User *I, raw_string_ostream& Code) {
         std::string PS = getValueAsStr(P);
         const char *load = "_load";
         if (VT->getElementType()->getPrimitiveSizeInBits() == 32) {
-          switch(VT->getNumElements()) {
+          switch (VT->getNumElements()) {
             case 1: load = "_load1"; break;
             case 2: load = "_load2"; break;
             case 3: load = "_load3"; break;
@@ -2129,7 +2244,7 @@ bool JSWriter::generateSIMDExpression(const User *I, raw_string_ostream& Code) {
       Code << getAdHocAssign(PS, P->getType()) << getValueAsStr(P) << ';';
       const char *store = "_store";
       if (VT->getElementType()->getPrimitiveSizeInBits() == 32) {
-        switch(VT->getNumElements()) {
+        switch (VT->getNumElements()) {
           case 1: store = "_store1"; break;
           case 2: store = "_store2"; break;
           case 3: store = "_store3"; break;
@@ -2336,9 +2451,9 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
     break;
   }
   case Instruction::ICmp: {
-    unsigned predicate = isa<ConstantExpr>(I) ?
-                         (unsigned)cast<ConstantExpr>(I)->getPredicate() :
-                         (unsigned)cast<ICmpInst>(I)->getPredicate();
+    auto predicate = isa<ConstantExpr>(I) ?
+                     (CmpInst::Predicate)cast<ConstantExpr>(I)->getPredicate() :
+                     cast<ICmpInst>(I)->getPredicate();
     AsmCast sign = CmpInst::isUnsigned(predicate) ? ASM_UNSIGNED : ASM_SIGNED;
     Code << getAssignIfNeeded(I) << "(" <<
       getValueAsCastStr(I->getOperand(0), sign) <<
@@ -2613,7 +2728,7 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
         Code << Assign << "_emscripten_atomic_exchange_u32(" << getValueAsStr(P) << ", " << VS << ")|0"; break;
 
       } else {
-        Code << Assign << "Atomics_" << atomicFunc << "(" << HeapName << ", " << Index << ", " << VS << ")"; break;
+        Code << Assign << "(Atomics_" << atomicFunc << "(" << HeapName << ", " << Index << ", " << VS << ")|0)"; break;
       }
     } else {
       Code << getLoad(rmwi, P, I->getType(), 0) << ';';
@@ -2636,11 +2751,8 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
     break;
   }
   case Instruction::Fence:
-    if (EnablePthreads) {
-      Code << "Atomics_fence()";
-    } else {
-      Code << "/* fence */"; // no threads, so nothing to do here
-    }
+    if (EnablePthreads) Code << "(Atomics_add(HEAP32, 0, 0)|0) /* fence */";
+    else Code << "/* fence */";
     break;
   }
 
@@ -2666,12 +2778,15 @@ static const Value *considerConditionVar(const Instruction *I) {
 void JSWriter::addBlock(const BasicBlock *BB, Relooper& R, LLVMToRelooperMap& LLVMToRelooper) {
   std::string Code;
   raw_string_ostream CodeStream(Code);
-  for (BasicBlock::const_iterator I = BB->begin(), E = BB->end();
-       I != E; ++I) {
+  for (BasicBlock::const_iterator II = BB->begin(), E = BB->end();
+       II != E; ++II) {
+    auto I = &*II;
     if (I->stripPointerCasts() == I) {
+      CurrInstruction = I;
       generateExpression(I, CodeStream);
     }
   }
+  CurrInstruction = nullptr;
   CodeStream.flush();
   const Value* Condition = considerConditionVar(BB->getTerminator());
   Block *Curr = new Block(Code.c_str(), Condition ? getValueAsCastStr(Condition).c_str() : NULL);
@@ -2697,8 +2812,9 @@ void JSWriter::printFunctionBody(const Function *F) {
   // Create relooper blocks with their contents. TODO: We could optimize
   // indirectbr by emitting indexed blocks first, so their indexes
   // match up with the label index.
-  for (Function::const_iterator BI = F->begin(), BE = F->end();
-       BI != BE; ++BI) {
+  for (Function::const_iterator I = F->begin(), BE = F->end();
+       I != BE; ++I) {
+    auto BI = &*I;
     InvokeState = 0; // each basic block begins in state 0; the previous may not have cleared it, if e.g. it had a throw in the middle and the rest of it was decapitated
     addBlock(BI, R, LLVMToRelooper);
     if (!Entry) Entry = LLVMToRelooper[BI];
@@ -2706,8 +2822,9 @@ void JSWriter::printFunctionBody(const Function *F) {
   assert(Entry);
 
   // Create branchings
-  for (Function::const_iterator BI = F->begin(), BE = F->end();
-       BI != BE; ++BI) {
+  for (Function::const_iterator I = F->begin(), BE = F->end();
+       I != BE; ++I) {
+    auto BI = &*I;
     const TerminatorInst *TI = BI->getTerminator();
     switch (TI->getOpcode()) {
       default: {
@@ -2828,11 +2945,17 @@ void JSWriter::printFunctionBody(const Function *F) {
           break;
         case Type::VectorTyID: {
           VectorType *VT = cast<VectorType>(VI->second);
-          int primSize = actualPrimitiveSize(VT);
-          // Promote smaller than 128-bit vector types to 128-bit since smaller ones do not exist in SIMD.js. (pad with zero lanes)
-          int numElems = 128 / primSize;
           Out << "SIMD_" << SIMDType(VT) << "(0";
-          for (int i = 1; i < numElems; ++i) {
+
+          // SIMD.js has only a fixed set of SIMD types, and no arbitrary vector sizes like <float x 3> or <i8 x 7>, so
+          // codegen rounds up to the smallest appropriate size where the LLVM vector fits.
+          unsigned simdJsNumElements = VT->getNumElements();
+          if (simdJsNumElements <= 2 && VT->getElementType()->getPrimitiveSizeInBits() > 32) simdJsNumElements = 2;
+          else if (simdJsNumElements <= 4 && VT->getElementType()->getPrimitiveSizeInBits() <= 32) simdJsNumElements = 4;
+          else if (simdJsNumElements <= 8 && VT->getElementType()->getPrimitiveSizeInBits() <= 16) simdJsNumElements = 8;
+          else if (simdJsNumElements <= 16 && VT->getElementType()->getPrimitiveSizeInBits() <= 8) simdJsNumElements = 16;
+
+          for (unsigned i = 1; i < simdJsNumElements; ++i) {
             Out << ",0";
           }
           Out << ')';
@@ -2965,10 +3088,12 @@ void JSWriter::processConstants() {
     if (Alignment > MaxGlobalAlign) MaxGlobalAlign = Alignment;
     ensureAligned(Alignment, &GlobalDataMap[Alignment]);
   }
+  if (int(ZeroInitSizes.size()-1) > MaxGlobalAlign) MaxGlobalAlign = ZeroInitSizes.size()-1; // highest index in ZeroInitSizes is the largest zero-init alignment
   if (!Relocatable && MaxGlobalAlign > 0) {
     while ((GlobalBase+GlobalBasePadding) % MaxGlobalAlign != 0) GlobalBasePadding++;
   }
   while (AlignedHeapStarts.size() <= (unsigned)MaxGlobalAlign) AlignedHeapStarts.push_back(0);
+  while (ZeroInitStarts.size() <= (unsigned)MaxGlobalAlign) ZeroInitStarts.push_back(0);
   for (auto& GI : GlobalDataMap) {
     int Alignment = GI.first;
     int Curr = GlobalBase + GlobalBasePadding;
@@ -2979,6 +3104,22 @@ void JSWriter::processConstants() {
     }
     AlignedHeapStarts[Alignment] = Curr;
   }
+
+  unsigned ZeroInitStart = GlobalBase + GlobalBasePadding;
+  for (auto& GI : GlobalDataMap) {
+    ZeroInitStart += GI.second.size();
+  }
+  if (!ZeroInitSizes.empty()) {
+    while (ZeroInitStart & (MaxGlobalAlign-1)) ZeroInitStart++; // fully align zero init area
+    for (int Alignment = ZeroInitSizes.size() - 1; Alignment > 0; Alignment--) {
+      if (ZeroInitSizes[Alignment] == 0) continue;
+      assert((ZeroInitStart & (Alignment-1)) == 0);
+      ZeroInitStarts[Alignment] = ZeroInitStart;
+      ZeroInitStart += ZeroInitSizes[Alignment];
+    }
+  }
+  StaticBump = ZeroInitStart; // total size of all the data section
+
   // Second, allocate their contents
   for (Module::const_global_iterator I = TheModule->global_begin(),
          E = TheModule->global_end(); I != E; ++I) {
@@ -2995,8 +3136,9 @@ void JSWriter::processConstants() {
     }
   }
   if (Relocatable) {
-    for (Module::const_global_iterator I = TheModule->global_begin(),
-           E = TheModule->global_end(); I != E; ++I) {
+    for (Module::const_global_iterator II = TheModule->global_begin(),
+           E = TheModule->global_end(); II != E; ++II) {
+      auto I = &*II;
       if (I->hasInitializer() && !I->hasInternalLinkage()) {
         std::string Name = I->getName().str();
         if (GlobalAddresses.find(Name) != GlobalAddresses.end()) {
@@ -3090,12 +3232,13 @@ void JSWriter::printFunction(const Function *F) {
   for (Function::const_arg_iterator AI = F->arg_begin(), AE = F->arg_end();
        AI != AE; ++AI) {
     if (AI != F->arg_begin()) Out << ",";
-    Out << getJSName(AI);
+    Out << getJSName(&*AI);
   }
   Out << ") {";
   nl(Out);
-  for (Function::const_arg_iterator AI = F->arg_begin(), AE = F->arg_end();
-       AI != AE; ++AI) {
+  for (Function::const_arg_iterator II = F->arg_begin(), AE = F->arg_end();
+       II != AE; ++II) {
+    auto AI = &*II;
     std::string name = getJSName(AI);
     Out << " " << name << " = " << getCast(name, AI->getType(), ASM_NONSPECIFIC) << ";";
     nl(Out);
@@ -3151,8 +3294,9 @@ void JSWriter::printModuleBody() {
 
   // Emit function bodies.
   nl(Out) << "// EMSCRIPTEN_START_FUNCTIONS"; nl(Out);
-  for (Module::const_iterator I = TheModule->begin(), E = TheModule->end();
-       I != E; ++I) {
+  for (Module::const_iterator II = TheModule->begin(), E = TheModule->end();
+       II != E; ++II) {
+    auto I = &*II;
     if (!I->isDeclaration()) printFunction(I);
   }
   // Emit postSets, split up into smaller functions to avoid one massive one that is slow to compile (more likely to occur in dynamic linking, as more postsets)
@@ -3304,6 +3448,8 @@ void JSWriter::printModuleBody() {
   Out << "\n\n// EMSCRIPTEN_METADATA\n";
   Out << "{\n";
 
+  Out << "\"staticBump\": " << StaticBump << ",\n";
+
   Out << "\"declares\": [";
   bool first = true;
   for (Module::const_iterator I = TheModule->begin(), E = TheModule->end();
@@ -3313,6 +3459,7 @@ void JSWriter::printModuleBody() {
       // which doesn't require the intrinsic function itself to be declared.
       if (I->isIntrinsic()) {
         switch (I->getIntrinsicID()) {
+        default: break;
         case Intrinsic::dbg_declare:
         case Intrinsic::dbg_value:
         case Intrinsic::lifetime_start:
@@ -3325,6 +3472,17 @@ void JSWriter::printModuleBody() {
         case Intrinsic::memmove:
         case Intrinsic::expect:
         case Intrinsic::flt_rounds:
+          continue;
+        }
+      }
+      // Do not report methods implemented in a call handler, unless
+      // they are accessed by a function pointer (in which case, we
+      // need the expected name to be available TODO: optimize
+      // that out, call handlers can declare their "function table
+      // name").
+      std::string fullName = std::string("_") + I->getName().str();
+      if (CallHandlers.count(fullName) > 0) {
+        if (IndexedFunctions.find(fullName) == IndexedFunctions.end()) {
           continue;
         }
       }
@@ -3462,12 +3620,19 @@ void JSWriter::printModuleBody() {
 
   Out << "\"cantValidate\": \"" << CantValidate << "\",";
 
-  Out << "\"simd\": " << (UsesSIMDInt8x16 || UsesSIMDInt8x16 || UsesSIMDInt32x4 || UsesSIMDFloat32x4 || UsesSIMDFloat64x2 ? "1" : "0") << ",";
+  Out << "\"simd\": " << (UsesSIMDUint8x16 || UsesSIMDInt8x16 || UsesSIMDUint16x8 || UsesSIMDInt16x8 || UsesSIMDUint32x4 || UsesSIMDInt32x4 || UsesSIMDFloat32x4 || UsesSIMDFloat64x2 ? "1" : "0") << ",";
+  Out << "\"simdUint8x16\": " << (UsesSIMDUint8x16 ? "1" : "0") << ",";
   Out << "\"simdInt8x16\": " << (UsesSIMDInt8x16 ? "1" : "0") << ",";
+  Out << "\"simdUint16x8\": " << (UsesSIMDUint16x8 ? "1" : "0") << ",";
   Out << "\"simdInt16x8\": " << (UsesSIMDInt16x8 ? "1" : "0") << ",";
+  Out << "\"simdUint32x4\": " << (UsesSIMDUint32x4 ? "1" : "0") << ",";
   Out << "\"simdInt32x4\": " << (UsesSIMDInt32x4 ? "1" : "0") << ",";
   Out << "\"simdFloat32x4\": " << (UsesSIMDFloat32x4 ? "1" : "0") << ",";
   Out << "\"simdFloat64x2\": " << (UsesSIMDFloat64x2 ? "1" : "0") << ",";
+  Out << "\"simdBool8x16\": " << (UsesSIMDBool8x16 ? "1" : "0") << ",";
+  Out << "\"simdBool16x8\": " << (UsesSIMDBool16x8 ? "1" : "0") << ",";
+  Out << "\"simdBool32x4\": " << (UsesSIMDBool32x4 ? "1" : "0") << ",";
+  Out << "\"simdBool64x2\": " << (UsesSIMDBool64x2 ? "1" : "0") << ",";
 
   Out << "\"maxGlobalAlign\": " << utostr(MaxGlobalAlign) << ",";
 
@@ -3485,44 +3650,24 @@ void JSWriter::printModuleBody() {
 
   Out << "\"asmConsts\": {";
   first = true;
-  for (NameIntMap::const_iterator I = AsmConsts.begin(), E = AsmConsts.end(); I != E; ++I) {
+  for (auto& I : AsmConsts) {
     if (first) {
       first = false;
     } else {
       Out << ", ";
     }
-    Out << "\"" << utostr(I->second) << "\": \"" << I->first.c_str() << "\"";
-  }
-  Out << "},";
-
-  // Output a structure like:
-  // "asmConstArities": {
-  //   "<ASM_CONST_ID_1>": [<ARITY>, <ARITY>],
-  //   "<ASM_CONST_ID_2>": [<ARITY>]
-  // }
-  // Each ASM_CONST_ID represents a single EM_ASM_* block in the code and each
-  // ARITY represents the number of arguments defined in the block in compiled
-  // output (which may vary, if the EM_ASM_* block is used inside a template).
-  Out << "\"asmConstArities\": {";
-  first = true;
-  for (IntIntSetMap::const_iterator I = AsmConstArities.begin(), E = AsmConstArities.end();
-       I != E; ++I) {
-    if (!first) {
-      Out << ", ";
-    }
-    Out << "\"" << utostr(I->first) << "\": [";
-    first = true;
-    for (IntSet::const_iterator J = I->second.begin(), F = I->second.end();
-         J != F; ++J) {
-      if (first) {
-        first = false;
+    Out << "\"" << utostr(I.second.Id) << "\": [\"" << I.first.c_str() << "\", [";
+    auto& Sigs = I.second.Sigs;
+    bool innerFirst = true;
+    for (auto& Sig : Sigs) {
+      if (innerFirst) {
+        innerFirst = false;
       } else {
         Out << ", ";
       }
-      Out << utostr(*J);
+      Out << "\"" << Sig << "\"";
     }
-    first = false;
-    Out << "]";
+    Out << "]]";
   }
   Out << "}, ";
 
@@ -3549,6 +3694,34 @@ void JSWriter::printModuleBody() {
 	printAddressList(objcProtocolRefs);
   Out << "]";
   Out << "}";
+
+  if (EnableCyberDWARF) {
+    Out << ",\"cyberdwarf_data\": {\n";
+    Out << "\"types\": {";
+
+    // Remove trailing comma
+    std::string TDD = cyberDWARFData.TypeDebugData.str().substr(0, cyberDWARFData.TypeDebugData.str().length() - 1);
+    // One Windows, paths can have \ separators
+    std::replace(TDD.begin(), TDD.end(), '\\', '/');
+    Out << TDD << "}, \"type_name_map\": {";
+
+    std::string TNM = cyberDWARFData.TypeNameMap.str().substr(0, cyberDWARFData.TypeNameMap.str().length() - 1);
+    std::replace(TNM.begin(), TNM.end(), '\\', '/');
+    Out << TNM << "}, \"functions\": {";
+
+    std::string FM = cyberDWARFData.FunctionMembers.str().substr(0, cyberDWARFData.FunctionMembers.str().length() - 1);
+    std::replace(FM.begin(), FM.end(), '\\', '/');
+    Out << FM << "}, \"vtable_offsets\": {";
+    bool first_elem = true;
+    for (auto VTO: cyberDWARFData.VtableOffsets) {
+      if (!first_elem) {
+        Out << ",";
+      }
+      Out << "\"" << VTO.first << "\":\"" << VTO.second << "\"";
+      first_elem = false;
+    }
+    Out << "}\n}";
+  }
 
   Out << "\n}\n";
 }
@@ -3614,12 +3787,7 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, int Al
   } else if (isa<ConstantAggregateZero>(CV)) {
     if (calculate) {
       unsigned Bytes = DL->getTypeStoreSize(CV->getType());
-      HeapData *GlobalData = allocateAddress(name, Alignment);
-      ensureAligned(Alignment, GlobalData);
-      for (unsigned i = 0; i < Bytes; ++i) {
-        GlobalData->push_back(0);
-      }
-      // FIXME: create a zero section at the end, avoid filling meminit with zeros
+      allocateZeroInitAddress(name, Alignment, Bytes);
     }
   } else if (const ConstantArray *CA = dyn_cast<ConstantArray>(CV)) {
     if (calculate) {
@@ -3677,6 +3845,12 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, int Al
       unsigned OffsetStart = Offset;
       unsigned Absolute = getGlobalAddress(name);
       // errs() << "Offset: " << Offset << ",Num: " << Num << ", Absolute: " << Absolute << "\n";
+
+      // VTable for the object
+      if (name.compare(0, 4, "_ZTV") == 0) {
+        cyberDWARFData.VtableOffsets[Absolute] = name;
+      }
+
       for (unsigned i = 0; i < Num; i++) {
         const Constant* C = CS->getOperand(i);
 		//if(name.find("OBJC_", 0) != std::string::npos) C->dump();
@@ -3782,12 +3956,187 @@ void JSWriter::parseConstant(const std::string& name, const Constant* CV, int Al
   }
 }
 
+std::string JSWriter::generateDebugRecordForVar(Metadata *MD) {
+  // void shows up as nullptr for Metadata
+  if (!MD) {
+    cyberDWARFData.IndexedMetadata[0] = 0;
+    return "\"0\"";
+  }
+  if (cyberDWARFData.IndexedMetadata.find(MD) == cyberDWARFData.IndexedMetadata.end()) {
+    cyberDWARFData.IndexedMetadata[MD] = cyberDWARFData.MetadataNum++;
+  }
+  else {
+    return "\"" + utostr(cyberDWARFData.IndexedMetadata[MD]) + "\"";
+  }
+
+  std::string VarIDForJSON = "\"" + utostr(cyberDWARFData.IndexedMetadata[MD]) + "\"";
+
+  if (DIBasicType *BT = dyn_cast<DIBasicType>(MD)) {
+    cyberDWARFData.TypeDebugData << VarIDForJSON << ":"
+    << "[0,\""
+    << BT->getName().str()
+    << "\","
+    << BT->getEncoding()
+    << ","
+    << BT->getOffsetInBits()
+    << ","
+    << BT->getSizeInBits()
+    << "],";
+  }
+  else if (MDString *MDS = dyn_cast<MDString>(MD)) {
+    cyberDWARFData.TypeDebugData << VarIDForJSON << ":"
+    << "[10,\"" << MDS->getString().str() << "\"],";
+  }
+  else if (DIDerivedType *DT = dyn_cast<DIDerivedType>(MD)) {
+    if (DT->getRawBaseType() && isa<MDString>(DT->getRawBaseType())) {
+      auto MDS = cast<MDString>(DT->getRawBaseType());
+      cyberDWARFData.TypeDebugData << VarIDForJSON << ":"
+      << "[1, \""
+      << DT->getName().str()
+      << "\","
+      << DT->getTag()
+      << ",\""
+      << MDS->getString().str()
+      << "\","
+      << DT->getOffsetInBits()
+      << ","
+      << DT->getSizeInBits() << "],";
+    }
+    else {
+      if (cyberDWARFData.IndexedMetadata.find(DT->getRawBaseType()) == cyberDWARFData.IndexedMetadata.end()) {
+        generateDebugRecordForVar(DT->getRawBaseType());
+      }
+
+    cyberDWARFData.TypeDebugData << VarIDForJSON << ":"
+        << "[1, \""
+        << DT->getName().str()
+        << "\","
+        << DT->getTag()
+        << ","
+        << cyberDWARFData.IndexedMetadata[DT->getRawBaseType()]
+        << ","
+        << DT->getOffsetInBits()
+        << ","
+        << DT->getSizeInBits() << "],";
+    }
+  }
+  else if (DICompositeType *CT = dyn_cast<DICompositeType>(MD)) {
+
+    if (CT->getIdentifier().str() != "") {
+      if (CT->isForwardDecl()) {
+        cyberDWARFData.TypeNameMap << "\"" << "fd_" << CT->getIdentifier().str() << "\":" << VarIDForJSON << ",";
+      } else {
+        cyberDWARFData.TypeNameMap << "\"" << CT->getIdentifier().str() << "\":" << VarIDForJSON << ",";
+      }
+    }
+
+    // Pull in debug info for any used elements before emitting ours
+    for (auto e : CT->getElements()) {
+      generateDebugRecordForVar(e);
+    }
+
+    // Build our base type, if we have one (arrays)
+    if (cyberDWARFData.IndexedMetadata.find(CT->getRawBaseType()) == cyberDWARFData.IndexedMetadata.end()) {
+      generateDebugRecordForVar(CT->getRawBaseType());
+    }
+
+    cyberDWARFData.TypeDebugData << VarIDForJSON << ":"
+      << "[2, \""
+      << CT->getName().str()
+      << "\","
+      << CT->getTag()
+      << ","
+      << cyberDWARFData.IndexedMetadata[CT->getRawBaseType()]
+      << ","
+      << CT->getOffsetInBits()
+      << ","
+      << CT->getSizeInBits()
+      << ",\""
+      << CT->getIdentifier().str()
+      << "\",[";
+
+    bool first_elem = true;
+    for (auto e : CT->getElements()) {
+      auto *vx = dyn_cast<DIType>(e);
+      if ((vx && vx->isStaticMember()) || isa<DISubroutineType>(e))
+        continue;
+      if (!first_elem) {
+        cyberDWARFData.TypeDebugData << ",";
+      }
+      first_elem = false;
+      cyberDWARFData.TypeDebugData << generateDebugRecordForVar(e);
+    }
+
+    cyberDWARFData.TypeDebugData << "]],";
+
+  }
+  else if (DISubroutineType *ST = dyn_cast<DISubroutineType>(MD)) {
+    cyberDWARFData.TypeDebugData << VarIDForJSON << ":"
+    << "[3," << ST->getTag() << "],";
+  }
+  else if (DISubrange *SR = dyn_cast<DISubrange>(MD)) {
+    cyberDWARFData.TypeDebugData << VarIDForJSON << ":"
+    << "[4," << SR->getCount() << "],";
+  }
+  else if (DISubprogram *SP = dyn_cast<DISubprogram>(MD)) {
+    cyberDWARFData.TypeDebugData << VarIDForJSON << ":"
+    << "[5,\"" << SP->getName().str() << "\"],";
+  }
+  else if (DIEnumerator *E = dyn_cast<DIEnumerator>(MD)) {
+    cyberDWARFData.TypeDebugData << VarIDForJSON << ":"
+    << "[6,\"" << E->getName().str() << "\"," << E->getValue() << "],";
+  }
+  else {
+    //MD->dump();
+  }
+
+  return VarIDForJSON;
+}
+
+void JSWriter::buildCyberDWARFData() {
+  for (auto &F : TheModule->functions()) {
+    auto MD = F.getMetadata("dbg");
+    if (MD) {
+      auto *SP = cast<DISubprogram>(MD);
+
+      if (SP->getLinkageName() != "") {
+        cyberDWARFData.FunctionMembers << "\"" << SP->getLinkageName().str() << "\":{";
+      }
+      else {
+        cyberDWARFData.FunctionMembers << "\"" << SP->getName().str() << "\":{";
+      }
+      bool first_elem = true;
+      for (auto V : SP->getVariables()) {
+        auto RT = V->getRawType();
+        if (!first_elem) {
+          cyberDWARFData.FunctionMembers << ",";
+        }
+        first_elem = false;
+        cyberDWARFData.FunctionMembers << "\"" << V->getName().str() << "\":" << generateDebugRecordForVar(RT);
+      }
+      cyberDWARFData.FunctionMembers << "},";
+    }
+  }
+
+  // Need to dump any types under each compilation unit's retained types
+  auto CUs = TheModule->getNamedMetadata("llvm.dbg.cu");
+
+  for (auto CUi : CUs->operands()) {
+    auto CU = cast<DICompileUnit>(CUi);
+    auto RT = CU->getRetainedTypes();
+    for (auto RTi : RT) {
+      generateDebugRecordForVar(RTi);
+    }
+  }
+}
+
 // nativization
 
 void JSWriter::calculateNativizedVars(const Function *F) {
   NativizedVars.clear();
 
-  for (Function::const_iterator BI = F->begin(), BE = F->end(); BI != BE; ++BI) {
+  for (Function::const_iterator I = F->begin(), BE = F->end(); I != BE; ++I) {
+    auto BI = &*I;
     for (BasicBlock::const_iterator II = BI->begin(), E = BI->end(); II != E; ++II) {
       const Instruction *I = &*II;
       if (const AllocaInst *AI = dyn_cast<const AllocaInst>(I)) {
@@ -3849,6 +4198,10 @@ bool JSWriter::runOnModule(Module &M) {
   assert(Relocatable ? GlobalBase == 0 : true);
   assert(Relocatable ? EmulatedFunctionPointers : true);
 
+  // Build debug data first, so that inline metadata can reuse the indicies
+  if (EnableCyberDWARF)
+    buildCyberDWARFData();
+
   setupCallHandlers();
 
   printProgram("", "");
@@ -3880,15 +4233,124 @@ Pass *createCheckTriplePass() {
 //                       External Interface declaration
 //===----------------------------------------------------------------------===//
 
-bool JSTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
-                                          raw_pwrite_stream &o,
-                                          CodeGenFileType FileType,
-                                          bool DisableVerify,
-                                          AnalysisID StartAfter,
-                                          AnalysisID StopAfter) {
+bool JSTargetMachine::addPassesToEmitFile(
+      PassManagerBase &PM, raw_pwrite_stream &Out, CodeGenFileType FileType,
+      bool DisableVerify, AnalysisID StartBefore,
+      AnalysisID StartAfter, AnalysisID StopAfter,
+      MachineFunctionInitializer *MFInitializer) {
   assert(FileType == TargetMachine::CGFT_AssemblyFile);
 
   PM.add(createCheckTriplePass());
+
+  if (NoExitRuntime) {
+    PM.add(createNoExitRuntimePass());
+    // removing atexits opens up globalopt/globaldce opportunities
+    PM.add(createGlobalOptimizerPass());
+    PM.add(createGlobalDCEPass());
+  }
+
+  // PNaCl legalization
+  {
+    PM.add(createStripDanglingDISubprogramsPass());
+    if (EnableSjLjEH) {
+      // This comes before ExpandTls because it introduces references to
+      // a TLS variable, __pnacl_eh_stack.  This comes before
+      // InternalizePass because it assumes various variables (including
+      // __pnacl_eh_stack) have not been internalized yet.
+      PM.add(createPNaClSjLjEHPass());
+    } else if (EnableEmCxxExceptions) {
+      PM.add(createLowerEmExceptionsPass());
+    } else {
+      // LowerInvoke prevents use of C++ exception handling by removing
+      // references to BasicBlocks which handle exceptions.
+      PM.add(createLowerInvokePass());
+    }
+    // Run CFG simplification passes for a few reasons:
+    // (1) Landingpad blocks can be made unreachable by LowerInvoke
+    // when EnableSjLjEH is not enabled, so clean those up to ensure
+    // there are no landingpad instructions in the stable ABI.
+    // (2) Unreachable blocks can have strange properties like self-referencing
+    // instructions, so remove them.
+    PM.add(createCFGSimplificationPass());
+
+    PM.add(createLowerEmSetjmpPass());
+
+    // Expand out computed gotos (indirectbr and blockaddresses) into switches.
+    PM.add(createExpandIndirectBrPass());
+
+    // ExpandStructRegs must be run after ExpandVarArgs so that struct-typed
+    // "va_arg" instructions have been removed.
+    PM.add(createExpandVarArgsPass());
+
+    // Convert struct reg function params to struct* byval. This needs to be
+    // before ExpandStructRegs so it has a chance to rewrite aggregates from
+    // function arguments and returns into something ExpandStructRegs can expand.
+    PM.add(createSimplifyStructRegSignaturesPass());
+
+    // TODO(mtrofin) Remove the following and only run it as a post-opt pass once
+    //               the following bug is fixed.
+    // https://code.google.com/p/nativeclient/issues/detail?id=3857
+    PM.add(createExpandStructRegsPass());
+
+    PM.add(createExpandCtorsPass());
+
+    if (EnableEmAsyncify)
+      PM.add(createLowerEmAsyncifyPass());
+
+    // ExpandStructRegs must be run after ExpandArithWithOverflow to expand out
+    // the insertvalue instructions that ExpandArithWithOverflow introduces.
+    PM.add(createExpandArithWithOverflowPass());
+
+    // We place ExpandByVal after optimization passes because some byval
+    // arguments can be expanded away by the ArgPromotion pass.  Leaving
+    // in "byval" during optimization also allows some dead stores to be
+    // eliminated, because "byval" is a stronger constraint than what
+    // ExpandByVal expands it to.
+    PM.add(createExpandByValPass());
+
+    PM.add(createPromoteI1OpsPass());
+
+    // We should not place arbitrary passes after ExpandConstantExpr
+    // because they might reintroduce ConstantExprs.
+    PM.add(createExpandConstantExprPass());
+    // The following pass inserts GEPs, it must precede ExpandGetElementPtr. It
+    // also creates vector loads and stores, the subsequent pass cleans them up to
+    // fix their alignment.
+    PM.add(createConstantInsertExtractElementIndexPass());
+
+    // Optimization passes and ExpandByVal introduce
+    // memset/memcpy/memmove intrinsics with a 64-bit size argument.
+    // This pass converts those arguments to 32-bit.
+    PM.add(createCanonicalizeMemIntrinsicsPass());
+
+    // ConstantMerge cleans up after passes such as GlobalizeConstantVectors. It
+    // must run before the FlattenGlobals pass because FlattenGlobals loses
+    // information that otherwise helps ConstantMerge do a good job.
+    PM.add(createConstantMergePass());
+    // FlattenGlobals introduces ConstantExpr bitcasts of globals which
+    // are expanded out later. ReplacePtrsWithInts also creates some
+    // ConstantExprs, and it locally creates an ExpandConstantExprPass
+    // to clean both of these up.
+    PM.add(createFlattenGlobalsPass());
+
+    // The type legalization passes (ExpandLargeIntegers and PromoteIntegers) do
+    // not handle constexprs and create GEPs, so they go between those passes.
+    PM.add(createExpandLargeIntegersPass());
+    PM.add(createPromoteIntegersPass());
+    // Rewrite atomic and volatile instructions with intrinsic calls.
+    PM.add(createRewriteAtomicsPass());
+
+    PM.add(createSimplifyAllocasPass());
+
+    // The atomic cmpxchg instruction returns a struct, and is rewritten to an
+    // intrinsic as a post-opt pass, we therefore need to expand struct regs.
+    PM.add(createExpandStructRegsPass());
+
+    // Eliminate simple dead code that the post-opt passes could have created.
+    PM.add(createDeadCodeEliminationPass());
+  }
+  // end PNaCl legalization
+
   PM.add(createExpandInsertExtractElementPass());
   PM.add(createExpandI64Pass());
 
@@ -3903,7 +4365,7 @@ bool JSTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
   PM.add(createEmscriptenRemoveLLVMAssumePass());
   PM.add(createEmscriptenExpandBigSwitchesPass());
 
-  PM.add(new JSWriter(o, OptLevel));
+  PM.add(new JSWriter(Out, OptLevel));
 
   return false;
 }

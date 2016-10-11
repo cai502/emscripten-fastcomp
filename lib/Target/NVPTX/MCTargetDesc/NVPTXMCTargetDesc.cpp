@@ -14,7 +14,6 @@
 #include "NVPTXMCTargetDesc.h"
 #include "InstPrinter/NVPTXInstPrinter.h"
 #include "NVPTXMCAsmInfo.h"
-#include "llvm/MC/MCCodeGenInfo.h"
 #include "llvm/MC/MCInstrInfo.h"
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSubtargetInfo.h"
@@ -37,7 +36,7 @@ static MCInstrInfo *createNVPTXMCInstrInfo() {
   return X;
 }
 
-static MCRegisterInfo *createNVPTXMCRegisterInfo(StringRef TT) {
+static MCRegisterInfo *createNVPTXMCRegisterInfo(const Triple &TT) {
   MCRegisterInfo *X = new MCRegisterInfo();
   // PTX does not have a return address register.
   InitNVPTXMCRegisterInfo(X, 0);
@@ -45,17 +44,8 @@ static MCRegisterInfo *createNVPTXMCRegisterInfo(StringRef TT) {
 }
 
 static MCSubtargetInfo *
-createNVPTXMCSubtargetInfo(StringRef TT, StringRef CPU, StringRef FS) {
-  MCSubtargetInfo *X = new MCSubtargetInfo();
-  InitNVPTXMCSubtargetInfo(X, TT, CPU, FS);
-  return X;
-}
-
-static MCCodeGenInfo *createNVPTXMCCodeGenInfo(
-    StringRef TT, Reloc::Model RM, CodeModel::Model CM, CodeGenOpt::Level OL) {
-  MCCodeGenInfo *X = new MCCodeGenInfo();
-  X->InitMCCodeGenInfo(RM, CM, OL);
-  return X;
+createNVPTXMCSubtargetInfo(const Triple &TT, StringRef CPU, StringRef FS) {
+  return createNVPTXMCSubtargetInfoImpl(TT, CPU, FS);
 }
 
 static MCInstPrinter *createNVPTXMCInstPrinter(const Triple &T,
@@ -73,9 +63,6 @@ extern "C" void LLVMInitializeNVPTXTargetMC() {
   for (Target *T : {&TheNVPTXTarget32, &TheNVPTXTarget64}) {
     // Register the MC asm info.
     RegisterMCAsmInfo<NVPTXMCAsmInfo> X(*T);
-
-    // Register the MC codegen info.
-    TargetRegistry::RegisterMCCodeGenInfo(*T, createNVPTXMCCodeGenInfo);
 
     // Register the MC instruction info.
     TargetRegistry::RegisterMCInstrInfo(*T, createNVPTXMCInstrInfo);
