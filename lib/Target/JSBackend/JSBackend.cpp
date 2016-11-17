@@ -112,6 +112,11 @@ Relocatable("emscripten-relocatable",
             cl::init(false));
 
 static cl::opt<bool>
+CompressRelocataionTable("emscripten-compress-relocation-table",
+            cl::desc("Whether to compress relocataion table (see emscripten RELOCATABLE option)"),
+            cl::init(false));
+
+static cl::opt<bool>
 EnableSjLjEH("enable-pnacl-sjlj-eh",
              cl::desc("Enable use of SJLJ-based C++ exception handling "
                       "as part of the pnacl-abi-simplify passes"),
@@ -480,9 +485,12 @@ namespace {
       V = resolveFully(V);
       if (const Function *F = dyn_cast<const Function>(V)) {
         if (Relocatable) {
-          //PostSets.push_back("\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + relocateFunctionPointer(utostr(getFunctionIndex(F))) + ';');
-          RelocationTable[AbsoluteTarget] = getFunctionIndex(F) * 2;
-          assert(getFunctionIndex(F));
+          if (CompressRelocataionTable) {
+            RelocationTable[AbsoluteTarget] = getFunctionIndex(F) * 2;
+            assert(getFunctionIndex(F));
+          } else {
+            PostSets.push_back("\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + relocateFunctionPointer(utostr(getFunctionIndex(F))) + ';');
+          }
           return 0; // emit zero in there for now, until the postSet
         }
         return getFunctionIndex(F);
@@ -508,9 +516,12 @@ namespace {
           } else if (Relocatable) {
             // this is one of our globals, but we must relocate it. we return zero, but the caller may store
             // an added offset, which we read at postSet time; in other words, we just add to that offset
-            //std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
-            //PostSets.push_back("\n " + access + " = (" + access + " | 0) + " + relocateGlobal(utostr(getGlobalAddress(V->getName().str()))) + ';');
-            RelocationTable[AbsoluteTarget] = getGlobalAddress(V->getName().str()) * 2 + 1;
+            if (CompressRelocataionTable) {
+              RelocationTable[AbsoluteTarget] = getGlobalAddress(V->getName().str()) * 2 + 1;
+            } else {
+              std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
+              PostSets.push_back("\n " + access + " = (" + access + " | 0) + " + relocateGlobal(utostr(getGlobalAddress(V->getName().str()))) + ';');
+            }
             return 0; // emit zero in there for now, until the postSet
           }
         }
@@ -3300,7 +3311,7 @@ void JSWriter::printModuleBody() {
     if (!I->isDeclaration()) printFunction(I);
   }
   // Emit postSets, split up into smaller functions to avoid one massive one that is slow to compile (more likely to occur in dynamic linking, as more postsets)
-  if(Relocatable) {
+  if(CompressRelocataionTable) {
     Out << "var addressMap = [";
     unsigned prev = 0;
     std::list<unsigned> addresses;
