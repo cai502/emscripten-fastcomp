@@ -87,6 +87,10 @@ DEF_CALL_HANDLER(__default__, {
           Name = std::string(Relocatable ? "mftCall_" : "ftCall_") + Sig + "(" + getCast(Name, Type::getInt32Ty(CI->getContext()));
           if (NumArgs > 0) Name += ',';
           Emulated = true;
+          if (WebAssembly) {
+            // this call uses the wasm Table
+            NeedCasts = false;
+          }
         }
       }
     }
@@ -151,11 +155,14 @@ DEF_CALL_HANDLER(__default__, {
     }
     if (NumArgs > 0) text += ",";
   }
-  // this is an ffi call if we need casts, and it is not a special Math_ builtin
+  // this is an ffi call if we need casts, and it is not a special Math_ builtin or wasm-only intrinsic
   bool FFI = NeedCasts;
-  if (FFI && IsMath) {
-    if (Name == "Math_ceil" || Name == "Math_floor" || Name == "Math_min" || Name == "Math_max" || Name == "Math_sqrt" || Name == "Math_abs") {
+  if (FFI) {
+    if (IsMath && (Name == "Math_ceil" || Name == "Math_floor" || Name == "Math_min" || Name == "Math_max" || Name == "Math_sqrt" || Name == "Math_abs")) {
       // This special Math builtin is optimizable with all types, including floats, so can treat it as non-ffi
+      FFI = false;
+    } else if (OnlyWebAssembly && Name == "f32_copysign") {
+      // f32_copysign doesn't need to use a +() coercion which an ffi would need, it's a simple f32 operation
       FFI = false;
     }
   }
@@ -246,6 +253,8 @@ DEF_CALL_HANDLER(emscripten_check_longjmp, {
   std::string Threw = getValueAsStr(CI->getOperand(0));
   std::string Target = getJSName(CI);
   std::string Assign = getAssign(CI);
+  Declares.insert("testSetjmp");
+  Declares.insert("longjmp");
   return "if (((" + Threw + "|0) != 0) & ((threwValue|0) != 0)) { " +
            Assign + "_testSetjmp(HEAP32[" + Threw + ">>2]|0, _setjmpTable|0, _setjmpTableSize|0)|0; " +
            "if ((" + Target + "|0) == 0) { _longjmp(" + Threw + "|0, threwValue|0); } " + // rethrow
@@ -382,37 +391,64 @@ DEF_CALL_HANDLER(llvm_memcpy_p0i8_p0i8_i32, {
         unsigned Len = LenInt->getZExtValue();
         if (Len <= WRITE_LOOP_MAX) {
           unsigned Align = AlignInt->getZExtValue();
-          if (Align > 4) Align = 4;
-          else if (Align == 0) Align = 1; // align 0 means 1 in memcpy and memset (unlike other places where it means 'default/4')
-          if (Align == 1 && Len > 1 && WarnOnUnaligned) {
-            errs() << "emcc: warning: unaligned memcpy in  " << CI->getParent()->getParent()->getName() << ":" << *CI << " (compiler's fault?)\n";
-          }
-          unsigned Pos = 0;
-          std::string Ret;
-          std::string Dest = getValueAsStr(CI->getOperand(0));
-          std::string Src = getValueAsStr(CI->getOperand(1));
-          while (Len > 0) {
-            // handle as much as we can in the current alignment
-            unsigned CurrLen = Align*(Len/Align);
-            unsigned Factor = CurrLen/Align;
-            if (Factor <= UNROLL_LOOP_MAX) {
-              // unroll
-              for (unsigned Offset = 0; Offset < CurrLen; Offset += Align) {
+          if (OnlyWebAssembly) {
+            // wasm
+            if (Align > 8) Align = 8;
+            else if (Align == 0) Align = 1; // align 0 means 1 in memcpy and memset (unlike other places where it means 'default')
+            unsigned Pos = 0;
+            std::string Ret;
+            std::string Dest = getValueAsStr(CI->getOperand(0));
+            std::string Src = getValueAsStr(CI->getOperand(1));
+            unsigned Size = 8; // start by writing out i64 copies
+            while (Len > 0) {
+              // handle as much as we can in the current size
+              unsigned CurrLen = Size*(Len/Size);
+              for (unsigned Offset = 0; Offset < CurrLen; Offset += Size) {
                 unsigned PosOffset = Pos + Offset;
-                std::string Add = PosOffset == 0 ? "" : ("+" + utostr(PosOffset));
-                Ret += ";" + getHeapAccess(Dest + Add, Align) + "=" + getHeapAccess(Src + Add, Align) + "|0";
+                std::string Add = PosOffset == 0 ? "" : ("+" + utostr(PosOffset) + " | 0");
+                Ret += "; store" + utostr(Size) + "(" + Dest + Add +
+                           ",load" + utostr(Size) + "(" + Src + Add + "," + utostr(std::min(Align, Size)) + ")" +
+                       "," + utostr(std::min(Align, Size)) + ")";
               }
-            } else {
-              // emit a loop
-              UsedVars["dest"] = UsedVars["src"] = UsedVars["stop"] = Type::getInt32Ty(TheModule->getContext());
-              std::string Add = Pos == 0 ? "" : ("+" + utostr(Pos) + "|0");
-              Ret += "dest=" + Dest + Add + "; src=" + Src + Add + "; stop=dest+" + utostr(CurrLen) + "|0; do { " + getHeapAccess("dest", Align) + "=" + getHeapAccess("src", Align) + "|0; dest=dest+" + utostr(Align) + "|0; src=src+" + utostr(Align) + "|0; } while ((dest|0) < (stop|0))";
+              Pos += CurrLen;
+              Len -= CurrLen;
+              Size /= 2;
             }
-            Pos += CurrLen;
-            Len -= CurrLen;
-            Align /= 2;
+            return Ret;
+          } else {
+            // asm.js
+            if (Align > 4) Align = 4;
+            else if (Align == 0) Align = 1; // align 0 means 1 in memcpy and memset (unlike other places where it means 'default/4')
+            if (Align == 1 && Len > 1 && WarnOnUnaligned) {
+              errs() << "emcc: warning: unaligned memcpy in  " << CI->getParent()->getParent()->getName() << ":" << *CI << " (compiler's fault?)\n";
+            }
+            unsigned Pos = 0;
+            std::string Ret;
+            std::string Dest = getValueAsStr(CI->getOperand(0));
+            std::string Src = getValueAsStr(CI->getOperand(1));
+            while (Len > 0) {
+              // handle as much as we can in the current alignment
+              unsigned CurrLen = Align*(Len/Align);
+              unsigned Factor = CurrLen/Align;
+              if (Factor <= UNROLL_LOOP_MAX) {
+                // unroll
+                for (unsigned Offset = 0; Offset < CurrLen; Offset += Align) {
+                  unsigned PosOffset = Pos + Offset;
+                  std::string Add = PosOffset == 0 ? "" : ("+" + utostr(PosOffset));
+                  Ret += ";" + getHeapAccess(Dest + Add, Align) + "=" + getHeapAccess(Src + Add, Align) + "|0";
+                }
+              } else {
+                // emit a loop
+                UsedVars["dest"] = UsedVars["src"] = UsedVars["stop"] = Type::getInt32Ty(TheModule->getContext());
+                std::string Add = Pos == 0 ? "" : ("+" + utostr(Pos) + "|0");
+                Ret += "dest=" + Dest + Add + "; src=" + Src + Add + "; stop=dest+" + utostr(CurrLen) + "|0; do { " + getHeapAccess("dest", Align) + "=" + getHeapAccess("src", Align) + "|0; dest=dest+" + utostr(Align) + "|0; src=src+" + utostr(Align) + "|0; } while ((dest|0) < (stop|0))";
+              }
+              Pos += CurrLen;
+              Len -= CurrLen;
+              Align /= 2;
+            }
+            return Ret;
           }
-          return Ret;
         }
       }
     }
@@ -433,42 +469,74 @@ DEF_CALL_HANDLER(llvm_memset_p0i8_i32, {
           unsigned Len = LenInt->getZExtValue();
           if (Len <= WRITE_LOOP_MAX) {
             unsigned Align = AlignInt->getZExtValue();
-            unsigned Val = ValInt->getZExtValue();
-            if (Align > 4) Align = 4;
-            else if (Align == 0) Align = 1; // align 0 means 1 in memcpy and memset (unlike other places where it means 'default/4')
-            if (Align == 1 && Len > 1 && WarnOnUnaligned) {
-              errs() << "emcc: warning: unaligned memcpy in  " << CI->getParent()->getParent()->getName() << ":" << *CI << " (compiler's fault?)\n";
-            }
-            unsigned Pos = 0;
-            std::string Ret;
-            std::string Dest = getValueAsStr(CI->getOperand(0));
-            while (Len > 0) {
-              // handle as much as we can in the current alignment
-              unsigned CurrLen = Align*(Len/Align);
-              unsigned FullVal = 0;
-              for (unsigned i = 0; i < Align; i++) {
-                FullVal <<= 8;
-                FullVal |= Val;
-              }
-              unsigned Factor = CurrLen/Align;
-              if (Factor <= UNROLL_LOOP_MAX) {
-                // unroll
-                for (unsigned Offset = 0; Offset < CurrLen; Offset += Align) {
-                  unsigned PosOffset = Pos + Offset;
-                  std::string Add = PosOffset == 0 ? "" : ("+" + utostr(PosOffset));
-                  Ret += ";" + getHeapAccess(Dest + Add, Align) + "=" + utostr(FullVal) + "|0";
+            if (OnlyWebAssembly) {
+              // wasm
+              uint64_t Val64 = ValInt->getZExtValue();
+              if (Align > 8) Align = 8;
+              else if (Align == 0) Align = 1; // align 0 means 1 in memcpy and memset (unlike other places where it means 'default')
+              unsigned Pos = 0;
+              std::string Ret;
+              std::string Dest = getValueAsStr(CI->getOperand(0));
+              std::string Src = getValueAsStr(CI->getOperand(1));
+              unsigned Size = 8; // start by writing out i64 copies
+              while (Len > 0) {
+                // handle as much as we can in the current size
+                unsigned CurrLen = Size*(Len/Size);
+                uint64_t FullVal = 0;
+                for (unsigned i = 0; i < Size; i++) {
+                  FullVal <<= 8;
+                  FullVal |= Val64;
                 }
-              } else {
-                // emit a loop
-                UsedVars["dest"] = UsedVars["stop"] = Type::getInt32Ty(TheModule->getContext());
-                std::string Add = Pos == 0 ? "" : ("+" + utostr(Pos) + "|0");
-                Ret += "dest=" + Dest + Add + "; stop=dest+" + utostr(CurrLen) + "|0; do { " + getHeapAccess("dest", Align) + "=" + utostr(FullVal) + "|0; dest=dest+" + utostr(Align) + "|0; } while ((dest|0) < (stop|0))";
+                std::string ValStr = Size < 8 ? utostr(FullVal) : emitI64Const(FullVal);
+                for (unsigned Offset = 0; Offset < CurrLen; Offset += Size) {
+                  unsigned PosOffset = Pos + Offset;
+                  std::string Add = PosOffset == 0 ? "" : ("+" + utostr(PosOffset) + "|0");
+                  Ret += "; store" + utostr(Size) + "(" + Dest + Add + "," + ValStr  + "," + utostr(std::min(Align, Size)) + ")";
+                }
+                Pos += CurrLen;
+                Len -= CurrLen;
+                Size /= 2;
               }
-              Pos += CurrLen;
-              Len -= CurrLen;
-              Align /= 2;
+              return Ret;
+            } else {
+              // asm.js
+              unsigned Val = ValInt->getZExtValue();
+              if (Align > 4) Align = 4;
+              else if (Align == 0) Align = 1; // align 0 means 1 in memcpy and memset (unlike other places where it means 'default/4')
+              if (Align == 1 && Len > 1 && WarnOnUnaligned) {
+                errs() << "emcc: warning: unaligned memcpy in  " << CI->getParent()->getParent()->getName() << ":" << *CI << " (compiler's fault?)\n";
+              }
+              unsigned Pos = 0;
+              std::string Ret;
+              std::string Dest = getValueAsStr(CI->getOperand(0));
+              while (Len > 0) {
+                // handle as much as we can in the current alignment
+                unsigned CurrLen = Align*(Len/Align);
+                unsigned FullVal = 0;
+                for (unsigned i = 0; i < Align; i++) {
+                  FullVal <<= 8;
+                  FullVal |= Val;
+                }
+                unsigned Factor = CurrLen/Align;
+                if (Factor <= UNROLL_LOOP_MAX) {
+                  // unroll
+                  for (unsigned Offset = 0; Offset < CurrLen; Offset += Align) {
+                    unsigned PosOffset = Pos + Offset;
+                    std::string Add = PosOffset == 0 ? "" : ("+" + utostr(PosOffset));
+                    Ret += ";" + getHeapAccess(Dest + Add, Align) + "=" + utostr(FullVal) + "|0";
+                  }
+                } else {
+                  // emit a loop
+                  UsedVars["dest"] = UsedVars["stop"] = Type::getInt32Ty(TheModule->getContext());
+                  std::string Add = Pos == 0 ? "" : ("+" + utostr(Pos) + "|0");
+                  Ret += "dest=" + Dest + Add + "; stop=dest+" + utostr(CurrLen) + "|0; do { " + getHeapAccess("dest", Align) + "=" + utostr(FullVal) + "|0; dest=dest+" + utostr(Align) + "|0; } while ((dest|0) < (stop|0))";
+                }
+                Pos += CurrLen;
+                Len -= CurrLen;
+                Align /= 2;
+              }
+              return Ret;
             }
-            return Ret;
           }
         }
       }
@@ -603,8 +671,43 @@ DEF_CALL_HANDLER(llvm_ctlz_i32, {
 })
 
 DEF_CALL_HANDLER(llvm_cttz_i32, {
+  if (OnlyWebAssembly) {
+    return CH___default__(CI, "i32_cttz", 1);
+  }
   Declares.insert("llvm_cttz_i32");
   return CH___default__(CI, "_llvm_cttz_i32", 1);
+})
+
+DEF_CALL_HANDLER(llvm_ctlz_i64, {
+  if (OnlyWebAssembly) {
+    return CH___default__(CI, "i64_ctlz", 1);
+  }
+  Declares.insert("llvm_ctlz_i64");
+  return CH___default__(CI, "_llvm_ctlz_i64");
+})
+
+DEF_CALL_HANDLER(llvm_cttz_i64, {
+  if (OnlyWebAssembly) {
+    return CH___default__(CI, "i64_cttz", 1);
+  }
+  Declares.insert("llvm_cttz_i64");
+  return CH___default__(CI, "_llvm_cttz_i64");
+})
+
+DEF_CALL_HANDLER(llvm_ctpop_i32, {
+  if (OnlyWebAssembly) {
+    return CH___default__(CI, "i32_ctpop", 1);
+  }
+  Declares.insert("llvm_ctpop_i32");
+  return CH___default__(CI, "_llvm_ctpop_i32");
+})
+
+DEF_CALL_HANDLER(llvm_ctpop_i64, {
+  if (OnlyWebAssembly) {
+    return CH___default__(CI, "i64_ctpop", 1);
+  }
+  Declares.insert("llvm_ctpop_i64");
+  return CH___default__(CI, "_llvm_ctpop_i64");
 })
 
 DEF_CALL_HANDLER(llvm_maxnum_f32, {
@@ -616,11 +719,17 @@ DEF_CALL_HANDLER(llvm_maxnum_f64, {
 })
 
 DEF_CALL_HANDLER(llvm_copysign_f32, {
+  if (OnlyWebAssembly) {
+    return CH___default__(CI, "f32_copysign", 2);
+  }
   Declares.insert("llvm_copysign_f32");
   return CH___default__(CI, "_llvm_copysign_f32", 2);
 })
 
 DEF_CALL_HANDLER(llvm_copysign_f64, {
+  if (OnlyWebAssembly) {
+    return CH___default__(CI, "(f64_copysign)", 2); // XXX add parens as this will be +f64_copysign(...), which triggers +f64 => f64.0. TODO fix regex in emscripten.py
+  }
   Declares.insert("llvm_copysign_f64");
   return CH___default__(CI, "_llvm_copysign_f64", 2);
 })
@@ -826,10 +935,12 @@ DEF_BUILTIN_HANDLER(llvm_fabs_f64, Math_abs);
 DEF_BUILTIN_HANDLER(ceil, Math_ceil);
 DEF_BUILTIN_HANDLER(ceilf, Math_ceil);
 DEF_BUILTIN_HANDLER(ceill, Math_ceil);
+DEF_BUILTIN_HANDLER(llvm_ceil_f32, Math_ceil);
 DEF_BUILTIN_HANDLER(llvm_ceil_f64, Math_ceil);
 DEF_BUILTIN_HANDLER(floor, Math_floor);
 DEF_BUILTIN_HANDLER(floorf, Math_floor);
 DEF_BUILTIN_HANDLER(floorl, Math_floor);
+DEF_BUILTIN_HANDLER(llvm_floor_f32, Math_floor);
 DEF_BUILTIN_HANDLER(llvm_floor_f64, Math_floor);
 DEF_MAYBE_BUILTIN_HANDLER(pow, Math_pow);
 DEF_MAYBE_BUILTIN_HANDLER(powf, Math_pow);
@@ -838,6 +949,8 @@ DEF_BUILTIN_HANDLER(llvm_sqrt_f32, Math_sqrt);
 DEF_BUILTIN_HANDLER(llvm_sqrt_f64, Math_sqrt);
 DEF_BUILTIN_HANDLER(llvm_pow_f32, Math_pow); // XXX these will be slow in wasm, but need to link in libc before getting here, or stop
 DEF_BUILTIN_HANDLER(llvm_pow_f64, Math_pow); //     LLVM from creating these intrinsics
+DEF_MAYBE_BUILTIN_HANDLER(llvm_cos_f32, Math_cos);
+DEF_MAYBE_BUILTIN_HANDLER(llvm_cos_f64, Math_cos);
 DEF_MAYBE_BUILTIN_HANDLER(llvm_sin_f32, Math_sin);
 DEF_MAYBE_BUILTIN_HANDLER(llvm_sin_f64, Math_sin);
 
@@ -1553,6 +1666,10 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(bitshift64Shl);
   SETUP_CALL_HANDLER(llvm_ctlz_i32);
   SETUP_CALL_HANDLER(llvm_cttz_i32);
+  SETUP_CALL_HANDLER(llvm_ctlz_i64);
+  SETUP_CALL_HANDLER(llvm_cttz_i64);
+  SETUP_CALL_HANDLER(llvm_ctpop_i32);
+  SETUP_CALL_HANDLER(llvm_ctpop_i64);
   SETUP_CALL_HANDLER(llvm_maxnum_f32);
   SETUP_CALL_HANDLER(llvm_maxnum_f64);
   SETUP_CALL_HANDLER(llvm_copysign_f32);
@@ -2068,10 +2185,12 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(ceil);
   SETUP_CALL_HANDLER(ceilf);
   SETUP_CALL_HANDLER(ceill);
+  SETUP_CALL_HANDLER(llvm_ceil_f32);
   SETUP_CALL_HANDLER(llvm_ceil_f64);
   SETUP_CALL_HANDLER(floor);
   SETUP_CALL_HANDLER(floorf);
   SETUP_CALL_HANDLER(floorl);
+  SETUP_CALL_HANDLER(llvm_floor_f32);
   SETUP_CALL_HANDLER(llvm_floor_f64);
   SETUP_CALL_HANDLER(pow);
   SETUP_CALL_HANDLER(powf);
@@ -2086,6 +2205,8 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(llvm_log_f64);
   SETUP_CALL_HANDLER(llvm_exp_f32);
   SETUP_CALL_HANDLER(llvm_exp_f64);
+  SETUP_CALL_HANDLER(llvm_cos_f32);
+  SETUP_CALL_HANDLER(llvm_cos_f64);
   SETUP_CALL_HANDLER(llvm_sin_f32);
   SETUP_CALL_HANDLER(llvm_sin_f64);
 }

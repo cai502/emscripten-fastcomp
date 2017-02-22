@@ -112,6 +112,16 @@ Relocatable("emscripten-relocatable",
             cl::init(false));
 
 static cl::opt<bool>
+SideModule("emscripten-side-module",
+           cl::desc("Whether to emit a side module (see emscripten SIDE_MODULE option)"),
+           cl::init(false));
+
+static cl::opt<int>
+StackSize("emscripten-stack-size",
+           cl::desc("How large a stack to create (important in wasm side modules; see emscripten TOTAL_STACK option)"),
+           cl::init(0));
+
+static cl::opt<bool>
 EnableSjLjEH("enable-pnacl-sjlj-eh",
              cl::desc("Enable use of SJLJ-based C++ exception handling "
                       "as part of the pnacl-abi-simplify passes"),
@@ -147,6 +157,11 @@ static cl::opt<bool>
 WebAssembly("emscripten-wasm",
             cl::desc("Generate asm.js which will later be compiled to WebAssembly (see emscripten BINARYEN setting)"),
             cl::init(false));
+
+static cl::opt<bool>
+OnlyWebAssembly("emscripten-only-wasm",
+                cl::desc("Generate code that will only ever be used as WebAssembly, and is not valid JS or asm.js"),
+                cl::init(false));
 
 
 extern "C" void LLVMInitializeJSBackendTarget() {
@@ -221,6 +236,8 @@ namespace {
     BlockAddressMap BlockAddresses;
     std::map<std::string, AsmConstInfo> AsmConsts; // code => { index, list of seen sigs }
     NameSet FuncRelocatableExterns; // which externals are accessed in this function; we load them once at the beginning (avoids a potential call in a heap access, and might be faster)
+    std::vector<std::string> ExtraFunctions;
+    std::set<const Function*> DeclaresNeedingTypeDeclarations; // list of declared funcs whose type we must declare asm.js-style with a usage, as they may not have another usage
     AddressList objcSelectorRefs;
     AddressList objcMessageRefs;
     AddressList objcClassRefs;
@@ -263,6 +280,7 @@ namespace {
     int MaxGlobalAlign;
     int StaticBump;
     const Instruction* CurrInstruction;
+    Type* i32; // the type of i32
 
     #include "CallHandlers.h"
 
@@ -377,7 +395,11 @@ namespace {
           return 'F';
         }
       } else {
-        return 'i';
+        if (OnlyWebAssembly && T->isIntegerTy() && T->getIntegerBitWidth() == 64) {
+          return 'j';
+        } else {
+          return 'i';
+        }
       }
     }
     bool isObjCFunction(const std::string *Name) {
@@ -393,16 +415,71 @@ namespace {
       return Ret;
     }
     FunctionTable& ensureFunctionTable(const FunctionType *FT) {
-      FunctionTable &Table = FunctionTables[getFunctionSignature(FT)];
+      std::string Sig = getFunctionSignature(FT);
+      if (WebAssembly && EmulatedFunctionPointers) {
+        // wasm function pointer emulation uses a single simple wasm table. ensure the specific tables
+        // exist (so we have properly typed calls to the outside), but only fill in the singleton.
+        FunctionTables[Sig];
+        Sig = "X";
+      }
+      FunctionTable &Table = FunctionTables[Sig];
       unsigned MinSize = ReservedFunctionPointers ? 2*(ReservedFunctionPointers+1) : 1; // each reserved slot must be 2-aligned
       while (Table.size() < MinSize) Table.push_back("0");
 
       return Table;
     }
+    bool usesFloat32(FunctionType* F) {
+      if (F->getReturnType()->isFloatTy()) return true;
+      for (FunctionType::param_iterator AI = F->param_begin(),
+             AE = F->param_end(); AI != AE; ++AI) {
+        if ((*AI)->isFloatTy()) return true;
+      }
+      return false;
+    }
+    // create a lettered argument name (a, b, c, etc.)
+    std::string getArgLetter(int Index) {
+      std::string Ret = "";
+      while (1) {
+        auto Curr = Index % 26;
+        Ret += char('a' + Curr);
+        Index = Index / 26;
+        if (Index == 0) return Ret;
+      }
+    }
+    std::string makeFloat32Legalizer(const Function *F) {
+      auto* FT = F->getFunctionType();
+      const std::string& Name = getJSName(F);
+      std::string LegalName = Name + "$legalf32";
+      std::string LegalFunc = "function " + LegalName + "(";
+      std::string Declares = "";
+      std::string Call = Name + "(";
+      int Index = 0;
+      for (FunctionType::param_iterator AI = FT->param_begin(),
+             AE = FT->param_end(); AI != AE; ++AI) {
+        if (Index > 0) {
+          LegalFunc += ", ";
+          Declares += " ";
+          Call += ", ";
+        }
+        auto Arg = getArgLetter(Index);
+        LegalFunc += Arg;
+        Declares += Arg + " = " + getCast(Arg, *AI) + ';';
+        Call += getCast(Arg, *AI, ASM_NONSPECIFIC | ASM_FFI_OUT);
+        Index++;
+      }
+      LegalFunc += ") {\n ";
+      LegalFunc += Declares + "\n ";
+      Call += ")";
+      if (!FT->getReturnType()->isVoidTy()) {
+        Call = "return " + getCast(Call, FT->getReturnType(), ASM_FFI_IN);
+      }
+      LegalFunc += Call + ";\n}";
+      ExtraFunctions.push_back(LegalFunc);
+      return LegalName;
+    }
     unsigned getFunctionIndex(const Function *F) {
       const std::string &Name = getJSName(F);
       if (IndexedFunctions.find(Name) != IndexedFunctions.end()) return IndexedFunctions[Name];
-      std::string Sig = getFunctionSignature(F->getFunctionType());
       FunctionTable& Table = ensureFunctionTable(F->getFunctionType());
       if (NoAliasingFunctionPointers) {
         while (Table.size() < NextFunctionIndex) Table.push_back("0");
@@ -414,8 +491,26 @@ namespace {
       unsigned Alignment = 1;
       while (Table.size() % Alignment) Table.push_back("0");
       unsigned Index = Table.size();
-      Table.push_back(Name);
-
+      // add the name to the table. normally we can just add the function itself,
+      // however, that may not be valid in wasm. consider an imported function with an
+      // f32 parameter - due to asm.js ffi rules, we must send it f64s. So its
+      // uses will appear to use f64s, but when called through the function table,
+      // it must use an f32 for wasm correctness. so we must have an import with
+      // f64, and put a thunk in the table which accepts f32 and redirects to the
+      // import. Note that this cannot be done in a later stage, like binaryen's
+      // legalization, as f32/f64 asm.js overloading can mask it. Note that this
+      // isn't an issue for i64s even though they are illegal, precisely because
+      // f32/f64 overloading is possible but i64s don't overload in asm.js with
+      // anything.
+      // TODO: if there are no uses of F (aside from being in the table) then
+      //       we don't need this, as we'll add a use in
+      //       DeclaresNeedingTypeDeclarations which will have the proper type,
+      //       and nothing will contradict it/overload it.
+      if (WebAssembly && F->isDeclaration() && usesFloat32(F->getFunctionType())) {
+        Table.push_back(makeFloat32Legalizer(F));
+      } else {
+        Table.push_back(Name);
+      }
       IndexedFunctions[Name] = Index;
       if (NoAliasingFunctionPointers) {
         NextFunctionIndex = Index+1;
@@ -425,6 +520,14 @@ namespace {
       CallHandlerMap::const_iterator CH = CallHandlers.find(Name);
       if (CH != CallHandlers.end()) {
         (this->*(CH->second))(NULL, Name, -1);
+      }
+
+      // in asm.js, types are inferred from use. so if we have a method that *only* appears in a table, it therefore has no use,
+      // and we are in trouble; emit a fake dce-able use for it.
+      if (WebAssembly) {
+        if (F->isDeclaration()) {
+          DeclaresNeedingTypeDeclarations.insert(F);
+        }
       }
 
       return Index;
@@ -459,10 +562,16 @@ namespace {
     }
 
     std::string relocateFunctionPointer(std::string FP) {
+      if (Relocatable && WebAssembly && SideModule) {
+        return "(tableBase + (" + FP + ") | 0)";
+      }
       return Relocatable ? "(fb + (" + FP + ") | 0)" : FP;
     }
 
     std::string relocateGlobal(std::string G) {
+      if (Relocatable && WebAssembly && SideModule) {
+        return "(memoryBase + (" + G + ") | 0)";
+      }
       return Relocatable ? "(gb + (" + G + ") | 0)" : G;
     }
 
@@ -625,6 +734,14 @@ namespace {
       }
     }
 
+    std::string emitI64Const(uint64_t value) {
+      return "i64_const(" + itostr(value & uint32_t(-1)) + "," + itostr((value >> 32) & uint32_t(-1)) + ")";
+    }
+
+    std::string emitI64Const(APInt i) {
+      return emitI64Const(i.getZExtValue());
+    }
+
     std::string ftostr(const ConstantFP *CFP, AsmCast sign) {
       const APFloat &flt = CFP->getValueAPF();
 
@@ -688,6 +805,7 @@ namespace {
     /// Like getPtrUse(), but for pointers represented in string expression form.
     static std::string getHeapAccess(const std::string& Name, unsigned Bytes, bool Integer=true);
 
+    std::string getUndefValue(Type* T, AsmCast sign=ASM_SIGNED);
     std::string getConstant(const Constant*, AsmCast sign=ASM_SIGNED);
     template<typename VectorType/*= ConstantVector or ConstantDataVector*/>
     std::string getConstantVector(const VectorType *C);
@@ -965,9 +1083,29 @@ std::string JSWriter::getAssignIfNeeded(const Value *V) {
   return std::string();
 }
 
+int SIMDNumElements(VectorType *t) {
+  assert(t->getElementType()->getPrimitiveSizeInBits() <= 128);
+
+  if (t->getElementType()->getPrimitiveSizeInBits() == 1) { // Bool8x16, Bool16x8, Bool32x4 or Bool64x2
+    if (t->getNumElements() <= 2) return 2;
+    if (t->getNumElements() <= 4) return 4;
+    if (t->getNumElements() <= 8) return 8;
+    if (t->getNumElements() <= 16) return 16;
+    // fall-through to error
+  } else { // Int/Float 8x16, 16x8, 32x4 or 64x2
+    if (t->getElementType()->getPrimitiveSizeInBits() > 32 && t->getNumElements() <= 2) return 2;
+    if (t->getElementType()->getPrimitiveSizeInBits() > 16 && t->getNumElements() <= 4) return 4;
+    if (t->getElementType()->getPrimitiveSizeInBits() > 8 && t->getNumElements() <= 8) return 8;
+    if (t->getElementType()->getPrimitiveSizeInBits() <= 8 && t->getNumElements() <= 16) return 16;
+    // fall-through to error
+  }
+  errs() << *t << "\n";
+  report_fatal_error("Unsupported type!");
+  return 0;
+}
+
 const char *SIMDType(VectorType *t) {
-  int primSize = t->getElementType()->getPrimitiveSizeInBits();
-  assert(primSize <= 128);
+  assert(t->getElementType()->getPrimitiveSizeInBits() <= 128);
 
   if (t->getElementType()->isIntegerTy()) {
     if (t->getElementType()->getPrimitiveSizeInBits() == 1) {
@@ -1020,6 +1158,7 @@ std::string JSWriter::getCast(const StringRef &s, Type *t, AsmCast sign) {
         case 8:  if (!(sign & ASM_NONSPECIFIC)) return sign == ASM_UNSIGNED ? (s + "&255").str()   : (s + "<<24>>24").str();
         case 16: if (!(sign & ASM_NONSPECIFIC)) return sign == ASM_UNSIGNED ? (s + "&65535").str() : (s + "<<16>>16").str();
         case 32: return (sign == ASM_SIGNED || (sign & ASM_NONSPECIFIC) ? s + "|0" : s + ">>>0").str();
+        case 64: return ("i64(" + s + ")").str();
         default: llvm_unreachable("Unsupported integer cast bitwidth");
       }
     }
@@ -1139,8 +1278,31 @@ static const char *heapNameToAtomicTypeName(const char *HeapName)
 std::string JSWriter::getLoad(const Instruction *I, const Value *P, Type *T, unsigned Alignment, char sep) {
   std::string Assign = getAssign(I);
   unsigned Bytes = DL->getTypeAllocSize(T);
+  bool Aligned = Bytes <= Alignment || Alignment == 0;
+  if (OnlyWebAssembly) {
+    if (isAbsolute(P)) {
+      // loads from an absolute constants are either intentional segfaults (int x = *((int*)0)), or code problems
+      JSWriter::getAssign(I); // ensure the variable is defined, even if it isn't used
+      return "abort() /* segfault, load from absolute addr */";
+    }
+    if (T->isIntegerTy() || T->isPointerTy()) {
+      switch (Bytes) {
+        case 1: return Assign + "load1(" + getValueAsStr(P) + ")";
+        case 2: return Assign + "load2(" + getValueAsStr(P) + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        case 4: return Assign + "load4(" + getValueAsStr(P) + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        case 8: return Assign + "load8(" + getValueAsStr(P) + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        default: llvm_unreachable("invalid wasm-only int load size");
+      }
+    } else {
+      switch (Bytes) {
+        case 4: return Assign + "loadf(" + getValueAsStr(P) + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        case 8: return Assign + "loadd(" + getValueAsStr(P) + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        default: llvm_unreachable("invalid wasm-only float load size");
+      }
+    }
+  }
   std::string text;
-  if (Bytes <= Alignment || Alignment == 0) {
+  if (Aligned) {
     if (EnablePthreads && cast<LoadInst>(I)->isVolatile()) {
       const char *HeapName;
       std::string Index = getHeapNameAndIndex(P, &HeapName);
@@ -1257,8 +1419,29 @@ std::string JSWriter::getLoad(const Instruction *I, const Value *P, Type *T, uns
 std::string JSWriter::getStore(const Instruction *I, const Value *P, Type *T, const std::string& VS, unsigned Alignment, char sep) {
   assert(sep == ';'); // FIXME when we need that
   unsigned Bytes = DL->getTypeAllocSize(T);
+  bool Aligned = Bytes <= Alignment || Alignment == 0;
+  if (OnlyWebAssembly) {
+    if (Alignment == 536870912) {
+      return "abort() /* segfault */";
+    }
+    if (T->isIntegerTy() || T->isPointerTy()) {
+      switch (Bytes) {
+        case 1: return "store1(" + getValueAsStr(P) + "," + VS + ")";
+        case 2: return "store2(" + getValueAsStr(P) + "," + VS + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        case 4: return "store4(" + getValueAsStr(P) + "," + VS + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        case 8: return "store8(" + getValueAsStr(P) + "," + VS + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        default: llvm_unreachable("invalid wasm-only int load size");
+      }
+    } else {
+      switch (Bytes) {
+        case 4: return "storef(" + getValueAsStr(P) + "," + VS + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        case 8: return "stored(" + getValueAsStr(P) + "," + VS + (Aligned ? "" : "," + itostr(Alignment)) + ")";
+        default: llvm_unreachable("invalid wasm-only float load size");
+      }
+    }
+  }
   std::string text;
-  if (Bytes <= Alignment || Alignment == 0) {
+  if (Aligned) {
     if (EnablePthreads && cast<StoreInst>(I)->isVolatile()) {
       const char *HeapName;
       std::string Index = getHeapNameAndIndex(P, &HeapName);
@@ -1410,6 +1593,23 @@ std::string JSWriter::getPtrUse(const Value* Ptr) {
   return std::string(HeapName) + '[' + Index + ']';
 }
 
+std::string JSWriter::getUndefValue(Type* T, AsmCast sign) {
+  std::string S;
+  if (VectorType *VT = dyn_cast<VectorType>(T)) {
+    checkVectorType(VT);
+    S = std::string("SIMD_") + SIMDType(VT) + "_splat(" + ensureFloat("0", !VT->getElementType()->isIntegerTy()) + ')';
+  } else {
+    if (OnlyWebAssembly && T->isIntegerTy() && T->getIntegerBitWidth() == 64) {
+      return "i64(0)";
+    }
+    S = T->isFloatingPointTy() ? "+0" : "0"; // XXX refactor this
+    if (PreciseF32 && T->isFloatTy() && !(sign & ASM_FFI_OUT)) {
+      S = "Math_fround(" + S + ")";
+    }
+  }
+  return S;
+}
+
 std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
   if (isa<ConstantPointerNull>(CV)) return "0";
 
@@ -1425,7 +1625,7 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
         // we access linked externs through calls, which we load at the beginning of basic blocks
         FuncRelocatableExterns.insert(Name);
         Name = "t$" + Name;
-        UsedVars[Name] = Type::getInt32Ty(CV->getContext());
+        UsedVars[Name] = i32;
       }
       return Name;
     }
@@ -1455,19 +1655,14 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
     if (sign != ASM_UNSIGNED && CI->getValue().getBitWidth() == 1) {
       sign = ASM_UNSIGNED; // bools must always be unsigned: either 0 or 1
     }
-    return CI->getValue().toString(10, sign != ASM_UNSIGNED);
-  } else if (isa<UndefValue>(CV)) {
-    std::string S;
-    if (VectorType *VT = dyn_cast<VectorType>(CV->getType())) {
-      checkVectorType(VT);
-      S = std::string("SIMD_") + SIMDType(VT) + "_splat(" + ensureFloat("0", !VT->getElementType()->isIntegerTy()) + ')';
+    if (!OnlyWebAssembly || CI->getValue().getBitWidth() != 64) {
+      return CI->getValue().toString(10, sign != ASM_UNSIGNED);
     } else {
-      S = CV->getType()->isFloatingPointTy() ? "+0" : "0"; // XXX refactor this
-      if (PreciseF32 && CV->getType()->isFloatTy() && !(sign & ASM_FFI_OUT)) {
-        S = "Math_fround(" + S + ")";
-      }
+      // i64 constant. emit as 32 bits, 32 bits, for ease of parsing by a JS-style parser
+      return emitI64Const(CI->getValue());
     }
-    return S;
+  } else if (isa<UndefValue>(CV)) {
+    return getUndefValue(CV->getType(), sign);
   } else if (isa<ConstantAggregateZero>(CV)) {
     if (VectorType *VT = dyn_cast<VectorType>(CV->getType())) {
       checkVectorType(VT);
@@ -1563,8 +1758,7 @@ std::string JSWriter::getConstantVector(const ConstantVectorType *C) {
     }
   }
 
-  int primSize = C->getType()->getElementType()->getPrimitiveSizeInBits();
-  const int SIMDJsRetNumElements = 128 / primSize;
+  const int SIMDJsRetNumElements = SIMDNumElements(C->getType());
 
   std::string c;
   if (!hasSpecialNaNs) {
@@ -1770,7 +1964,7 @@ std::string JSWriter::getSIMDCast(VectorType *fromType, VectorType *toType, cons
   }
 
   // Promote smaller than 128-bit vector types to 128-bit since smaller ones do not exist in SIMD.js. (pad with zero lanes)
-  int toNumElems = 128 / toPrimSize;
+  const int toNumElems = SIMDNumElements(toType);
 
   bool fromIsBool = (fromInt && fromPrimSize == 1);
   bool toIsBool = (toInt && toPrimSize == 1);
@@ -1817,8 +2011,8 @@ void JSWriter::generateShuffleVectorExpression(const ShuffleVectorInst *SVI, raw
   int OpNumElements = op0->getNumElements();
   int ResultNumElements = SVI->getType()->getNumElements();
   // Promote smaller than 128-bit vector types to 128-bit since smaller ones do not exist in SIMD.js. (pad with zero lanes)
-  int SIMDJsRetNumElements = 128 / cast<VectorType>(SVI->getType())->getElementType()->getPrimitiveSizeInBits();
-  int SIMDJsOp0NumElements = 128 / op0->getElementType()->getPrimitiveSizeInBits();
+  const int SIMDJsRetNumElements = SIMDNumElements(cast<VectorType>(SVI->getType()));
+  const int SIMDJsOp0NumElements = SIMDNumElements(op0);
   bool swizzleA = true;
   bool swizzleB = true;
   for(int i = 0; i < ResultNumElements; ++i) {
@@ -2283,7 +2477,8 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
   assert(I == I->stripPointerCasts());
 
   Type *T = I->getType();
-  if (T->isIntegerTy() && T->getIntegerBitWidth() > 32) {
+  if (T->isIntegerTy() && ((!OnlyWebAssembly && T->getIntegerBitWidth() > 32) ||
+                           ( OnlyWebAssembly && T->getIntegerBitWidth() > 64))) {
     errs() << *I << "\n";
     report_fatal_error("legalization problem");
   }
@@ -2334,6 +2529,25 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
   case Instruction::AShr:{
     Code << getAssignIfNeeded(I);
     unsigned opcode = Operator::getOpcode(I);
+    if (OnlyWebAssembly && I->getType()->isIntegerTy() && I->getType()->getIntegerBitWidth() == 64) {
+      switch (opcode) {
+        case Instruction::Add:  Code << "i64_add(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::Sub:  Code << "i64_sub(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::Mul:  Code << "i64_mul(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::UDiv: Code << "i64_udiv(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::SDiv: Code << "i64_sdiv(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::URem: Code << "i64_urem(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::SRem: Code << "i64_srem(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::And:  Code << "i64_and(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::Or:   Code << "i64_or(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::Xor:  Code << "i64_xor(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::Shl:  Code << "i64_shl(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::AShr: Code << "i64_ashr(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case Instruction::LShr: Code << "i64_lshr(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        default: error("bad wasm-i64 binary opcode"); break;
+      }
+      break;
+    }
     switch (opcode) {
       case Instruction::Add:  Code << getParenCast(
                                         getValueAsParenStr(I->getOperand(0)) +
@@ -2451,6 +2665,23 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
     auto predicate = isa<ConstantExpr>(I) ?
                      (CmpInst::Predicate)cast<ConstantExpr>(I)->getPredicate() :
                      cast<ICmpInst>(I)->getPredicate();
+    if (OnlyWebAssembly && I->getOperand(0)->getType()->isIntegerTy() && I->getOperand(0)->getType()->getIntegerBitWidth() == 64) {
+      Code << getAssignIfNeeded(I);
+      switch (predicate) {
+        case ICmpInst::ICMP_EQ:  Code << "i64_eq(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case ICmpInst::ICMP_NE:  Code << "i64_ne(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case ICmpInst::ICMP_ULE: Code << "i64_ule(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case ICmpInst::ICMP_SLE: Code << "i64_sle(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case ICmpInst::ICMP_UGE: Code << "i64_uge(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case ICmpInst::ICMP_SGE: Code << "i64_sge(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case ICmpInst::ICMP_ULT: Code << "i64_ult(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case ICmpInst::ICMP_SLT: Code << "i64_slt(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case ICmpInst::ICMP_UGT: Code << "i64_ugt(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        case ICmpInst::ICMP_SGT: Code << "i64_sgt(" << getValueAsStr(I->getOperand(0)) << "," << getValueAsStr(I->getOperand(1)) << ")"; break;
+        default: llvm_unreachable("Invalid ICmp-64 predicate");
+      }
+      break;
+    }
     AsmCast sign = CmpInst::isUnsigned(predicate) ? ASM_UNSIGNED : ASM_SIGNED;
     Code << getAssignIfNeeded(I) << "(" <<
       getValueAsCastStr(I->getOperand(0), sign) <<
@@ -2548,7 +2779,7 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
     }
 
     Type *T = V->getType();
-    if (T->isIntegerTy() && T->getIntegerBitWidth() > 32) {
+    if (T->isIntegerTy() && T->getIntegerBitWidth() > 32 && !OnlyWebAssembly) {
       errs() << *I << "\n";
       report_fatal_error("legalization problem");
     }
@@ -2593,7 +2824,7 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
           ConstantOffset = 0;
 
           // Now add the scaled dynamic index.
-          std::string Mul = getIMul(Index, ConstantInt::get(Type::getInt32Ty(GEP->getContext()), ElementSize));
+          std::string Mul = getIMul(Index, ConstantInt::get(i32, ElementSize));
           text = text.empty() ? Mul : ("(" + text + " + (" + Mul + ")|0)");
         }
       }
@@ -2606,10 +2837,24 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
     // handled separately - we push them back into the relooper branchings
     return;
   }
-  case Instruction::PtrToInt:
-  case Instruction::IntToPtr:
+  case Instruction::PtrToInt: {
+    if (OnlyWebAssembly && I->getType()->getIntegerBitWidth() == 64) {
+      // it is valid in LLVM IR to convert a pointer into an i64, it zexts
+      Code << getAssignIfNeeded(I) << "i64_zext(" << getValueAsStr(I->getOperand(0)) << ')';
+      break;
+    }
     Code << getAssignIfNeeded(I) << getValueAsStr(I->getOperand(0));
     break;
+  }
+  case Instruction::IntToPtr: {
+    if (OnlyWebAssembly && I->getOperand(0)->getType()->getIntegerBitWidth() == 64) {
+      // it is valid in LLVM IR to convert an i64 into a 32-bit pointer, it truncates
+      Code << getAssignIfNeeded(I) << "i64_trunc(" << getValueAsStr(I->getOperand(0)) << ')';
+      break;
+    }
+    Code << getAssignIfNeeded(I) << getValueAsStr(I->getOperand(0));
+    break;
+  }
   case Instruction::Trunc:
   case Instruction::ZExt:
   case Instruction::SExt:
@@ -2620,6 +2865,40 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
   case Instruction::UIToFP:
   case Instruction::SIToFP: {
     Code << getAssignIfNeeded(I);
+    if (OnlyWebAssembly &&
+        ((I->getType()->isIntegerTy() && I->getType()->getIntegerBitWidth() == 64) ||
+         (I->getOperand(0)->getType()->isIntegerTy() && I->getOperand(0)->getType()->getIntegerBitWidth() == 64))) {
+      switch (Operator::getOpcode(I)) {
+        case Instruction::Trunc: {
+          unsigned outBits = I->getType()->getIntegerBitWidth();
+          Code << "i64_trunc(" << getValueAsStr(I->getOperand(0)) << ')';
+          if (outBits < 32) {
+            Code << "&" << utostr(LSBMask(outBits));
+          }
+          break;
+        }
+        case Instruction::SExt: {
+          unsigned inBits = I->getOperand(0)->getType()->getIntegerBitWidth();
+          std::string bits = utostr(32 - inBits);
+          Code << "i64_sext(" << getValueAsStr(I->getOperand(0));
+          if (inBits < 32) {
+            Code << " << " << bits << " >> " << bits;
+          }
+          Code << ')';
+          break;
+        }
+        case Instruction::ZExt: {
+          Code << "i64_zext(" << getValueAsCastStr(I->getOperand(0), ASM_UNSIGNED) << ')';
+          break;
+        }
+        case Instruction::SIToFP: Code << (I->getType()->isFloatTy() ? "i64_s2f(" : "i64_s2d(") << getValueAsStr(I->getOperand(0)) << ')'; break;
+        case Instruction::UIToFP: Code << (I->getType()->isFloatTy() ? "i64_u2f(" : "i64_u2d(") << getValueAsStr(I->getOperand(0)) << ')'; break;
+        case Instruction::FPToSI: Code << (I->getOperand(0)->getType()->isFloatTy() ? "i64_f2s(" : "i64_d2s(") << getValueAsStr(I->getOperand(0)) << ')'; break;
+        case Instruction::FPToUI: Code << (I->getOperand(0)->getType()->isFloatTy() ? "i64_f2u(" : "i64_d2u(") << getValueAsStr(I->getOperand(0)) << ')'; break;
+        default: llvm_unreachable("Unreachable-i64");
+      }
+      break;
+    }
     switch (Operator::getOpcode(I)) {
     case Instruction::Trunc: {
       //unsigned inBits = V->getType()->getIntegerBitWidth();
@@ -2665,9 +2944,25 @@ void JSWriter::generateExpression(const User *I, raw_string_ostream& Code) {
     Type *OutType = I->getType();
     std::string V = getValueAsStr(I->getOperand(0));
     if (InType->isIntegerTy() && OutType->isFloatingPointTy()) {
+      if (OnlyWebAssembly) {
+        if (InType->getIntegerBitWidth() == 64) {
+          Code << "i64_bc2d(" << V << ')';
+        } else {
+          Code << "i32_bc2f(" << V << ')';
+        }
+        break;
+      }
       assert(InType->getIntegerBitWidth() == 32);
       Code << "(HEAP32[tempDoublePtr>>2]=" << V << "," << getCast("HEAPF32[tempDoublePtr>>2]", Type::getFloatTy(TheModule->getContext())) << ")";
     } else if (OutType->isIntegerTy() && InType->isFloatingPointTy()) {
+      if (OnlyWebAssembly) {
+        if (OutType->getIntegerBitWidth() == 64) {
+          Code << "i64_bc2i(" << V << ')';
+        } else {
+          Code << "i32_bc2i(" << V << ')';
+        }
+        break;
+      }
       assert(OutType->getIntegerBitWidth() == 32);
       Code << "(HEAPF32[tempDoublePtr>>2]=" << V << "," "HEAP32[tempDoublePtr>>2]|0)";
     } else {
@@ -2876,7 +3171,13 @@ void JSWriter::printFunctionBody(const Function *F) {
         BlockCondMap BlocksToConditions;
         for (SwitchInst::ConstCaseIt i = SI->case_begin(), e = SI->case_end(); i != e; ++i) {
           const BasicBlock *BB = i.getCaseSuccessor();
-          std::string Curr = i.getCaseValue()->getValue().toString(10, true);
+          APInt CaseValue = i.getCaseValue()->getValue();
+          std::string Curr;
+          if (CaseValue.getBitWidth() == 64) {
+            Curr = emitI64Const(CaseValue);
+          } else {
+            Curr = CaseValue.toString(10, true);
+          }
           std::string Condition;
           if (UseSwitch) {
             Condition = "case " + Curr + ": ";
@@ -2905,12 +3206,12 @@ void JSWriter::printFunctionBody(const Function *F) {
   R.Render();
 
   // Emit local variables
-  UsedVars["sp"] = Type::getInt32Ty(F->getContext());
+  UsedVars["sp"] = i32;
   unsigned MaxAlignment = Allocas.getMaxAlignment();
   if (MaxAlignment > STACK_ALIGN) {
-    UsedVars["sp_a"] = Type::getInt32Ty(F->getContext());
+    UsedVars["sp_a"] = i32;
   }
-  UsedVars["label"] = Type::getInt32Ty(F->getContext());
+  UsedVars["label"] = i32;
   if (!UsedVars.empty()) {
     unsigned Count = 0;
     for (VarMap::const_iterator VI = UsedVars.begin(); VI != UsedVars.end(); ++VI) {
@@ -2928,8 +3229,15 @@ void JSWriter::printFunctionBody(const Function *F) {
         default:
           llvm_unreachable("unsupported variable initializer type");
         case Type::PointerTyID:
-        case Type::IntegerTyID:
           Out << "0";
+          break;
+        case Type::IntegerTyID:
+          if (VI->second->getIntegerBitWidth() == 64) {
+            assert(OnlyWebAssembly);
+            Out << "i64()";
+          } else {
+            Out << "0";
+          }
           break;
         case Type::FloatTyID:
           if (PreciseF32) {
@@ -2973,7 +3281,7 @@ void JSWriter::printFunctionBody(const Function *F) {
   }
 
   // Emit stack entry
-  Out << " " << getAdHocAssign("sp", Type::getInt32Ty(F->getContext())) << "STACKTOP;";
+  Out << " " << getAdHocAssign("sp", i32) << "STACKTOP;";
   if (uint64_t FrameSize = Allocas.getFrameSize()) {
     if (MaxAlignment > STACK_ALIGN) {
       // We must align this entire stack frame to something higher than the default
@@ -3077,6 +3385,10 @@ void JSWriter::processConstants() {
         parseConstant(I->getName().str(), I->getInitializer(), I->getAlignment(), true);
       }
     }
+  }
+  if (WebAssembly && SideModule && StackSize > 0) {
+    // allocate the stack
+    allocateZeroInitAddress("wasm-module-stack", STACK_ALIGN, StackSize);
   }
   // Calculate MaxGlobalAlign, adjust final paddings, and adjust GlobalBasePadding
   assert(MaxGlobalAlign == 0);
@@ -3324,6 +3636,52 @@ void JSWriter::printModuleBody() {
     } while (i < num);
 
     PostSets.clear();
+    if (WebAssembly && SideModule) {
+      // emit the init method for a wasm side module,
+      // which runs postsets and global inits
+      // note that we can't use the wasm start mechanism, as the JS side is
+      // not yet ready - imagine that in the start method we call out to JS,
+      // then try to call back in, but we haven't yet captured the exports
+      // from the wasm module to their places on the JS Module object etc.
+      Out << "function __post_instantiate() {\n";
+      if (StackSize > 0) {
+        Out << " STACKTOP = " << relocateGlobal(utostr(getGlobalAddress("wasm-module-stack"))) << ";\n";
+        Out << " STACK_MAX = STACKTOP + " << StackSize << " | 0;\n";
+      }
+      Out << " runPostSets();\n";
+      for (auto& init : GlobalInitializers) {
+        Out << " " << init << "();\n";
+      }
+      GlobalInitializers.clear();
+      Out << "}\n";
+      Exports.push_back("__post_instantiate");
+    }
+    if (DeclaresNeedingTypeDeclarations.size() > 0) {
+      Out << "function __emscripten_dceable_type_decls() {\n";
+      for (auto& Decl : DeclaresNeedingTypeDeclarations) {
+        std::string Call = getJSName(Decl) + "(";
+        bool First = true;
+        auto* FT = Decl->getFunctionType();
+        for (auto AI = FT->param_begin(), AE = FT->param_end(); AI != AE; ++AI) {
+          if (First) {
+            First = false;
+          } else {
+            Call += ", ";
+          }
+          Call += getUndefValue(*AI);
+        }
+        Call += ")";
+        Type *RT = FT->getReturnType();
+        if (!RT->isVoidTy()) {
+          Call = getCast(Call, RT);
+        }
+        Out << " " << Call << ";\n";
+      }
+      Out << "}\n";
+    }
+    for (auto& Name : ExtraFunctions) {
+      Out << Name << '\n';
+    }
   }
   Out << "// EMSCRIPTEN_END_FUNCTIONS\n\n";
 
@@ -3485,14 +3843,17 @@ void JSWriter::printModuleBody() {
   unsigned Num = FunctionTables.size();
   for (FunctionTableMap::iterator I = FunctionTables.begin(), E = FunctionTables.end(); I != E; ++I) {
     Out << "  \"" << I->first << "\": \"var FUNCTION_TABLE_" << I->first << " = [";
-    FunctionTable &Table = I->second;
-    // ensure power of two
-    unsigned Size = 1;
-    while (Size < Table.size()) Size <<= 1;
-    while (Table.size() < Size) Table.push_back("0");
-    for (unsigned i = 0; i < Table.size(); i++) {
-      Out << Table[i];
-      if (i < Table.size()-1) Out << ",";
+    // wasm emulated function pointers use just one table
+    if (!(WebAssembly && EmulatedFunctionPointers && I->first != "X")) {
+      FunctionTable &Table = I->second;
+      // ensure power of two
+      unsigned Size = 1;
+      while (Size < Table.size()) Size <<= 1;
+      while (Table.size() < Size) Table.push_back("0");
+      for (unsigned i = 0; i < Table.size(); i++) {
+        Out << Table[i];
+        if (i < Table.size()-1) Out << ",";
+      }
     }
     Out << "];\"";
     if (--Num > 0) Out << ",";
@@ -4112,6 +4473,7 @@ void JSWriter::printModule(const std::string& fname,
 bool JSWriter::runOnModule(Module &M) {
   TheModule = &M;
   DL = &M.getDataLayout();
+  i32 = Type::getInt32Ty(M.getContext());
 
   // sanity checks on options
   assert(Relocatable ? GlobalBase == 0 : true);
@@ -4271,7 +4633,14 @@ bool JSTargetMachine::addPassesToEmitFile(
   // end PNaCl legalization
 
   PM.add(createExpandInsertExtractElementPass());
-  PM.add(createExpandI64Pass());
+
+  if (!OnlyWebAssembly) {
+    // if only wasm, then we can emit i64s, otherwise they must be lowered
+    PM.add(createExpandI64Pass());
+  } else {
+    // only wasm, and for now no atomics there, so just lower them out
+    PM.add(createLowerAtomicPass());
+  }
 
   CodeGenOpt::Level OptLevel = getOptLevel();
 
