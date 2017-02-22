@@ -112,11 +112,6 @@ Relocatable("emscripten-relocatable",
             cl::init(false));
 
 static cl::opt<bool>
-CompressRelocataionTable("emscripten-compress-relocation-table",
-            cl::desc("Whether to compress relocataion table (see emscripten RELOCATABLE option)"),
-            cl::init(false));
-
-static cl::opt<bool>
 EnableSjLjEH("enable-pnacl-sjlj-eh",
              cl::desc("Enable use of SJLJ-based C++ exception handling "
                       "as part of the pnacl-abi-simplify passes"),
@@ -485,12 +480,7 @@ namespace {
       V = resolveFully(V);
       if (const Function *F = dyn_cast<const Function>(V)) {
         if (Relocatable) {
-          if (CompressRelocataionTable) {
-            RelocationTable[AbsoluteTarget] = getFunctionIndex(F) * 2;
-            assert(getFunctionIndex(F));
-          } else {
-            PostSets.push_back("\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + relocateFunctionPointer(utostr(getFunctionIndex(F))) + ';');
-          }
+          PostSets.push_back("\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + relocateFunctionPointer(utostr(getFunctionIndex(F))) + ';');
           return 0; // emit zero in there for now, until the postSet
         }
         return getFunctionIndex(F);
@@ -516,12 +506,8 @@ namespace {
           } else if (Relocatable) {
             // this is one of our globals, but we must relocate it. we return zero, but the caller may store
             // an added offset, which we read at postSet time; in other words, we just add to that offset
-            if (CompressRelocataionTable) {
-              RelocationTable[AbsoluteTarget] = getGlobalAddress(V->getName().str()) * 2 + 1;
-            } else {
-              std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
-              PostSets.push_back("\n " + access + " = (" + access + " | 0) + " + relocateGlobal(utostr(getGlobalAddress(V->getName().str()))) + ';');
-            }
+            std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
+            PostSets.push_back("\n " + access + " = (" + access + " | 0) + " + relocateGlobal(utostr(getGlobalAddress(V->getName().str()))) + ';');
             return 0; // emit zero in there for now, until the postSet
           }
         }
@@ -3311,85 +3297,7 @@ void JSWriter::printModuleBody() {
     if (!I->isDeclaration()) printFunction(I);
   }
   // Emit postSets, split up into smaller functions to avoid one massive one that is slow to compile (more likely to occur in dynamic linking, as more postsets)
-  if(CompressRelocataionTable) {
-    Out << "var addressMap = [";
-    unsigned prev = 0;
-    std::list<unsigned> addresses;
-    bool First = true;
-    unsigned totalSize = 0;
-    for (std::map<unsigned, unsigned>::iterator I = RelocationTable.begin(), E = RelocationTable.end();
-        I != E; ++I) {
-      unsigned target = I->first;
-      unsigned address = I->second;
-      
-      if(First) {
-        First = false;
-        Out << "\n  " << utostr(target);
-        totalSize++;
-      } else {
-        assert(target > prev);
-        
-        if(target - prev <= 4*10) {
-          for(int i = 0; i < (target-prev)/4-1; i++) {
-            addresses.push_back(0);
-          }
-        } else {
-          // break
-          Out << "," << utostr(addresses.size());
-          totalSize++;
-          for(std::list<unsigned>::iterator AI = addresses.begin(), AE = addresses.end(); AI != AE; ++AI) {
-              Out << "," << utostr(*AI);
-              totalSize++;
-          }
-          addresses.clear();
-          Out << ",\n  " << utostr(target);
-          totalSize++;
-        }
-      }
-      addresses.push_back(address);
-      prev = target;
-    }
-    if(!First) {
-        Out << "," << utostr(addresses.size());
-        totalSize++;
-        for(std::list<unsigned>::iterator AI = addresses.begin(), AE = addresses.end(); AI != AE; ++AI) {
-            Out << "," << utostr(*AI);
-            totalSize++;
-        }
-        addresses.clear();
-    }
-    Out << "];\n";
-    RelocationTable.clear();
-
-    Out << "function runPostSets() {\n";
-    Out << "  var i = 0, j = 0, target = 0, address = 0, tableSize = 0;\n";
-    Out << "  var temp = 0;\n";
-    Out << "  while(1) {\n";
-    Out << "    if(i >= " << totalSize << ") break;\n";
-    Out << "    target = addressMap[i]|0;\n";
-    Out << "    tableSize = addressMap[i+1]|0;\n";
-    Out << "    j = 0;\n";
-    Out << "    while(1) {\n";
-    Out << "      if(j >= tableSize) break;\n";
-    Out << "      address = addressMap[i+2+j]|0;\n";
-    Out << "      if(address == 0) {\n";
-    Out << "        // skip\n";
-    Out << "      } else if((address & 1) == 0) {\n";
-    Out << "        HEAP32[(gb + target) >> 2] = fb + (address >> 1);\n";
-    Out << "      } else {\n";
-    Out << "        HEAP32[(gb + target) >> 2] = (HEAP32[(gb + target) >> 2]|0) + gb + (address >> 1);\n";
-    Out << "      }\n";
-    Out << "      j = j + 1;\n";
-    Out << "      target = target + 4;\n";
-    Out << "    }\n";
-    Out << "    i = i + 2 + tableSize;\n";
-    Out << "  }\n";
-    for(int i = 0; i < PostSets.size(); i++) {
-      Out << "  " << PostSets[i];
-    }
-    Out << "\n}\n";
-    PostSets.clear();
-  } else {
+  {
     const int CHUNK = 100;
     int i = 0;
     int chunk = 0;
