@@ -7,6 +7,8 @@
 // which are reported as declared but not implemented symbols, so that
 // JS linking brings them in.
 
+#include "llvm/Support/ScopedPrinter.h"
+
 typedef std::string (JSWriter::*CallHandler)(const Instruction*, std::string Name, int NumArgs);
 typedef std::map<std::string, CallHandler> CallHandlerMap;
 CallHandlerMap CallHandlers;
@@ -24,7 +26,7 @@ const Value *getActuallyCalledValue(const Instruction *I) {
   // for example, extern void x() in C will turn into void x(...) in LLVM IR, then the IR bitcasts
   // it to the proper form right before the call. this both causes an unnecessary indirect
   // call, and it is done with the wrong type. TODO: don't even put it into the function table
-  if (const Function *F = dyn_cast<const Function>(CV->stripPointerCasts())) {
+  if (const Function *F = dyn_cast<const Function>(stripPointerCastsWithoutSideEffects(CV))) {
     CV = F;
   }
   return CV;
@@ -625,11 +627,11 @@ DEF_CALL_HANDLER(llvm_lifetime_end, {
   return "";
 })
 
-DEF_CALL_HANDLER(llvm_invariant_start, {
+DEF_CALL_HANDLER(llvm_invariant_start_p0i8, {
   return "";
 })
 
-DEF_CALL_HANDLER(llvm_invariant_end, {
+DEF_CALL_HANDLER(llvm_invariant_end_p0i8, {
   return "";
 })
 
@@ -1065,7 +1067,7 @@ DEF_BUILTIN_HANDLER(emscripten_float32x4_abs, SIMD_Float32x4_abs);
 std::string castBoolVecToIntVec(int numElems, const std::string &str, bool signExtend)
 {
   int elemWidth = 128 / numElems;
-  std::string simdType = "SIMD_Int" + std::to_string(elemWidth) + "x" + std::to_string(numElems);
+  std::string simdType = "SIMD_Int" + llvm::to_string(elemWidth) + "x" + llvm::to_string(numElems);
   return simdType + "_select(" + str + ", " + simdType + "_splat(" + (signExtend ? "-1" : "1") + "), " + simdType + "_splat(0))";
 }
 DEF_CALL_HANDLER(emscripten_float32x4_lessThan, {
@@ -1655,8 +1657,8 @@ void setupCallHandlers() {
   SETUP_CALL_HANDLER(llvm_dbg_value);
   SETUP_CALL_HANDLER(llvm_lifetime_start);
   SETUP_CALL_HANDLER(llvm_lifetime_end);
-  SETUP_CALL_HANDLER(llvm_invariant_start);
-  SETUP_CALL_HANDLER(llvm_invariant_end);
+  SETUP_CALL_HANDLER(llvm_invariant_start_p0i8);
+  SETUP_CALL_HANDLER(llvm_invariant_end_p0i8);
   SETUP_CALL_HANDLER(llvm_prefetch);
   SETUP_CALL_HANDLER(clang_arc_use);
   SETUP_CALL_HANDLER(llvm_objectsize_i32_p0i8);
