@@ -223,6 +223,7 @@ namespace {
     AlignedHeapStartMap AlignedHeapStarts, ZeroInitStarts;
     GlobalAddressMap GlobalAddresses;
     NameSet Externals; // vars
+    NameSet ExternalsOriginal; // vars
     NameSet Declares; // funcs
     NameSet ObjCMessageFuncs; // funcs
     StringMap Redirects; // library function redirects actually used, needed for wrapper funcs in tables
@@ -616,6 +617,7 @@ namespace {
             // All postsets are of external values, so they are pointers, hence 32-bit
             std::string Name = getOpName(V);
             Externals.insert(Name);
+            ExternalsOriginal.insert(V->getName());
             if (Relocatable) {
               std::string line = "\n temp = g$" + Name + "() | 0;"; // we access linked externs through calls, and must do so to a temp for heap growth validation
               // see later down about adding to an offset
@@ -1635,6 +1637,7 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
     if (GV->isDeclaration()) {
       std::string Name = getOpName(GV);
       Externals.insert(Name);
+      ExternalsOriginal.insert(GV->getName());
       if (Relocatable) {
         // we access linked externs through calls, which we load at the beginning of basic blocks
         FuncRelocatableExterns.insert(Name);
@@ -3813,6 +3816,19 @@ void JSWriter::printModuleBody() {
   Out << "\"externs\": [";
   first = true;
   for (NameSet::const_iterator I = Externals.begin(), E = Externals.end();
+       I != E; ++I) {
+    if (first) {
+      first = false;
+    } else {
+      Out << ", \n";
+    }
+    Out << "\"" << escapeJSONString(*I) << "\"";
+  }
+  Out << "],";
+
+  Out << "\"externsOriginal\": [";
+  first = true;
+  for (NameSet::const_iterator I = ExternalsOriginal.begin(), E = ExternalsOriginal.end();
        I != E; ++I) {
     if (first) {
       first = false;
