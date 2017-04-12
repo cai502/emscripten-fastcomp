@@ -3666,12 +3666,16 @@ void JSWriter::printModuleBody() {
         Out << " STACK_MAX = STACKTOP + " << StackSize << " | 0;\n";
       }
       Out << " runPostSets();\n";
+      Out << "}\n";
+      Exports.push_back("__post_instantiate");
+
+      Out << "function __run_global_initializers() {\n";
       for (auto& init : GlobalInitializers) {
         Out << " " << init << "();\n";
       }
       GlobalInitializers.clear();
       Out << "}\n";
-      Exports.push_back("__post_instantiate");
+      Exports.push_back("__run_global_initializers");
     }
     if (DeclaresNeedingTypeDeclarations.size() > 0) {
       Out << "function __emscripten_dceable_type_decls() {\n";
