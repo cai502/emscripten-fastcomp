@@ -108,10 +108,7 @@ DEF_CALL_HANDLER(__default__, {
     Name += "_" + Sig;
     ObjCMessageFuncs.insert(Name);
     // TODO Fix
-    unsigned addr = getFunctionIndex(F);
-    FunctionTable &Table = FunctionTables[Sig];
-    while (Table.size() <= addr) Table.push_back("0");
-    Table[addr] = getJSName(F)+"_"+Sig;
+    getFunctionIndex(F, Name);
   }
 
   if (!FT->isVarArg() && !ForcedNumArgs) {
@@ -139,7 +136,7 @@ DEF_CALL_HANDLER(__default__, {
   }
 
   if (Invoke) {
-    if(isObjCFunction(&Name)) {
+    if(ObjcMsgSendFuncs) {
     } else {
       Sig = getFunctionSignature(FT);
     }
@@ -151,7 +148,11 @@ DEF_CALL_HANDLER(__default__, {
   if (Invoke) {
     // add first param
     if (F) {
-      text += relocateFunctionPointer(utostr(getFunctionIndex(F))); // convert to function pointer
+      if(ObjcMsgSendFuncs) {
+        text += relocateFunctionPointer(utostr(getFunctionIndex(F, getJSName(F)+"_"+Sig))); // convert to function pointer
+      } else {
+        text += relocateFunctionPointer(utostr(getFunctionIndex(F))); // convert to function pointer
+      }
     } else {
       text += getValueAsCastStr(CV); // already a function pointer
     }

@@ -492,8 +492,8 @@ namespace {
       ExtraFunctions.push_back(LegalFunc);
       return LegalName;
     }
-    unsigned getFunctionIndex(const Function *F) {
-      const std::string &Name = getJSName(F);
+    unsigned getFunctionIndex(const Function *F, const std::string &Alias = std::string("")) {
+      const std::string &Name = Alias.empty() ? getJSName(F) : Alias;
       if (IndexedFunctions.find(Name) != IndexedFunctions.end()) return IndexedFunctions[Name];
       FunctionTable& Table = ensureFunctionTable(F->getFunctionType());
       if (NoAliasingFunctionPointers) {
