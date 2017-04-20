@@ -4687,6 +4687,8 @@ bool JSTargetMachine::addPassesToEmitFile(
   PM.add(createEmscriptenRemoveLLVMAssumePass());
   PM.add(createEmscriptenExpandBigSwitchesPass());
 
+  PM.add(createGenObjcFuncsPass());
+
   PM.add(new JSWriter(Out, OptLevel));
 
   return false;
