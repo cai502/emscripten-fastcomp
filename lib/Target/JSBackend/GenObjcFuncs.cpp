@@ -90,6 +90,11 @@ bool GenObjcFuncs::runOnModule(Module &M) {
   ObjcCallVisitor visitor(funcs);
   visitor.visit(M);
 
+  for(auto I = funcs.begin(), E = funcs.end(); I != E; ++I) {
+    ObjcFunction func = I->first;
+    func.generateFunction(M);
+  }
+
   // 1. funcs -> generate Function
   // 2. replace CI's CalledValue with generated Fucntion
   // 3. erase old functions
@@ -142,15 +147,80 @@ bool ObjcFunction::isObjcFunction(std::string &Name) {
 
 Function *ObjcFunction::generateFunction(Module &M) {
   Function* Func = Function::Create(MessageFunctionType, GlobalValue::InternalLinkage, getFullName(), &M);
+  SmallVector<Value*, 10> Args;
+  for(auto I = Func->arg_begin(), E = Func->arg_end(); I != E; ++I) {
+    I->setName("arg");
+    Args.push_back(&*I);
+  }
+  Argument *Self = cast<Argument>(Args[0]);
+  Self->setName("self");
+  Argument *Sel = cast<Argument>(Args[1]);
+  Sel->setName("sel");
 
-  BasicBlock *EntryBB = BasicBlock::Create(Func->getContext(), "", Func);
-  BasicBlock *L5BB    = BasicBlock::Create(Func->getContext(), "L5", Func);
-  BasicBlock *L10BB   = BasicBlock::Create(Func->getContext(), "L10", Func);
-  BasicBlock *L12BB   = BasicBlock::Create(Func->getContext(), "L12", Func);
-  BasicBlock *L14BB   = BasicBlock::Create(Func->getContext(), "L14", Func);
-  BasicBlock *L17BB   = BasicBlock::Create(Func->getContext(), "L17", Func);
-  BasicBlock *L19BB   = BasicBlock::Create(Func->getContext(), "L19", Func);
+  bool isVoidReturn = MessageFunctionType->getReturnType()->isVoidTy();
 
+  BasicBlock *EntryBB   = BasicBlock::Create(Func->getContext(), "", Func);
+  BasicBlock *CacheBB   = BasicBlock::Create(Func->getContext(), "Cache", Func);
+  BasicBlock *LookupBB  = BasicBlock::Create(Func->getContext(), "Lookup", Func);
+  BasicBlock *CheckBB   = BasicBlock::Create(Func->getContext(), "Check", Func);
+  BasicBlock *CallBB    = BasicBlock::Create(Func->getContext(), "Call", Func);
+  BasicBlock *ForwardBB = BasicBlock::Create(Func->getContext(), "Foward", Func);
+  BasicBlock *ReturnBB  = BasicBlock::Create(Func->getContext(), "Return", Func);
+
+  Type *I32 = Type::getInt32Ty(Func->getContext());
+
+  auto SelfIsNull = new ICmpInst(*EntryBB, CmpInst::ICMP_EQ, Self, ConstantInt::get(I32, 0), "self_is_null");
+  BranchInst::Create(ReturnBB, CacheBB, SelfIsNull, EntryBB);
+
+  auto SelfIsa = new BitCastInst(Self, PointerType::getUnqual(Self->getType()), "self_isa", CacheBB);
+  auto Cls = new LoadInst(SelfIsa, "cls", CacheBB);
+  auto CacheGetImpFunc = Func->getParent()->getFunction("cache_getImp");
+  Value *CacheGetImpArgs[] = { Cls, Sel };
+
+  auto CacheImp = CallInst::Create(CacheGetImpFunc, CacheGetImpArgs, "cache_imp", CacheBB);
+  auto CacheImpIsNull = new ICmpInst(*CacheBB, CmpInst::ICMP_EQ, CacheImp, ConstantInt::get(I32, 0), "cache_imp_is_null");
+  BranchInst::Create(LookupBB, CheckBB, CacheImpIsNull, CacheBB);
+
+  auto LookupFunc = Func->getParent()->getFunction("_class_lookupMethodAndLoadCache3");
+  Value *LookupArgs[] = { Self, Sel, Cls };
+  auto LookupImp = CallInst::Create(LookupFunc, LookupArgs, "lookup_imp", LookupBB);
+  BranchInst::Create(CheckBB, LookupBB);
+
+  auto Imp = PHINode::Create(CacheImp->getType(), 2, "imp", CheckBB);
+  Imp->addIncoming(CacheImp, CacheBB);
+  Imp->addIncoming(LookupImp, LookupBB);
+  auto ImpIsZeroOrPositive = new ICmpInst(*CheckBB, CmpInst::ICMP_SGT, Imp, ConstantInt::get(I32, -1), "imp_ge_zero");
+  BranchInst::Create(CallBB, ForwardBB, ImpIsZeroOrPositive, CheckBB);
+
+  auto ActualFunc = new BitCastInst(Imp, PointerType::getUnqual(MessageFunctionType), "actual_func", CallBB);
+  auto CallRet = CallInst::Create(ActualFunc, Args, "call_ret", CallBB);
+  BranchInst::Create(ReturnBB, CallBB);
+
+  auto Margs = new AllocaInst(ArrayType::get(Self->getType(), Args.size()), "margs", ForwardBB);
+  Value *Indexes[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, 0)};
+  auto ReturnStorage = GetElementPtrInst::CreateInBounds(Margs, Indexes, "return_storage", ForwardBB);
+  int i = 0;
+  for(auto I = Args.begin(), E = Args.end(); I != E; ++I, ++i) {
+    Value *Indexes[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, i)};
+    auto Ptr = GetElementPtrInst::CreateInBounds(Margs, Indexes, "ptr", ForwardBB);
+    new StoreInst(*I, Ptr, ForwardBB);
+  }
+  auto ForwardingFunc = Func->getParent()->getFunction("___forwarding___");
+  Value *ForwardingArgs[] = {Margs, ReturnStorage};
+  auto ForwardRet = CallInst::Create(ForwardingFunc, ForwardingArgs, "forward_ret", ForwardBB);
+  BranchInst::Create(ReturnBB, ForwardBB);
+
+  if(!isVoidReturn) {
+    auto Ret = PHINode::Create(CacheImp->getType(), 3, "ret", ReturnBB);
+    Ret->addIncoming(ConstantInt::get(I32, 0), EntryBB);
+    Ret->addIncoming(CallRet, CallBB);
+    Ret->addIncoming(ForwardRet, ForwardBB);
+    ReturnInst::Create(Func->getContext(), Ret, ReturnBB);
+  } else {
+    ReturnInst::Create(Func->getContext(), ReturnBB);
+  }
+
+  Func->dump();
   return Func;
 }
 
