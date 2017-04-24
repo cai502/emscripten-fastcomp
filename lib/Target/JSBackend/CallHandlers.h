@@ -98,26 +98,13 @@ DEF_CALL_HANDLER(__default__, {
     }
   }
 
-  bool ObjcMsgSendFuncs = Name.find("_objc_msg") != std::string::npos || Name.find("_method_invoke") != std::string::npos;
-  if(ObjcMsgSendFuncs) {
-    Sig = getFunctionSignatureLetter(CI->getType());
-    for (int i = 0; i < NumArgs; i++) {
-      Type *ActualType = CI->getOperand(i)->getType();
-      Sig += getFunctionSignatureLetter(ActualType);
-    }
-    Name += "_" + Sig;
-    ObjCMessageFuncs.insert(Name);
-    // TODO Fix
-    getFunctionIndex(F, Name);
-  }
-
   if (!FT->isVarArg() && !ForcedNumArgs) {
     int TypeNumArgs = FT->getNumParams();
-    if (TypeNumArgs != NumArgs && !ObjcMsgSendFuncs) {
+    if (TypeNumArgs != NumArgs) {
       if (EmscriptenAssertions) prettyWarning() << "unexpected number of arguments " << utostr(NumArgs) << " in call to '" << F->getName() << "', should be " << utostr(TypeNumArgs) << "\n";
       if (NumArgs > TypeNumArgs) NumArgs = TypeNumArgs; // lop off the extra params that will not be used and just break validation
     }
-    if (EmscriptenAssertions && !ObjcMsgSendFuncs) {
+    if (EmscriptenAssertions) {
       for (int i = 0; i < std::min(TypeNumArgs, NumArgs); i++) {
         Type *TypeType = FT->getParamType(i);
         Type *ActualType = CI->getOperand(i)->getType();
@@ -127,7 +114,7 @@ DEF_CALL_HANDLER(__default__, {
       }
     }
   }
-  if (EmscriptenAssertions && !ObjcMsgSendFuncs) {
+  if (EmscriptenAssertions) {
     Type *TypeType = FT->getReturnType();
     Type *ActualType = CI->getType();
     if (getFunctionSignatureLetter(TypeType) != getFunctionSignatureLetter(ActualType)) {
@@ -136,10 +123,7 @@ DEF_CALL_HANDLER(__default__, {
   }
 
   if (Invoke) {
-    if(ObjcMsgSendFuncs) {
-    } else {
-      Sig = getFunctionSignature(FT);
-    }
+    Sig = getFunctionSignature(FT);
     Name = "invoke_" + Sig;
     NeedCasts = true;
   }
@@ -148,11 +132,7 @@ DEF_CALL_HANDLER(__default__, {
   if (Invoke) {
     // add first param
     if (F) {
-      if(ObjcMsgSendFuncs) {
-        text += relocateFunctionPointer(utostr(getFunctionIndex(F, getJSName(F)+"_"+Sig))); // convert to function pointer
-      } else {
-        text += relocateFunctionPointer(utostr(getFunctionIndex(F))); // convert to function pointer
-      }
+      text += relocateFunctionPointer(utostr(getFunctionIndex(F))); // convert to function pointer
     } else {
       text += getValueAsCastStr(CV); // already a function pointer
     }
@@ -187,12 +167,9 @@ DEF_CALL_HANDLER(__default__, {
     // does not return a value
     getAssignIfNeeded(CI); // ensure the variable is defined, but do not emit it here
                            // it should have 0 uses, but just to be safe
-  } else {
-    Type *RT = ObjcMsgSendFuncs ? InstRT : ActualRT;
-    if (!RT->isVoidTy()) {
-      unsigned FFI_IN = FFI ? ASM_FFI_IN : 0;
-      text = getAssignIfNeeded(CI) + "(" + getCast(text, RT, ASM_NONSPECIFIC | FFI_IN) + ")";
-    }
+  } else if (!ActualRT->isVoidTy()) {
+    unsigned FFI_IN = FFI ? ASM_FFI_IN : 0;
+    text = getAssignIfNeeded(CI) + "(" + getCast(text, ActualRT, ASM_NONSPECIFIC | FFI_IN) + ")";
   }
   return text;
 })
