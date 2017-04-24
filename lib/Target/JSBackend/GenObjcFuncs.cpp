@@ -103,6 +103,8 @@ bool GenObjcFuncs::runOnModule(Module &M) {
     Function *F = func.generateFunction(M);
     std::vector<Instruction*> Instructions = I->second;
     for(auto CI = Instructions.begin(), CE = Instructions.end(); CI != CE; ++CI) {
+      CallSite CS(*CI);
+      CS.setCalledFunction(F);
     }
   }
 
