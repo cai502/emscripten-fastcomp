@@ -205,22 +205,25 @@ Function *ObjcFunction::generateFunction(Module &M) {
 Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   Function* Func = Function::Create(MessageFunctionType, GlobalValue::InternalLinkage, getFullName(), &M);
 
-  bool isVoidReturn = MessageFunctionType->getReturnType()->isVoidTy();
-
-  // Prepare blocks
-  BasicBlock *EntryBB   = BasicBlock::Create(Func->getContext(), "", Func);
-  BasicBlock *CacheBB   = BasicBlock::Create(Func->getContext(), "Cache", Func);
-  BasicBlock *LookupBB  = BasicBlock::Create(Func->getContext(), "Lookup", Func);
-  BasicBlock *CheckBB   = BasicBlock::Create(Func->getContext(), "Check", Func);
-  BasicBlock *CallBB    = BasicBlock::Create(Func->getContext(), "Call", Func);
-  BasicBlock *ForwardBB = BasicBlock::Create(Func->getContext(), "Foward", Func);
-  BasicBlock *ReturnBB  = BasicBlock::Create(Func->getContext(), "Return", Func);
-
   // common Type
   Type *I32 = Type::getInt32Ty(Func->getContext());
+  Type *ReturnType = MessageFunctionType->getReturnType();
   Value *Index1[] = {ConstantInt::get(I32, 1)};
   Value *Index00[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, 0)};
   Value *Index01[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, 1)};
+  bool isVoidReturn = ReturnType->isVoidTy();
+
+  // Prepare blocks
+  BasicBlock *EntryBB = BasicBlock::Create(Func->getContext(), "", Func);
+  BasicBlock *CacheBB = BasicBlock::Create(Func->getContext(), "Cache", Func);
+  BasicBlock *LookupBB = BasicBlock::Create(Func->getContext(), "Lookup", Func);
+  BasicBlock *CheckBB = BasicBlock::Create(Func->getContext(), "Check", Func);
+  BasicBlock *CallBB = BasicBlock::Create(Func->getContext(), "Call", Func);
+  BasicBlock *ForwardBB = BasicBlock::Create(Func->getContext(), "Foward", Func);
+  BasicBlock *RetargetBB = BasicBlock::Create(Func->getContext(), "Retarget", Func);
+  BasicBlock *ForwardReturnBB = isVoidReturn ? nullptr : BasicBlock::Create(Func->getContext(), "ForwardReturn", Func);
+  BasicBlock *ReturnBB = BasicBlock::Create(Func->getContext(), "Return", Func);
+
 
   // Setup arguments
   SmallVector<Value*, 10> Args;
@@ -355,19 +358,43 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   }
   auto ForwardingFunc = Func->getParent()->getFunction("___forwarding___");
   Value *ForwardingArgs[] = {Margs, ReturnStorage};
-  auto ForwardRet = CallInst::Create(ForwardingFunc, ForwardingArgs, "forward_ret", ForwardBB);
-  BranchInst::Create(ReturnBB, ForwardBB);
+  auto Target = CallInst::Create(ForwardingFunc, ForwardingArgs, "target", ForwardBB);
+  auto TargetIsNull = new ICmpInst(*ForwardBB, CmpInst::ICMP_EQ, Target, ConstantInt::get(I32, 0), "target_is_null");
+  BranchInst::Create(isVoidReturn ? ReturnBB : ForwardReturnBB, RetargetBB, TargetIsNull, ForwardBB);
 
-  // return
+  // Call objc_msgSend with setting target as self
+  // TODO implement
+  auto AbortFunc = Func->getParent()->getFunction("abort");
+  CallInst::Create(AbortFunc, "", RetargetBB);
+  new UnreachableInst(Func->getContext(), RetargetBB);
+
   if(!isVoidReturn) {
-    auto Ret = PHINode::Create(CacheImp->getType(), 3, "ret", ReturnBB);
-    Ret->addIncoming(ConstantInt::get(I32, 0), EntryBB);
+    // return forward result
+    auto ForwardRetAddr = new BitCastInst(ReturnStorage, PointerType::getUnqual(ReturnType), "forward_ret_addr", ForwardReturnBB);
+    auto ForwardRet = new LoadInst(ForwardRetAddr, "forward_ret", ForwardReturnBB);
+    BranchInst::Create(ReturnBB, ForwardReturnBB);
+
+    // return
+    auto Ret = PHINode::Create(ReturnType, 3, "ret", ReturnBB);
+
+    Type *T = ReturnType;
+
+    Value *ZeroValue;
+    if (T->isFloatingPointTy()) {
+      ZeroValue = ConstantFP::get(T, 0.0);
+    } else if (T->isIntegerTy()) {
+      ZeroValue = ConstantInt::get(T, 0);
+    } else {
+      ZeroValue = ConstantInt::get(I32, 0);
+    }
+    Ret->addIncoming(ZeroValue, EntryBB);
     Ret->addIncoming(CallRet, CallBB);
-    Ret->addIncoming(ForwardRet, ForwardBB);
+    Ret->addIncoming(ForwardRet, ForwardReturnBB);
     ReturnInst::Create(Func->getContext(), Ret, ReturnBB);
   } else {
     ReturnInst::Create(Func->getContext(), ReturnBB);
   }
+  // Func->dump();
   return Func;
 }
 
