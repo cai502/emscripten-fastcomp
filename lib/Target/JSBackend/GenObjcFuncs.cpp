@@ -98,25 +98,19 @@ bool GenObjcFuncs::runOnModule(Module &M) {
   ObjcCallVisitor visitor(funcs);
   visitor.visit(M);
 
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   for(auto I = funcs.begin(), E = funcs.end(); I != E; ++I) {
     ObjcFunction func = I->first;
-    errs() << "***** " << func.getFullName() << "\n";
     Function *F = func.generateFunction(M);
     std::vector<Instruction*> Instructions = I->second;
     for(auto CI = Instructions.begin(), CE = Instructions.end(); CI != CE; ++CI) {
     }
   }
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
-  // 2. replace CI's CalledValue with generated Fucntion
-  // 3. erase old functions
+  // TODO erase old functions
   return true;
 }
 
 ObjcFunction::ObjcFunction(std::string Name, FunctionType *FT, Module *M) :Name(Name) {
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
-
   Type *I8 = Type::getInt8PtrTy(M->getContext());
 
   SmallVector<Type*, 10> Args;
@@ -129,14 +123,8 @@ ObjcFunction::ObjcFunction(std::string Name, FunctionType *FT, Module *M) :Name(
       Args.push_back(T);
     }
   }
-  for(Type *t: Args) {
-    t->dump();
-  }
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
   MessageFunctionType = FunctionType::get(FT->getReturnType(), Args, false);
-  MessageFunctionType->dump();
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 }
 
 std::string ObjcFunction::getFullName(void) const {
@@ -213,10 +201,8 @@ Function *ObjcFunction::generateFunction(Module &M) {
 }
 
 Function *ObjcFunction::generateMsgSendFunction(Module &M) {
-  errs() << "generateMsgSendFunction:" << Name << "\n";
   Function* Func = Function::Create(MessageFunctionType, GlobalValue::InternalLinkage, getFullName(), &M);
 
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   bool isVoidReturn = MessageFunctionType->getReturnType()->isVoidTy();
 
   // Prepare blocks
@@ -241,7 +227,6 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
     Args.push_back(&Arg);
   }
 
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   auto ArgIter = Func->arg_begin();
   Argument *FisrtArg = &*ArgIter++;
   Argument *SecondArg = &*ArgIter++;
@@ -278,7 +263,6 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
       Sel = ThirdArg;
     }
   }
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
   // Function body
 
@@ -289,7 +273,6 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   } else {
     BranchInst::Create(CacheBB, EntryBB);
   }
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
   // get class
   Value *Cls;
@@ -315,7 +298,6 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   } else {
     llvm_unreachable("Unexpected function type");
   }
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
   // call cache_getImp
   auto CacheGetImpFunc = Func->getParent()->getFunction("cache_getImp");
@@ -324,14 +306,12 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   auto CacheImpIsNull = new ICmpInst(*CacheBB, CmpInst::ICMP_EQ, CacheImp, ConstantInt::get(I32, 0), "cache_imp_is_null");
   BranchInst::Create(LookupBB, CheckBB, CacheImpIsNull, CacheBB);
 
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   // call _class_lookupMethodAndLoadCache3
   auto LookupFunc = Func->getParent()->getFunction("_class_lookupMethodAndLoadCache3");
   Value *LookupArgs[] = { Self, Sel, Cls };
   auto LookupImp = CallInst::Create(LookupFunc, LookupArgs, "lookup_imp", LookupBB);
   BranchInst::Create(CheckBB, LookupBB);
 
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   // check imp is not negative
   auto Imp = PHINode::Create(CacheImp->getType(), 2, "imp", CheckBB);
   Imp->addIncoming(CacheImp, CacheBB);
@@ -339,7 +319,6 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   auto ImpIsZeroOrPositive = new ICmpInst(*CheckBB, CmpInst::ICMP_SGT, Imp, ConstantInt::get(I32, -1), "imp_ge_zero");
   BranchInst::Create(CallBB, ForwardBB, ImpIsZeroOrPositive, CheckBB);
 
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   // call actual function
   auto ActualFunc = new BitCastInst(Imp, PointerType::getUnqual(MessageFunctionType), "actual_func", CallBB);
   SmallVector<Value*, 10> ActualArgs(Args);
@@ -353,7 +332,6 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   auto CallRet = CallInst::Create(ActualFunc, ActualArgs, "call_ret", CallBB);
   BranchInst::Create(ReturnBB, CallBB);
 
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   // forward to method missing
   // not stret: margs = args, return_storage = margs
   // stret: margs = args.slice(1), return_storage = staddr(= args[0])
@@ -378,7 +356,6 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   auto ForwardRet = CallInst::Create(ForwardingFunc, ForwardingArgs, "forward_ret", ForwardBB);
   BranchInst::Create(ReturnBB, ForwardBB);
 
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   // return
   if(!isVoidReturn) {
     auto Ret = PHINode::Create(CacheImp->getType(), 3, "ret", ReturnBB);
@@ -389,9 +366,6 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   } else {
     ReturnInst::Create(Func->getContext(), ReturnBB);
   }
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
-
-  Func->dump();
   return Func;
 }
 
@@ -451,10 +425,6 @@ Function *ObjcFunction::generateMethodInvokeFunction(Module &M) {
   } else {
     ReturnInst::Create(Func->getContext(), BB);
   }
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
-
-
-  Func->dump();
   return Func;
 }
 
@@ -481,18 +451,9 @@ void ObjcCallVisitor::handleCall(Instruction *CI) {
   std::string Name = F->getName();
   if(!ObjcFunction::isObjcFunction(Name)) return;
 
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
-  errs() << "In function " << CI->getParent()->getParent()->getName() << "()\n";
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
-
-  errs() << Name << "\n";
   ObjcFunction function(Name, CS.getFunctionType(), CI->getParent()->getModule());
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
   funcs[function].push_back(CI);
-  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
-
-  errs() << function.getFullName() << "\n";
 }
 
 
