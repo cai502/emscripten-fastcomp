@@ -51,20 +51,28 @@ namespace {
 
   class ObjcFunction {
   public:
-    ObjcFunction(std::string Name, FunctionType *MessageFunctionType) :Name(Name), MessageFunctionType(MessageFunctionType) {};
+    ObjcFunction(std::string Name, FunctionType *MessageFunctionType, Module *M);
     ObjcFunction(const ObjcFunction& other) :Name(other.Name), MessageFunctionType(other.MessageFunctionType) {};
     ~ObjcFunction() {};
 
     bool operator<(const ObjcFunction &right) const {return getFullName() < right.getFullName();}
     std::string getFullName(void) const;
     std::string getSignature(void) const;
+    bool isObjcFunction(void) const;
+    bool isObjcMsgSend(void) const;
+    bool isObjcMsgSendSuper(void) const;
+    bool isObjcMsgSendSuper2(void) const;
+    bool isMethodInvoke(void) const;
+    bool isStret(void) const;
 
     static char getFunctionSignatureLetter(Type *T);
     static bool isObjcFunction(std::string &Name);
     Function *generateFunction(Module &M);
-  protected:
+  private:
     std::string Name;
     FunctionType *MessageFunctionType;
+    Function *generateMsgSendFunction(Module &M);
+    Function *generateMethodInvokeFunction(Module &M);
   };
 
   class ObjcCallVisitor: public InstVisitor<ObjcCallVisitor> {
@@ -92,13 +100,47 @@ bool GenObjcFuncs::runOnModule(Module &M) {
 
   for(auto I = funcs.begin(), E = funcs.end(); I != E; ++I) {
     ObjcFunction func = I->first;
-    func.generateFunction(M);
+    Function *F = func.generateFunction(M);
+    std::vector<Instruction*> Instructions = I->second;
+    for(auto CI = Instructions.begin(), CE = Instructions.end(); CI != CE; ++CI) {
+    }
   }
 
-  // 1. funcs -> generate Function
   // 2. replace CI's CalledValue with generated Fucntion
   // 3. erase old functions
   return false;
+}
+
+ObjcFunction::ObjcFunction(std::string Name, FunctionType *FT, Module *M) :Name(Name) {
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+
+  Type *I8 = Type::getInt8PtrTy(M->getContext());
+
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+  SmallVector<Type*, 10> Args;
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+  auto I = FT->param_begin(), E = FT->param_end();
+  int copyNum = isStret() ? 3 : 2;
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+  for(int i = 0; i < copyNum; i++) {
+    Args.push_back(*I++);
+  }
+  for(; I != E; ++I) {
+    Type *T = *I;
+    if(T->isPointerTy()) {
+      Args.push_back(I8);
+    } else {
+      Args.push_back(T);
+    }
+  }
+  for(Type *t: Args) {
+    t->dump();
+  }
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+
+  MessageFunctionType = FunctionType::get(FT->getReturnType(), Args, false);
+  MessageFunctionType->dump();
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 }
 
 std::string ObjcFunction::getFullName(void) const {
@@ -145,20 +187,43 @@ bool ObjcFunction::isObjcFunction(std::string &Name) {
     || Name.compare(0, OBJC_METHOD_INVOKE.length(), OBJC_METHOD_INVOKE) == 0;
 }
 
-Function *ObjcFunction::generateFunction(Module &M) {
-  Function* Func = Function::Create(MessageFunctionType, GlobalValue::InternalLinkage, getFullName(), &M);
-  SmallVector<Value*, 10> Args;
-  for(auto I = Func->arg_begin(), E = Func->arg_end(); I != E; ++I) {
-    I->setName("arg");
-    Args.push_back(&*I);
-  }
-  Argument *Self = cast<Argument>(Args[0]);
-  Self->setName("self");
-  Argument *Sel = cast<Argument>(Args[1]);
-  Sel->setName("sel");
 
+bool ObjcFunction::isObjcMsgSend(void) const {
+  return Name == OBJC_MSG_SEND || Name == (OBJC_MSG_SEND+"_stret");
+}
+
+bool ObjcFunction::isObjcMsgSendSuper(void) const {
+  return Name == OBJC_MSG_SEND_SUPER || Name == (OBJC_MSG_SEND_SUPER+"_stret");
+}
+
+bool ObjcFunction::isObjcMsgSendSuper2(void) const {
+  return Name == OBJC_MSG_SEND_SUPER2 || Name == (OBJC_MSG_SEND_SUPER2+"_stret");
+}
+
+bool ObjcFunction::isMethodInvoke(void) const {
+  return Name == OBJC_METHOD_INVOKE || Name == (OBJC_METHOD_INVOKE+"_stret");
+}
+
+bool ObjcFunction::isStret(void) const {
+  return Name.find("_stret") != std::string::npos;
+}
+
+Function *ObjcFunction::generateFunction(Module &M) {
+  if(isMethodInvoke()) {
+    return generateMethodInvokeFunction(M);
+  } else {
+    return generateMsgSendFunction(M);
+  }
+}
+
+Function *ObjcFunction::generateMsgSendFunction(Module &M) {
+  errs() << "generateMsgSendFunction:" << Name << "\n";
+  Function* Func = Function::Create(MessageFunctionType, GlobalValue::InternalLinkage, getFullName(), &M);
+
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   bool isVoidReturn = MessageFunctionType->getReturnType()->isVoidTy();
 
+  // Prepare blocks
   BasicBlock *EntryBB   = BasicBlock::Create(Func->getContext(), "", Func);
   BasicBlock *CacheBB   = BasicBlock::Create(Func->getContext(), "Cache", Func);
   BasicBlock *LookupBB  = BasicBlock::Create(Func->getContext(), "Lookup", Func);
@@ -167,49 +232,161 @@ Function *ObjcFunction::generateFunction(Module &M) {
   BasicBlock *ForwardBB = BasicBlock::Create(Func->getContext(), "Foward", Func);
   BasicBlock *ReturnBB  = BasicBlock::Create(Func->getContext(), "Return", Func);
 
+  // common Type
   Type *I32 = Type::getInt32Ty(Func->getContext());
+  Value *Index1[] = {ConstantInt::get(I32, 1)};
+  Value *Index00[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, 0)};
+  Value *Index01[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, 1)};
 
-  auto SelfIsNull = new ICmpInst(*EntryBB, CmpInst::ICMP_EQ, Self, ConstantInt::get(I32, 0), "self_is_null");
-  BranchInst::Create(ReturnBB, CacheBB, SelfIsNull, EntryBB);
+  // Setup arguments
+  SmallVector<Value*, 10> Args;
+  for(auto &Arg: Func->args()) {
+    Arg.setName("arg");
+    Args.push_back(&Arg);
+  }
 
-  auto SelfIsa = new BitCastInst(Self, PointerType::getUnqual(Self->getType()), "self_isa", CacheBB);
-  auto Cls = new LoadInst(SelfIsa, "cls", CacheBB);
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+  auto ArgIter = Func->arg_begin();
+  Argument *FisrtArg = &*ArgIter++;
+  Argument *SecondArg = &*ArgIter++;
+  Argument *ThirdArg = isStret() ? &*ArgIter : nullptr;
+
+  Value *Self, *ObjcSuper, *StAddr, *Sel;
+
+  if(isObjcMsgSend()) {
+    if(!isStret()) {
+      FisrtArg->setName("self");
+      SecondArg->setName("sel");
+      Self = FisrtArg;
+      Sel = SecondArg;
+    } else {
+      FisrtArg->setName("staddr");
+      SecondArg->setName("self");
+      ThirdArg->setName("sel");
+      StAddr = FisrtArg;
+      Self = SecondArg;
+      Sel = ThirdArg;
+    }
+  } else { // Super or Super2
+    if(!isStret()) {
+      FisrtArg->setName("objcSuper");
+      SecondArg->setName("sel");
+      ObjcSuper = FisrtArg;
+      Sel = SecondArg;
+    } else {
+      FisrtArg->setName("staddr");
+      SecondArg->setName("objcSuper");
+      ThirdArg->setName("sel");
+      StAddr = FisrtArg;
+      ObjcSuper = SecondArg;
+      Sel = ThirdArg;
+    }
+  }
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+
+  // Function body
+
+  // check self is not null
+  if(isObjcMsgSend()) {
+    auto SelfIsNull = new ICmpInst(*EntryBB, CmpInst::ICMP_EQ, Self, ConstantInt::get(I32, 0), "self_is_null");
+    BranchInst::Create(ReturnBB, CacheBB, SelfIsNull, EntryBB);
+  } else {
+    BranchInst::Create(CacheBB, EntryBB);
+  }
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+
+  // get class
+  Value *Cls;
+  if(isObjcMsgSend()) {
+    auto SelfIsa = new BitCastInst(Self, PointerType::getUnqual(Self->getType()), "self.isa", CacheBB);
+    Cls = new LoadInst(SelfIsa, "cls", CacheBB);
+  } else if(isObjcMsgSendSuper()) {
+    auto ObjcSuperSelf = GetElementPtrInst::CreateInBounds(ObjcSuper, Index00, "objcSuper.self", CacheBB);
+    Self = new LoadInst(ObjcSuperSelf, "self", CacheBB);
+
+    auto ObjcSuperCls = GetElementPtrInst::CreateInBounds(ObjcSuper, Index01, "objcSuper.cls", CacheBB);
+    Cls = new LoadInst(ObjcSuperCls, "supercls", CacheBB);
+  } else if(isObjcMsgSendSuper2()) {
+    auto ObjcSuperSelf = GetElementPtrInst::CreateInBounds(ObjcSuper, Index00, "objcSuper.self", CacheBB);
+    Self = new LoadInst(ObjcSuperSelf, "self", CacheBB);
+
+    auto ObjcSuperCls = GetElementPtrInst::CreateInBounds(ObjcSuper, Index01, "objcSuper.cls", CacheBB);
+    auto MyClsAddr = new BitCastInst(ObjcSuperCls, PointerType::getUnqual(ObjcSuperCls->getType()), "cls_addr", CacheBB);
+    auto MyCls = new LoadInst(MyClsAddr, "cls", CacheBB);
+
+    auto SuperClsAddr = GetElementPtrInst::CreateInBounds(MyCls, Index1, "cls.super", CacheBB);
+    Cls = new LoadInst(SuperClsAddr, "supercls", CacheBB);
+  } else {
+    llvm_unreachable("Unexpected function type");
+  }
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+
+  // call cache_getImp
   auto CacheGetImpFunc = Func->getParent()->getFunction("cache_getImp");
   Value *CacheGetImpArgs[] = { Cls, Sel };
-
   auto CacheImp = CallInst::Create(CacheGetImpFunc, CacheGetImpArgs, "cache_imp", CacheBB);
   auto CacheImpIsNull = new ICmpInst(*CacheBB, CmpInst::ICMP_EQ, CacheImp, ConstantInt::get(I32, 0), "cache_imp_is_null");
   BranchInst::Create(LookupBB, CheckBB, CacheImpIsNull, CacheBB);
 
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+  // call _class_lookupMethodAndLoadCache3
   auto LookupFunc = Func->getParent()->getFunction("_class_lookupMethodAndLoadCache3");
   Value *LookupArgs[] = { Self, Sel, Cls };
   auto LookupImp = CallInst::Create(LookupFunc, LookupArgs, "lookup_imp", LookupBB);
   BranchInst::Create(CheckBB, LookupBB);
 
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+  // check imp is not negative
   auto Imp = PHINode::Create(CacheImp->getType(), 2, "imp", CheckBB);
   Imp->addIncoming(CacheImp, CacheBB);
   Imp->addIncoming(LookupImp, LookupBB);
   auto ImpIsZeroOrPositive = new ICmpInst(*CheckBB, CmpInst::ICMP_SGT, Imp, ConstantInt::get(I32, -1), "imp_ge_zero");
   BranchInst::Create(CallBB, ForwardBB, ImpIsZeroOrPositive, CheckBB);
 
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+  // call actual function
   auto ActualFunc = new BitCastInst(Imp, PointerType::getUnqual(MessageFunctionType), "actual_func", CallBB);
-  auto CallRet = CallInst::Create(ActualFunc, Args, "call_ret", CallBB);
+  SmallVector<Value*, 10> ActualArgs(Args);
+  if(!isObjcMsgSend()) {
+    if(!isStret()) {
+      ActualArgs[0] = Self;
+    } else {
+      ActualArgs[1] = Self;
+    }
+  }
+  auto CallRet = CallInst::Create(ActualFunc, ActualArgs, "call_ret", CallBB);
   BranchInst::Create(ReturnBB, CallBB);
 
-  auto Margs = new AllocaInst(ArrayType::get(Self->getType(), Args.size()), "margs", ForwardBB);
-  Value *Indexes[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, 0)};
-  auto ReturnStorage = GetElementPtrInst::CreateInBounds(Margs, Indexes, "return_storage", ForwardBB);
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+  // forward to method missing
+  // not stret: margs = args, return_storage = margs
+  // stret: margs = args.slice(1), return_storage = staddr(= args[0])
+  auto Margs = new AllocaInst(ArrayType::get(Self->getType(), isStret() ? Args.size()-1 : Args.size()), "margs", ForwardBB);
+  Value *ReturnStorage;
+  if(!isStret()) {
+    Value *Indexes[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, 0)};
+    ReturnStorage = GetElementPtrInst::CreateInBounds(Margs, Indexes, "return_storage", ForwardBB);
+  } else {
+    ReturnStorage = StAddr;
+  }
+  auto ForwardArgBegin = Args.begin();
+  if(isStret()) {
+    ForwardArgBegin++;
+  }
   int i = 0;
-  for(auto I = Args.begin(), E = Args.end(); I != E; ++I, ++i) {
+  for(Value *Arg: SmallVector<Value*,0>(ForwardArgBegin, Args.end())) {
     Value *Indexes[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, i)};
     auto Ptr = GetElementPtrInst::CreateInBounds(Margs, Indexes, "ptr", ForwardBB);
-    new StoreInst(*I, Ptr, ForwardBB);
+    new StoreInst(Arg, Ptr, ForwardBB);
+    i++;
   }
   auto ForwardingFunc = Func->getParent()->getFunction("___forwarding___");
   Value *ForwardingArgs[] = {Margs, ReturnStorage};
   auto ForwardRet = CallInst::Create(ForwardingFunc, ForwardingArgs, "forward_ret", ForwardBB);
   BranchInst::Create(ReturnBB, ForwardBB);
 
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
+  // return
   if(!isVoidReturn) {
     auto Ret = PHINode::Create(CacheImp->getType(), 3, "ret", ReturnBB);
     Ret->addIncoming(ConstantInt::get(I32, 0), EntryBB);
@@ -219,9 +396,14 @@ Function *ObjcFunction::generateFunction(Module &M) {
   } else {
     ReturnInst::Create(Func->getContext(), ReturnBB);
   }
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
   Func->dump();
   return Func;
+}
+
+Function *ObjcFunction::generateMethodInvokeFunction(Module &M) {
+  return nullptr;
 }
 
 void ObjcCallVisitor::visitCallInst(CallInst &CI) {
@@ -247,11 +429,16 @@ void ObjcCallVisitor::handleCall(Instruction *CI) {
   std::string Name = F->getName();
   if(!ObjcFunction::isObjcFunction(Name)) return;
 
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
   errs() << "In function " << CI->getParent()->getParent()->getName() << "()\n";
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
-  ObjcFunction function(Name, CS.getFunctionType());
+  errs() << Name << "\n";
+  ObjcFunction function(Name, CS.getFunctionType(), CI->getParent()->getModule());
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
   funcs[function].push_back(CI);
+  errs() << __FUNCTION__ << ":" << __LINE__ << "\n";
 
   errs() << function.getFullName() << "\n";
 }
