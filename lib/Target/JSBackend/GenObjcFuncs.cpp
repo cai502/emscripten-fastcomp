@@ -47,6 +47,8 @@ namespace {
     }
 
     virtual bool runOnModule(Module &M);
+    void removeFunctions(Module &M);
+    void removeFunctionIfExist(Module &M, std::string Name);
   };
 
   class ObjcFunction {
@@ -112,8 +114,27 @@ bool GenObjcFuncs::runOnModule(Module &M) {
     }
   }
 
-  // TODO erase old functions
+  removeFunctions(M);
+
   return true;
+}
+
+void GenObjcFuncs::removeFunctions(Module &M) {
+  removeFunctionIfExist(M, OBJC_MSG_SEND);
+  removeFunctionIfExist(M, OBJC_MSG_SEND_SUPER);
+  removeFunctionIfExist(M, OBJC_MSG_SEND_SUPER2);
+  removeFunctionIfExist(M, OBJC_METHOD_INVOKE);
+  removeFunctionIfExist(M, OBJC_MSG_SEND+"_stret");
+  removeFunctionIfExist(M, OBJC_MSG_SEND_SUPER+"_stret");
+  removeFunctionIfExist(M, OBJC_MSG_SEND_SUPER2+"_stret");
+  removeFunctionIfExist(M, OBJC_METHOD_INVOKE+"_stret");
+}
+
+void GenObjcFuncs::removeFunctionIfExist(Module &M, std::string Name) {
+  auto F = M.getFunction(Name);
+  if(F) {
+    F->eraseFromParent();
+  }
 }
 
 ObjcFunction::ObjcFunction(std::string Name, FunctionType *FT, Module *M) :Name(Name) {
