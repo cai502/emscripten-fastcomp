@@ -64,6 +64,10 @@ namespace {
     bool isObjcMsgSendSuper2(void) const;
     bool isMethodInvoke(void) const;
     bool isStret(void) const;
+    Function *getCacheGetImpFunction(Module &M);
+    Function *getLookupMethodAndLoadCache3Functions(Module &M);
+    Function *getForwardingFunction(Module &M);
+    Function *getAbortFunction(Module &M);
 
     static char getFunctionSignatureLetter(Type *T);
     static bool isObjcFunction(std::string &Name);
@@ -116,10 +120,18 @@ ObjcFunction::ObjcFunction(std::string Name, FunctionType *FT, Module *M) :Name(
   Type *I8 = Type::getInt8PtrTy(M->getContext());
 
   SmallVector<Type*, 10> Args;
-  int i = 0, keep = isStret() ? 3 : 2;
+  int i = 0;
   for(auto I = FT->param_begin(), E = FT->param_end(); I != E; ++i, ++I) {
     Type *T = *I;
-    if(((isStret() && i == 0) || i > keep) && T->isPointerTy()) {
+
+    // keep objcSuper
+    bool keep = false;
+    if(isObjcMsgSendSuper() || isObjcMsgSendSuper2()) {
+      if(!isStret() && i == 0) keep = true;
+      if(isStret() && i == 1) keep = true;
+    }
+
+    if(!keep && T->isPointerTy()) {
       Args.push_back(I8);
     } else {
       Args.push_back(T);
@@ -192,6 +204,51 @@ bool ObjcFunction::isMethodInvoke(void) const {
 
 bool ObjcFunction::isStret(void) const {
   return Name.find("_stret") != std::string::npos;
+}
+
+Function *ObjcFunction::getCacheGetImpFunction(Module &M) {
+  auto F = M.getFunction("cache_getImp");
+  if(!F) {
+    Type *I8 = Type::getInt8PtrTy(M.getContext());
+    Type *Args[] = { I8, I8 };
+    auto VoidFuncType = FunctionType::get(Type::getVoidTy(M.getContext()), false);
+    auto CacheGetImpFuncType = FunctionType::get(VoidFuncType, Args, false);
+    F = Function::Create(CacheGetImpFuncType, GlobalValue::ExternalLinkage, "cache_getImp", &M);
+  }
+  return F;
+}
+
+Function *ObjcFunction::getLookupMethodAndLoadCache3Functions(Module &M) {
+  auto F = M.getFunction("_class_lookupMethodAndLoadCache3");
+  if(!F) {
+    Type *I8 = Type::getInt8PtrTy(M.getContext());
+    Type *Args[] = { I8, I8, I8 };
+    auto VoidFuncType = FunctionType::get(Type::getVoidTy(M.getContext()), false);
+    auto LookupFuncType = FunctionType::get(VoidFuncType, Args, false);
+    F = Function::Create(LookupFuncType, GlobalValue::ExternalLinkage, "_class_lookupMethodAndLoadCache3", &M);
+  }
+  return F;
+}
+
+Function *ObjcFunction::getForwardingFunction(Module &M) {
+  auto F = M.getFunction("__forwarding__");
+  if(!F) {
+    Type *I8 = Type::getInt8PtrTy(M.getContext());
+    Type *Args[] = { I8, I8 };
+    auto CacheGetImpFuncType = FunctionType::get(I8, Args, false);
+    F = Function::Create(CacheGetImpFuncType, GlobalValue::ExternalLinkage, "cache_getImp", &M);
+  }
+  return F;
+}
+
+Function *ObjcFunction::getAbortFunction(Module &M) {
+  auto F = M.getFunction("abort");
+  if(!F) {
+    auto VoidFuncType = FunctionType::get(Type::getVoidTy(M.getContext()), false);
+    F = Function::Create(VoidFuncType, GlobalValue::ExternalLinkage, "abort", &M);
+    F->addFnAttr(Attribute::NoReturn);
+  }
+  return F;
 }
 
 Function *ObjcFunction::generateFunction(Module &M) {
@@ -305,14 +362,14 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   }
 
   // call cache_getImp
-  auto CacheGetImpFunc = Func->getParent()->getFunction("cache_getImp");
+  auto CacheGetImpFunc = getCacheGetImpFunction(M);
   Value *CacheGetImpArgs[] = { Cls, Sel };
   auto CacheImp = CallInst::Create(CacheGetImpFunc, CacheGetImpArgs, "cache_imp", CacheBB);
   auto CacheImpIsNull = new ICmpInst(*CacheBB, CmpInst::ICMP_EQ, CacheImp, ConstantInt::get(I32, 0), "cache_imp_is_null");
   BranchInst::Create(LookupBB, CheckBB, CacheImpIsNull, CacheBB);
 
   // call _class_lookupMethodAndLoadCache3
-  auto LookupFunc = Func->getParent()->getFunction("_class_lookupMethodAndLoadCache3");
+  auto LookupFunc = getLookupMethodAndLoadCache3Functions(M);
   Value *LookupArgs[] = { Self, Sel, Cls };
   auto LookupImp = CallInst::Create(LookupFunc, LookupArgs, "lookup_imp", LookupBB);
   BranchInst::Create(CheckBB, LookupBB);
@@ -356,7 +413,7 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
     new StoreInst(Arg, Ptr, ForwardBB);
     i++;
   }
-  auto ForwardingFunc = Func->getParent()->getFunction("___forwarding___");
+  auto ForwardingFunc = getForwardingFunction(M);
   Value *ForwardingArgs[] = {Margs, ReturnStorage};
   auto Target = CallInst::Create(ForwardingFunc, ForwardingArgs, "target", ForwardBB);
   auto TargetIsNull = new ICmpInst(*ForwardBB, CmpInst::ICMP_EQ, Target, ConstantInt::get(I32, 0), "target_is_null");
@@ -364,7 +421,7 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
 
   // Call objc_msgSend with setting target as self
   // TODO implement
-  auto AbortFunc = Func->getParent()->getFunction("abort");
+  auto AbortFunc = getAbortFunction(M);
   CallInst::Create(AbortFunc, "", RetargetBB);
   new UnreachableInst(Func->getContext(), RetargetBB);
 
@@ -426,14 +483,14 @@ Function *ObjcFunction::generateMethodInvokeFunction(Module &M) {
     ThirdArg->setName("method");
     Method = ThirdArg;
   }
+  Type *I8 = Type::getInt8PtrTy(Func->getContext());
+  auto Meth = new BitCastInst(Method, PointerType::getUnqual(I8), "method.sel", BB);
+  auto Sel = new LoadInst(Meth, "sel", BB);
+  assert(Sel);
 
   Type *I32 = Type::getInt32Ty(Func->getContext());
-  Value *Index00[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, 0)};
-  auto SelAddr = GetElementPtrInst::CreateInBounds(Method, Index00, "method.sel", BB);
-  auto Sel = new LoadInst(SelAddr, "sel", BB);
-  assert(Sel);
-  Value *Index02[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, 2)};
-  auto ImpAddr = GetElementPtrInst::CreateInBounds(Method, Index02, "method.imp", BB);
+  Value *Index2[] = {ConstantInt::get(I32, 2)};
+  auto ImpAddr = GetElementPtrInst::CreateInBounds(Meth, Index2, "method.imp", BB);
   auto Imp = new LoadInst(ImpAddr, "imp", BB);
   assert(Imp);
 
