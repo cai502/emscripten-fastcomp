@@ -212,7 +212,7 @@ Function *ObjcFunction::getCacheGetImpFunction(Module &M) {
     Type *I8 = Type::getInt8PtrTy(M.getContext());
     Type *Args[] = { I8, I8 };
     auto VoidFuncType = FunctionType::get(Type::getVoidTy(M.getContext()), false);
-    auto CacheGetImpFuncType = FunctionType::get(VoidFuncType, Args, false);
+    auto CacheGetImpFuncType = FunctionType::get(PointerType::getUnqual(VoidFuncType), Args, false);
     F = Function::Create(CacheGetImpFuncType, GlobalValue::ExternalLinkage, "cache_getImp", &M);
   }
   return F;
@@ -224,7 +224,7 @@ Function *ObjcFunction::getLookupMethodAndLoadCache3Functions(Module &M) {
     Type *I8 = Type::getInt8PtrTy(M.getContext());
     Type *Args[] = { I8, I8, I8 };
     auto VoidFuncType = FunctionType::get(Type::getVoidTy(M.getContext()), false);
-    auto LookupFuncType = FunctionType::get(VoidFuncType, Args, false);
+    auto LookupFuncType = FunctionType::get(PointerType::getUnqual(VoidFuncType), Args, false);
     F = Function::Create(LookupFuncType, GlobalValue::ExternalLinkage, "_class_lookupMethodAndLoadCache3", &M);
   }
   return F;
@@ -236,7 +236,7 @@ Function *ObjcFunction::getForwardingFunction(Module &M) {
     Type *I8 = Type::getInt8PtrTy(M.getContext());
     Type *Args[] = { I8, I8 };
     auto CacheGetImpFuncType = FunctionType::get(I8, Args, false);
-    F = Function::Create(CacheGetImpFuncType, GlobalValue::ExternalLinkage, "cache_getImp", &M);
+    F = Function::Create(CacheGetImpFuncType, GlobalValue::ExternalLinkage, "__forwarding__", &M);
   }
   return F;
 }
