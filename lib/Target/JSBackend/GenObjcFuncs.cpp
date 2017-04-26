@@ -352,7 +352,7 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
 
   // check self is not null
   if(isObjcMsgSend()) {
-    auto SelfIsNull = new ICmpInst(*EntryBB, CmpInst::ICMP_EQ, Self, ConstantInt::get(I32, 0), "self_is_null");
+    auto SelfIsNull = new ICmpInst(*EntryBB, CmpInst::ICMP_EQ, Self, ConstantExpr::getBitCast(ConstantInt::get(I32, 0), Self->getType()), "self_is_null");
     BranchInst::Create(ReturnBB, CacheBB, SelfIsNull, EntryBB);
   } else {
     BranchInst::Create(CacheBB, EntryBB);
@@ -434,13 +434,19 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   int i = 0;
   for(Value *Arg: SmallVector<Value*,0>(ForwardArgBegin, ActualArgs.end())) {
     Value *Indexes[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, i)};
-    auto Ptr = GetElementPtrInst::CreateInBounds(Margs, Indexes, "ptr", ForwardBB);
+    Value* Ptr = GetElementPtrInst::CreateInBounds(Margs, Indexes, "ptr", ForwardBB);
+    auto ArgPointerType = PointerType::getUnqual(Arg->getType());
+    if(ArgPointerType != Ptr->getType()) {
+      Ptr = new BitCastInst(Ptr, ArgPointerType, "", ForwardBB);
+    }
     new StoreInst(Arg, Ptr, ForwardBB);
     i++;
   }
   auto ForwardingFunc = getForwardingFunction(M);
   Value *ForwardingArgs[] = {Margs, ReturnStorage};
-  auto Target = CallInst::Create(ForwardingFunc, ForwardingArgs, "target", ForwardBB);
+  Type *ForwardingArgsType[] = {Margs->getType(), ReturnStorage->getType()};
+  auto ForwardingFuncType = PointerType::getUnqual(FunctionType::get(ForwardingFunc->getReturnType(), ForwardingArgsType, false));
+  auto Target = CallInst::Create(ConstantExpr::getBitCast(ForwardingFunc, ForwardingFuncType), ForwardingArgs, "target", ForwardBB);
   auto TargetIsNull = new ICmpInst(*ForwardBB, CmpInst::ICMP_EQ, Target, ConstantExpr::getBitCast(ConstantInt::get(I32, 0), Target->getType()), "target_is_null");
   BranchInst::Create(isVoidReturn ? ReturnBB : ForwardReturnBB, RetargetBB, TargetIsNull, ForwardBB);
 
@@ -459,17 +465,11 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
     // return
     auto Ret = PHINode::Create(ReturnType, 3, "ret", ReturnBB);
 
-    Type *T = ReturnType;
 
-    Value *ZeroValue;
-    if (T->isFloatingPointTy()) {
-      ZeroValue = ConstantFP::get(T, 0.0);
-    } else if (T->isIntegerTy()) {
-      ZeroValue = ConstantInt::get(T, 0);
-    } else {
-      ZeroValue = ConstantInt::get(I32, 0);
+    if(isObjcMsgSend()) {
+      auto ZeroValue = ConstantExpr::getBitCast(ConstantInt::get(I32, 0), ReturnType);
+      Ret->addIncoming(ZeroValue, EntryBB);
     }
-    Ret->addIncoming(ZeroValue, EntryBB);
     Ret->addIncoming(CallRet, CallBB);
     Ret->addIncoming(ForwardRet, ForwardReturnBB);
     ReturnInst::Create(Func->getContext(), Ret, ReturnBB);
