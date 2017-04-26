@@ -110,7 +110,8 @@ bool GenObjcFuncs::runOnModule(Module &M) {
     std::vector<Instruction*> Instructions = I->second;
     for(auto CI = Instructions.begin(), CE = Instructions.end(); CI != CE; ++CI) {
       CallSite CS(*CI);
-      CS.setCalledFunction(F);
+      auto CF = ConstantExpr::getBitCast(F, PointerType::getUnqual(CS.getFunctionType()));
+      CS.setCalledFunction(CF);
     }
   }
 
