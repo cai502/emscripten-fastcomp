@@ -387,7 +387,7 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   auto CacheGetImpFunc = getCacheGetImpFunction(M);
   Value *CacheGetImpArgs[] = { Cls, Sel };
   auto CacheImp = CallInst::Create(CacheGetImpFunc, CacheGetImpArgs, "cache_imp", CacheBB);
-  auto CacheImpIsNull = new ICmpInst(*CacheBB, CmpInst::ICMP_EQ, CacheImp, ConstantInt::get(I32, 0), "cache_imp_is_null");
+  auto CacheImpIsNull = new ICmpInst(*CacheBB, CmpInst::ICMP_EQ, CacheImp, ConstantExpr::getBitCast(ConstantInt::get(I32, 0), CacheImp->getType()), "cache_imp_is_null");
   BranchInst::Create(LookupBB, CheckBB, CacheImpIsNull, CacheBB);
 
   // call _class_lookupMethodAndLoadCache3
@@ -400,19 +400,22 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   auto Imp = PHINode::Create(CacheImp->getType(), 2, "imp", CheckBB);
   Imp->addIncoming(CacheImp, CacheBB);
   Imp->addIncoming(LookupImp, LookupBB);
-  auto ImpIsZeroOrPositive = new ICmpInst(*CheckBB, CmpInst::ICMP_SGT, Imp, ConstantInt::get(I32, -1), "imp_ge_zero");
+  auto ImpIsZeroOrPositive = new ICmpInst(*CheckBB, CmpInst::ICMP_SGE, Imp, ConstantExpr::getBitCast(ConstantInt::get(I32, 0), Imp->getType()), "imp_ge_zero");
   BranchInst::Create(CallBB, ForwardBB, ImpIsZeroOrPositive, CheckBB);
 
   // call actual function
-  auto ActualFunc = new BitCastInst(Imp, PointerType::getUnqual(MessageFunctionType), "actual_func", CallBB);
   SmallVector<Value*, 10> ActualArgs(Args);
+  SmallVector<Type*, 10> ActualArgTypes(MessageFunctionType->param_begin(), MessageFunctionType->param_end());
   if(!isObjcMsgSend()) {
     if(!isStret()) {
       ActualArgs[0] = Self;
+      ActualArgTypes[0] = Self->getType();
     } else {
       ActualArgs[1] = Self;
+      ActualArgTypes[1] = Self->getType();
     }
   }
+  auto ActualFunc = new BitCastInst(Imp, PointerType::getUnqual(FunctionType::get(MessageFunctionType->getReturnType(), ActualArgTypes, false)), "actual_func", CallBB);
   auto CallRet = CallInst::Create(ActualFunc, ActualArgs, isVoidReturn ? "" : "call_ret", CallBB);
   BranchInst::Create(ReturnBB, CallBB);
 
@@ -438,7 +441,7 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   auto ForwardingFunc = getForwardingFunction(M);
   Value *ForwardingArgs[] = {Margs, ReturnStorage};
   auto Target = CallInst::Create(ForwardingFunc, ForwardingArgs, "target", ForwardBB);
-  auto TargetIsNull = new ICmpInst(*ForwardBB, CmpInst::ICMP_EQ, Target, ConstantInt::get(I32, 0), "target_is_null");
+  auto TargetIsNull = new ICmpInst(*ForwardBB, CmpInst::ICMP_EQ, Target, ConstantExpr::getBitCast(ConstantInt::get(I32, 0), Target->getType()), "target_is_null");
   BranchInst::Create(isVoidReturn ? ReturnBB : ForwardReturnBB, RetargetBB, TargetIsNull, ForwardBB);
 
   // Call objc_msgSend with setting target as self
