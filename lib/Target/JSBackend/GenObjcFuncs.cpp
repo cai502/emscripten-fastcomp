@@ -413,7 +413,7 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
       ActualArgs[1] = Self;
     }
   }
-  auto CallRet = CallInst::Create(ActualFunc, ActualArgs, "call_ret", CallBB);
+  auto CallRet = CallInst::Create(ActualFunc, ActualArgs, isVoidReturn ? "" : "call_ret", CallBB);
   BranchInst::Create(ReturnBB, CallBB);
 
   // forward to method missing
@@ -527,7 +527,7 @@ Function *ObjcFunction::generateMethodInvokeFunction(Module &M) {
   }
 
   auto InvokedFunc = new BitCastInst(Imp, PointerType::getUnqual(FunctionType::get(MessageFunctionType->getReturnType(), InvokeArgTypes, false)), "func", BB);
-  auto Ret = CallInst::Create(InvokedFunc, InvokeArgs, "ret", BB);
+  auto Ret = CallInst::Create(InvokedFunc, InvokeArgs, isVoidReturn ? "" : "ret", BB);
   if(!isVoidReturn) {
     ReturnInst::Create(Func->getContext(), Ret, BB);
   } else {
