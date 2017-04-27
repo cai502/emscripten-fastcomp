@@ -256,12 +256,12 @@ Function *ObjcFunction::getLookupMethodAndLoadCache3Functions(Module &M) {
 }
 
 Function *ObjcFunction::getForwardingFunction(Module &M) {
-  auto F = M.getFunction("__forwarding__");
+  auto F = M.getFunction("___forwarding___");
   if(!F) {
     Type *I8 = Type::getInt8PtrTy(M.getContext());
     Type *Args[] = { I8, I8 };
     auto CacheGetImpFuncType = FunctionType::get(I8, Args, false);
-    F = Function::Create(CacheGetImpFuncType, GlobalValue::ExternalLinkage, "__forwarding__", &M);
+    F = Function::Create(CacheGetImpFuncType, GlobalValue::ExternalLinkage, "___forwarding___", &M);
   }
   return F;
 }
