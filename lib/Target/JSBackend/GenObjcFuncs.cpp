@@ -31,6 +31,8 @@
 
 #include "llvm/Support/raw_ostream.h"
 
+#define DEBUG_TYPE "gen_objc_funcs"
+
 using namespace llvm;
 
 namespace {
@@ -299,6 +301,7 @@ Type *ObjcFunction::getInvokedFunctionType(void) {
 }
 
 Function *ObjcFunction::generateFunction(Module &M) {
+  DEBUG(dbgs() << "generateFunction: " << getFullName() << "\n");
   if(isMethodInvoke()) {
     return generateMethodInvokeFunction(M);
   } else {
@@ -494,7 +497,7 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
   } else {
     ReturnInst::Create(Func->getContext(), ReturnBB);
   }
-  // Func->dump();
+  DEBUG(Func->dump());
   return Func;
 }
 
@@ -546,6 +549,7 @@ Function *ObjcFunction::generateMethodInvokeFunction(Module &M) {
   } else {
     ReturnInst::Create(Func->getContext(), BB);
   }
+  DEBUG(Func->dump());
   return Func;
 }
 
