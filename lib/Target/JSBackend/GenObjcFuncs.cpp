@@ -70,6 +70,7 @@ namespace {
     Function *getLookupMethodAndLoadCache3Functions(Module &M);
     Function *getForwardingFunction(Module &M);
     Function *getAbortFunction(Module &M);
+    Type *getInvokedFunctionType(void);
 
     static char getFunctionSignatureLetter(Type *T);
     static bool isObjcFunction(std::string &Name);
@@ -273,6 +274,30 @@ Function *ObjcFunction::getAbortFunction(Module &M) {
   return F;
 }
 
+// objc_msgSuper/Super2:        objcSuper, SEL, ...           -> self, SEL, ...
+// objc_msgSuper/Super2_stret:  staddr, objcSuper, SEL, ...   -> staddr, self, SEL, ...
+// method_invoke:               target, method, ...           -> target, SEL, ...
+// method_invoke_stret:         staddr, target, method, ...   -> staddr, target, SEL, ...
+Type *ObjcFunction::getInvokedFunctionType(void) {
+  FunctionType* FT;
+
+  if(isObjcMsgSend()) {
+    FT = MessageFunctionType;
+  } else {
+    SmallVector<Type*, 10> ArgTypes(MessageFunctionType->param_begin(), MessageFunctionType->param_end());
+    unsigned idx;
+    if(isObjcMsgSendSuper() || isObjcMsgSendSuper2()) {
+      idx = !isStret() ? 0 : 1;
+    } else {
+      idx = !isStret() ? 1 : 2;
+    }
+    ArgTypes[idx] = Type::getInt8PtrTy(MessageFunctionType->getContext());
+    FT = FunctionType::get(MessageFunctionType->getReturnType(), ArgTypes, false);
+  }
+
+  return PointerType::getUnqual(FT);
+}
+
 Function *ObjcFunction::generateFunction(Module &M) {
   if(isMethodInvoke()) {
     return generateMethodInvokeFunction(M);
@@ -405,17 +430,10 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
 
   // call actual function
   SmallVector<Value*, 10> ActualArgs(Args);
-  SmallVector<Type*, 10> ActualArgTypes(MessageFunctionType->param_begin(), MessageFunctionType->param_end());
   if(!isObjcMsgSend()) {
-    if(!isStret()) {
-      ActualArgs[0] = Self;
-      ActualArgTypes[0] = Self->getType();
-    } else {
-      ActualArgs[1] = Self;
-      ActualArgTypes[1] = Self->getType();
-    }
+    ActualArgs[!isStret() ? 0 : 1] = Self;
   }
-  auto ActualFunc = new BitCastInst(Imp, PointerType::getUnqual(FunctionType::get(MessageFunctionType->getReturnType(), ActualArgTypes, false)), "actual_func", CallBB);
+  auto ActualFunc = new BitCastInst(Imp, getInvokedFunctionType(), "actual_func", CallBB);
   auto CallRet = CallInst::Create(ActualFunc, ActualArgs, isVoidReturn ? "" : "call_ret", CallBB);
   BranchInst::Create(ReturnBB, CallBB);
 
@@ -431,7 +449,7 @@ Function *ObjcFunction::generateMsgSendFunction(Module &M) {
     ReturnStorage = StAddr;
     ForwardArgBegin++;
   }
-  int i = 0;
+  unsigned i = 0;
   for(Value *Arg: SmallVector<Value*,0>(ForwardArgBegin, ActualArgs.end())) {
     Value *Indexes[] = {ConstantInt::get(I32, 0), ConstantInt::get(I32, i)};
     Value* Ptr = GetElementPtrInst::CreateInBounds(Margs, Indexes, "ptr", ForwardBB);
@@ -520,16 +538,8 @@ Function *ObjcFunction::generateMethodInvokeFunction(Module &M) {
   assert(Imp);
 
   SmallVector<Value*, 10> InvokeArgs(Args);
-  SmallVector<Type*, 10> InvokeArgTypes(MessageFunctionType->param_begin(), MessageFunctionType->param_end());
-  if(!isStret()) {
-    InvokeArgs[1] = Sel;
-    InvokeArgTypes[1] = Sel->getType();
-  } else {
-    InvokeArgs[2] = Sel;
-    InvokeArgTypes[2] = Sel->getType();
-  }
-
-  auto InvokedFunc = new BitCastInst(Imp, PointerType::getUnqual(FunctionType::get(MessageFunctionType->getReturnType(), InvokeArgTypes, false)), "func", BB);
+  InvokeArgs[!isStret() ? 1 : 2] = Sel;
+  auto InvokedFunc = new BitCastInst(Imp, getInvokedFunctionType(), "func", BB);
   auto Ret = CallInst::Create(InvokedFunc, InvokeArgs, isVoidReturn ? "" : "ret", BB);
   if(!isVoidReturn) {
     ReturnInst::Create(Func->getContext(), Ret, BB);
