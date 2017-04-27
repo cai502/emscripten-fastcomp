@@ -75,6 +75,7 @@ ModulePass *createLowerEmAsyncifyPass();
 ModulePass *createLowerEmExceptionsPass();
 ModulePass *createLowerEmSetjmpPass();
 ModulePass *createNoExitRuntimePass();
+ModulePass *createGenObjcFuncsPass();
 // Emscripten passes end.
 
 //void PNaClABISimplifyAddPreOptPasses(Triple *T, PassManagerBase &PM);

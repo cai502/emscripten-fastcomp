@@ -414,6 +414,7 @@ void initializeLowerEmAsyncifyPass(PassRegistry&);
 void initializeLowerEmExceptionsPass(PassRegistry&);
 void initializeLowerEmSetjmpPass(PassRegistry&);
 void initializeNoExitRuntimePass(PassRegistry&);
+void initializeGenObjcFuncsPass(PassRegistry&);
 // Emscripten passes end.
 // @LOCALMOD-END
 

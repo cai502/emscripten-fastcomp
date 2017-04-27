@@ -228,7 +228,6 @@ namespace {
     NameSet ObjCMessageFuncs; // funcs
     StringMap Redirects; // library function redirects actually used, needed for wrapper funcs in tables
     std::vector<std::string> PostSets;
-    std::map<unsigned, unsigned> RelocationTable;
     NameIntMap NamedGlobals; // globals that we export as metadata to JS, so it can access them by name
     std::map<std::string, unsigned> IndexedFunctions; // name -> index
     FunctionTableMap FunctionTables; // sig => list of functions
@@ -417,9 +416,6 @@ namespace {
         }
       }
     }
-    bool isObjCFunction(const std::string *Name) {
-      return Name && (Name->compare(0, 6, "_OBJC_") == 0 || Name->compare(0, 9, "_objc_msg") == 0);
-    }
     std::string getFunctionSignature(const FunctionType *F) {
       std::string Ret;
       Ret += getFunctionSignatureLetter(F->getReturnType());
@@ -492,8 +488,8 @@ namespace {
       ExtraFunctions.push_back(LegalFunc);
       return LegalName;
     }
-    unsigned getFunctionIndex(const Function *F, const std::string &Alias = std::string("")) {
-      const std::string &Name = Alias.empty() ? getJSName(F) : Alias;
+    unsigned getFunctionIndex(const Function *F) {
+      const std::string &Name = getJSName(F);
       if (IndexedFunctions.find(Name) != IndexedFunctions.end()) return IndexedFunctions[Name];
       FunctionTable& Table = ensureFunctionTable(F->getFunctionType());
       if (NoAliasingFunctionPointers) {
@@ -4686,6 +4682,8 @@ bool JSTargetMachine::addPassesToEmitFile(
 
   PM.add(createEmscriptenRemoveLLVMAssumePass());
   PM.add(createEmscriptenExpandBigSwitchesPass());
+
+  PM.add(createGenObjcFuncsPass());
 
   PM.add(new JSWriter(Out, OptLevel));
 

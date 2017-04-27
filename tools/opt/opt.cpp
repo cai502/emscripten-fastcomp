@@ -398,6 +398,7 @@ int main(int argc, char **argv) {
   initializeInterleavedAccessPass(Registry);
   initializeCountingFunctionInserterPass(Registry);
   initializeUnreachableBlockElimLegacyPassPass(Registry);
+  initializeGenObjcFuncsPass(Registry);
 
 #ifdef LINK_POLLY_INTO_TOOLS
   polly::initializePollyPasses(Registry);

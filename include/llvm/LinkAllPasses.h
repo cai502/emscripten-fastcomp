@@ -48,6 +48,7 @@
 #include "llvm/Transforms/Utils/SymbolRewriter.h"
 #include "llvm/Transforms/Utils/UnifyFunctionExitNodes.h"
 #include "llvm/Transforms/Vectorize.h"
+#include "llvm/Transforms/NaCl.h"
 #include "llvm/Support/Valgrind.h"
 #include <cstdlib>
 
@@ -203,6 +204,7 @@ namespace {
       (void) llvm::createMemDerefPrinter();
       (void) llvm::createFloat2IntPass();
       (void) llvm::createEliminateAvailableExternallyPass();
+      (void) llvm::createGenObjcFuncsPass();
 
       (void)new llvm::IntervalPartition();
       (void)new llvm::ScalarEvolutionWrapperPass();
