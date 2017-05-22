@@ -113,6 +113,11 @@ Relocatable("emscripten-relocatable",
             cl::init(false));
 
 static cl::opt<bool>
+LegalizeJavaScriptFFI("emscripten-legalize-javascript-ffi",
+           cl::desc("Whether to legalize JavaScript FFI calls (see emscripten LEGALIZE_JS_FFI option)"),
+           cl::init(true));
+
+static cl::opt<bool>
 SideModule("emscripten-side-module",
            cl::desc("Whether to emit a side module (see emscripten SIDE_MODULE option)"),
            cl::init(false));
@@ -615,11 +620,11 @@ namespace {
             Externals.insert(Name);
             ExternalsOriginal.insert(V->getName());
             if (Relocatable) {
-              std::string line = "\n temp = g$" + Name + "() | 0;"; // we access linked externs through calls, and must do so to a temp for heap growth validation
-              // see later down about adding to an offset
               std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
-              line += "\n " + access + " = (" + access + " | 0) + temp;";
-              PostSets.push_back(line);
+              PostSets.push_back(
+                "\n temp = g$" + Name + "() | 0;" // we access linked externs through calls, and must do so to a temp for heap growth validation
+                + "\n " + access + " = (" + access + " | 0) + temp;" // see later down about adding to an offset
+              );
             } else {
               PostSets.push_back("\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + Name + ';');
             }
