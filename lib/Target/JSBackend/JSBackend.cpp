@@ -3614,7 +3614,13 @@ void JSWriter::printModuleBody() {
          I != E; ++I) {
       if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(I)) {
         const Value* Target = resolveFully(GA);
-        Aliases[getJSName(GA)] = getJSName(Target);
+        auto JSName = getJSName(Target);
+        Aliases[getJSName(GA)] = JSName;
+
+        auto TargetName = JSName.substr(1);
+        if(NamedGlobals.find(TargetName) == NamedGlobals.end() && GlobalAddresses.find(TargetName) != GlobalAddresses.end()) {
+          NamedGlobals[TargetName] = getGlobalAddress(TargetName);
+        }
       }
     }
   }
